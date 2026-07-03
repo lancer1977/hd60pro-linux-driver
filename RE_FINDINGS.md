@@ -184,3 +184,29 @@ command from the wrong card-RAM address and STATUS stays at ep.ko's 0xdddddddd
 poison value. => the post-boot control path is gated on DMA/bus-master (M4), not on
 opcode correctness. mz0380_card_init() is Windows-accurate and should light up once
 the inbound window is programmed.
+
+## M4 CONTROL PATH WORKING (verified on hardware)
+
+Post-boot mailbox is fully operational. Sequence (mz0380_card_init):
+1. BAR5[0x30]=bar0_phys+4, BAR5[0x38]=bar0_phys+0x5f (already latched at boot).
+2. CMD_INIT (0x01): opcode -> BAR0+0x04, doorbell BAR0+0x00 = 0x800.
+   Completion = STATUS(BAR0+0x2c) reads 0xaaaaaaaa (NOT bit0; the fw success
+   stamp). Answered on attempt 1.
+3. GET_BOARD_VERSION (0x0a): running fw version in PARAM1/PARAM2 (BAR0+0x08/0x0c).
+   Reports 1.11, matching MZ0380.FW.TXT "01.11".
+4. Version-skip: if the card already runs the shipped version, the ~21 s
+   upload+boot is skipped entirely.
+5. Peripheral read (mz0380_periph_read, opcode 0x1a) of bridge chip 0x90 reg
+   0x12 returns live HDMI signal presence (bit0). Confirmed responding.
+
+THE decisive bug (found via mz0380_mailbox_scan): the poll loop was firing the
+0x400 ack doorbell every 1 ms unconditionally, which ABORTS a STATUS-completing
+command (0x01/0x0a) before the card finishes. Fix: poll silently, ack only when
+EVENT(0x30) != 0. Offsets (op@0x04, bell@0x00) were correct throughout.
+
+Bus mastering (dma_handshake=1) was enabled for the successful runs; whether the
+quiet poll alone suffices without it is untested.
+
+Remaining for full capture (M4 second half): program the frame DMA ring (real
+ring-register offsets still a guess in mz0380-dma.c) and drive SET_VIC /
+START_STREAMING over the now-working command channel.
