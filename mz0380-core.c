@@ -3564,6 +3564,19 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 	pci_read_config_byte(pci_dev, PCI_CLASS_REVISION, &dev->pci_rev);
 	pci_read_config_byte(pci_dev, PCI_LATENCY_TIMER, &dev->pci_lat);
 
+	/*
+	 * M4 diagnostic: bus mastering must be live BEFORE the firmware
+	 * handshake (which happens inside mz0380_firmware_load below), not
+	 * after. Enable it here so the CMD_INIT doorbell is issued with bus
+	 * mastering on. No ring addresses are programmed (still unverified),
+	 * so the card has no host DMA target - safe.
+	 */
+	if (mz0380_dma_handshake) {
+		pci_set_master(pci_dev);
+		pr_info("%s: dma_handshake: bus mastering enabled pre-firmware\n",
+			pci_name(pci_dev));
+	}
+
 	printk(KERN_INFO
 	       "mz0380 device found at %s, rev: %u, irq: %u, latency: %u\n",
 	       pci_name(pci_dev), dev->pci_rev, pci_dev->irq, dev->pci_lat);
@@ -3604,18 +3617,6 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 				mz0380_irq_release(dev);
 			}
 		}
-	} else if (mz0380_dma_handshake) {
-		/*
-		 * M4 diagnostic: enable bus mastering ONLY - no MSI, no ring
-		 * programming. Keeps the trusted STATUS/EVENT poll path (MSI
-		 * would route completion through the still-unverified ISR
-		 * status offsets). Isolates the single variable: does the
-		 * post-boot doorbell only reach the card with bus mastering
-		 * on? Must precede the firmware handshake in card_setup.
-		 */
-		pci_set_master(pci_dev);
-		pr_info("%s: dma_handshake: bus mastering on (poll path)\n",
-			dev->name);
 	} else if (allow_bus_master) {
 		/* legacy escape hatch: bus-master without DMA setup */
 		pci_set_master(pci_dev);
