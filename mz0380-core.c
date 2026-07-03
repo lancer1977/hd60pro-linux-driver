@@ -3375,6 +3375,21 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 			goto out;
 		}
 
+		/*
+		 * A command that completed via STATUS bit0 may still post a
+		 * trailing completion event a moment later; give it a few ms
+		 * and ack it so the card is not left with INTx asserted.
+		 */
+		for (waited = 0; waited < 10; waited++) {
+			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+			if (event ||
+			    mz_cfg_read(dev, MZ0380_CFG_INT_FLAG) == 1) {
+				mz0380_mb_ack_event(dev);
+				break;
+			}
+			usleep_range(300, 500);
+		}
+
 		/* capture the result/param slots for the caller */
 		for (i = 0; i < MZ0380_REG_PARAM_MAX; i++)
 			dev->cmd_last_param[i] =
@@ -3389,6 +3404,35 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_send_command);
+
+/*
+ * Peripheral register file access via mailbox opcodes 0x1a/0x1b
+ * (Windows FUN_1402777e4 / FUN_1402851cc). Read results land in the
+ * PARAM3 slot (BAR0+0x10). Requires booted firmware.
+ */
+int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val)
+{
+	u32 params[3] = { chip, reg, 0 };
+	int ret;
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ, params, 3,
+				  NULL, 1000);
+	if (ret)
+		return ret;
+	if (val)
+		*val = dev->cmd_last_param[3];
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_periph_read);
+
+int mz0380_periph_write(struct mz0380_dev *dev, u8 chip, u8 reg, u32 val)
+{
+	u32 params[3] = { chip, reg, val };
+
+	return mz0380_send_command(dev, MZ0380_CMD_REG_WRITE, params, 3,
+				   NULL, 1000);
+}
+EXPORT_SYMBOL_GPL(mz0380_periph_write);
 
 static int mz0380_initdev(struct pci_dev *pci_dev,
 			  const struct pci_device_id *pci_id)

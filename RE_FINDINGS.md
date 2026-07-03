@@ -129,3 +129,21 @@ Working sequence (mz0380-fw.c):
 
 Every event MUST be acked (BAR5[0xdc]=2, BAR0[0x30]=0, doorbell 0x400) or the
 card wedges with INTx asserted and later commands time out.
+
+## DMA buffer allocation (RE pass 3 — FUN_14028d254, generic YUAN SDK init)
+
+One SDK function sizes and allocates all DMA memory. MZ0380 matches via
+`(devid - 0x370) & 0xffee == 0` (0x370/0x371/0x380/0x381) at LAB_14028dcfb:
+
+- ctx[0x18] = 0        -> allocation mode 0: MmAllocateContiguousMemorySpecifyCache,
+                          retry loop walking 128 MB windows upward below 4 GB
+- ctx[0x1c] = common buffer size. HD60 Pro (subsys 1cfa:0006 takes the
+  "else" branch) = 0x400000 (4 MB); other MZ038x flavors 0x200000.
+- stream buffer sizes for our flavor: 0x655000 (or 0x466000/0x34bd00 variant),
+  DbgPrint tag "[MEMORY] [%08X] [%08X] [%08X]".
+- allocated VA stored at ctx[0x28], physical address (MmGetPhysicalAddress)
+  at ctx[0x27]. WHO writes ctx[0x27] into a BAR register = still open —
+  next RE target (consumers of ctx offset 0x138/0x140 region).
+
+Note: BAR5[0x30]=bar0+0x4 and BAR5[0x38]=bar0+0x5f exist pre-boot already,
+so those two are card-programmed defaults, not host DMA pointers.

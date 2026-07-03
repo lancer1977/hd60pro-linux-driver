@@ -436,6 +436,8 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 			const u32 *params, unsigned int nparams,
 			u32 *status_out, unsigned int timeout_ms);
 void mz0380_mb_ack_event(struct mz0380_dev *dev);
+int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val);
+int mz0380_periph_write(struct mz0380_dev *dev, u8 chip, u8 reg, u32 val);
 
 /* Firmware (mz0380-fw.c) */
 int mz0380_firmware_load(struct mz0380_dev *dev);

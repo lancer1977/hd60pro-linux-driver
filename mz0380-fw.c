@@ -181,6 +181,23 @@ void mz0380_fw_info_dump(struct seq_file *m, struct mz0380_dev *dev)
 	for (i = 0; i < 4; i++)
 		seq_printf(m, "  bar0[PARAM%u   0x%02x] = %08x\n", i,
 			   MZ0380_MB_PARAM(i), mz_mmio_read(dev, MZ0380_MB_PARAM(i)));
+
+	/*
+	 * With booted firmware the bridge register file is reachable via
+	 * mailbox reg-read commands. Reg 0x12 bit0 = input signal present
+	 * (safe to read; the read-to-clear IRQ regs 0x10/13/14/15 are NOT
+	 * dumped here to avoid eating events).
+	 */
+	if (dev->fw_state == MZ0380_FW_STATE_READY) {
+		u32 sig;
+
+		if (mz0380_periph_read(dev, MZ0380_CHIP_BRIDGE,
+				       MZ0380_BRIDGE_SIGNAL, &sig) == 0)
+			seq_printf(m, "  hdmi signal: %s (bridge[0x12]=0x%08x)\n",
+				   (sig & 1) ? "present" : "absent", sig);
+		else
+			seq_puts(m, "  hdmi signal: query failed\n");
+	}
 }
 EXPORT_SYMBOL_GPL(mz0380_fw_info_dump);
 

@@ -125,6 +125,28 @@
 #define MZ0380_CMD_BEGIN_BASE_FW_DL     0x0e  /* begin base firmware, param=size      */
 #define MZ0380_CMD_COMMIT_BASE_FW       0x0f  /* commit/execute base firmware         */
 
+/*
+ * Peripheral register file access (RE-confirmed, FUN_1402777e4 /
+ * FUN_1402851cc): cmd {opcode, chip, reg, value}; read result lands in
+ * PARAM3 (BAR0+0x10).
+ */
+#define MZ0380_CMD_REG_READ             0x1a
+#define MZ0380_CMD_REG_WRITE            0x1b
+
+/* chip ids seen in the Windows driver */
+#define MZ0380_CHIP_BRIDGE              0x90  /* FPGA/bridge register file        */
+#define MZ0380_CHIP_ENCODER             0x50  /* CHECKME - poked in fw-boot retry */
+#define MZ0380_CHIP_TVP5160             0xb8  /* analog front-end                 */
+
+/* bridge (chip 0x90) registers used by the Windows Interrupt_Handler */
+#define MZ0380_BRIDGE_IRQ_MAIN          0x10  /* read-to-clear main status        */
+#define MZ0380_BRIDGE_SIGNAL            0x12  /* bit0 = input signal present      */
+#define MZ0380_BRIDGE_IRQ_SRC0          0x13  /* per-source status (read-to-clear)*/
+#define MZ0380_BRIDGE_IRQ_SRC1          0x14
+#define MZ0380_BRIDGE_IRQ_SRC2          0x15
+#define MZ0380_BRIDGE_CTL18             0x18  /* bit7 toggled as a reset strobe   */
+#define MZ0380_BRIDGE_CTL19             0x19  /* event ack/mask (bits 0x30 kept)  */
+
 /* Opcodes not yet resolved by RE - placeholders (CHECKME) */
 #define MZ0380_CMD_GET_FW_VERSION       0x01  /* CHECKME (host reads version from blob) */
 #define MZ0380_CMD_SET_VIC_PARAMS       0x10  /* CHECKME */
