@@ -1,1 +1,0 @@
-savedcmd_mz0380.ko := ld.lld -r -m elf_x86_64 -mllvm -import-instr-limit=5 --mllvm=-enable-fs-discriminator=true --mllvm=-improved-fs-discriminator=true -plugin-opt=thinlto -plugin-opt=-split-machine-functions -z noexecstack --build-id=sha1  -T /usr/lib/modules/6.19.10-1-cachyos/build/scripts/module.lds -o mz0380.ko mz0380.o mz0380.mod.o .module-common.o

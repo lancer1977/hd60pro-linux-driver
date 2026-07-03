@@ -1,82 +1,128 @@
-# sc0710
-Linux driver for the Elgato 4k60 Pro Mk.2
+# mz0380 — Linux driver for Elgato Game Capture HD60 Pro
 
-This is a reverse engineering project. The goal is to bring support for the
-Elgato 4k60 card to the linux platform.
+PCIe capture card driver for the Elgato Game Capture **HD60 Pro** family
+(YUAN MZ0380 chipset, PCI `12ab:0380` / `12ab:0381`). The card has an
+onboard ARM SoC that runs its own embedded Linux and performs HDMI
+receive, signal detect (MST3367), and H.264 encoding (TP2834 +
+tinyvenc). The host driver uploads firmware, manages two DMA rings,
+and exposes the result as a V4L2 H.264 capture device plus an ALSA
+PCM audio device.
 
-The primary development platform for the project is Centos 7.5.1804 (Core), although
-the driver is expected to work on multiple distributions.
+> Legacy note: this repo started as a reverse-engineering project for
+> the Elgato 4K60 Pro Mk.2 (`sc0710-*.c`). That code is preserved but
+> no longer builds on modern kernels and is excluded from the default
+> target. Pass `MZ0380_LEGACY_SC0710=1` to `make` to attempt it.
 
-# License
-Driver for the Elgato 4k60 Pro mk.2 HDMI capture card.
+## Supported cards
 
-Copyright (c) 2021 Steven Toth <stoth@kernellabs.com>
+| Subsys           | Variant                       | Firmware blob       |
+|------------------|-------------------------------|---------------------|
+| `1cfa:0003`      | HD60 Pro Rev. 1               | `MZ0380.HD.HEX`     |
+| `1cfa:0005`      | HD60 Pro Rev. 2 (unreleased)  | `MZ0380.HD.HEX`     |
+| `1cfa:0006`      | HD60 Pro Rev. 1 + Ryzen fix   | `MZ0380.HD.HEX`     |
+| `1cfa:0010`      | HD60 Pro Rev. 3 (`DEV_0381`)  | `MZ0381.HD.HEX`     |
+| `12ab:05cf`      | HD60 Pro Prototype            | `MZ0380.HD.HEX`     |
 
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 2 of the License, or
-(at your option) any later version.
+## Firmware
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+The card needs its onboard ARM firmware blob uploaded at probe.
 
-GNU General Public License for more details.
+The blob is **not redistributable** in this repo. Extract it from the
+Windows installer:
 
-You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+```bash
+7z x Game_Capture_HD60_Pro_*.exe -o/tmp/hd60pro_extract/
+sudo install -d /lib/firmware/mz0380
+sudo cp /tmp/hd60pro_extract/MZ0380.HD.HEX /lib/firmware/mz0380/
+# Rev.3 owners also:
+sudo cp /tmp/hd60pro_extract/MZ0381.HD.HEX /lib/firmware/mz0380/
+```
 
-# Background
-Most of the investigation work is being done on Windows 10.
-I'm instrumenting the hardware with debug wiring, identifying common
-buses, sketching out a basic hardware digram, understanding the
-individual components, monitoring hardware behavior and outlining
-a plan for the linux implementation.
+The blob is a gzipped tar with a full mini-Linux for the card; the
+host driver pushes it byte-for-byte through a BAR5 scratch window
+and the onboard bootloader untars and boots.
 
-The project started Early Jan 2021. One month in, early feb, I understand enough of the
-basic design, hardware layout, board debug points to start making an early
-linux driver - enough to perform signal detection of the HDMI port and do some
-basic hardware servicing.
+## Build
 
-All of my working notes, analyzer traces, daily journal notes will be
-stored in this repository - as a single source for any interested viewers.
+```bash
+make
+```
 
-I'm maintaining a basic 'developer journal' so interested readers can follow along.
-It's not my intension to do a "how to reverse engineer step-by-step" intro guide,
-it's really to describe the process, show some of the tooling, highlight things that
-worked and things that didn't work. I'm not writing an essay, its random utterances
-that may help another developer on a similar project.
+Build needs `linux-headers-$(uname -r)`. The default build emits only
+`mz0380.ko`; the legacy `sc0710.ko` (4K60 Pro Mk.2) is opt-in.
 
-At this stage, everything is contained in master. We don't have any branches. As the
-project progresses and the driver becomes usable, almost certainly, a new 'cleaner' repo
-will emerge and users will not be expected to download this entire repo, with huge images,
-analyzer traces, random notes - just to use the driver.
+## Load
 
-# Status
-* Jun 26 2022 - On Ubuntu, /usr/bin/pulseaudio keeps the driver open and prevents make unload during development.
-* Jun 26 2022 - Forward port driver, fix broken APIs for use on Ubuntu 22.04. Basic video works on Ubuntu now.
-* Jun 26 2022 - Use tag e2908371f4c2b28ea613622815dcf2b4739d3bb7 for Centos 3.10 kernels. After this we're moving to Ubuntu 5.x kernels.
-* Feb 15 2021 - Detected colorimetry and colospace HDMI support.
-* Feb 15 2021 - Added basic DV Timing support to expose resolution / rate material through the v4l api.
-* Feb 14 2021 - Added audio support, PCM 16bit 48KHz.
-* Feb 14 2021 - Driver is usable for certain resolutions for video and audio capture via ffmpeg.
-* Feb 13 2021 - Overhauled the scatter gather subsystem to support 4k video.
-* Feb 11 2021 - First every colorbar still iage captured via the driver.
-* Aug  1 2021 - Driver adjusts to auto detect 1280x720p vs 1920x1080p and work accordingly.
-* Aug  1 2021 - 4k is untested with the latest changes, but should be full supported.
+Three escalating modes during bring-up. Each requires the previous to
+work first.
 
-# TODO
-* Test/Support HDR 10bit.
-* Intermittent issue during capture, possible short video frame, casuses ffmpeg to error and stall.
+```bash
+# 1. probe-safe: V4L2 node only, no firmware upload, no DMA
+sudo insmod ./mz0380.ko procfs_verbosity=2 enable_video=1
 
-# Comments / Support
+# 2. firmware: upload the blob to the card, leave DMA off
+sudo insmod ./mz0380.ko procfs_verbosity=2 enable_video=1 firmware_upload=1
 
-Email: stoth@kernellabs.com
+# 3. full streaming: firmware + DMA rings + MSI + ALSA
+sudo insmod ./mz0380.ko procfs_verbosity=2 \
+    enable_video=1 firmware_upload=1 enable_dma=1 enable_audio=1
+# or:
+make load-streaming
+```
 
-# Content
-* Project root - Driver source code.
-* Docs - Daily journal, random notes.
-* Traces - Various dump files taken from analyzers.
-* Pics - Interesting or curious pictures I've taken during the process.
+## Module parameters
 
+| param                      | default | meaning                                   |
+|---                         |---      |---                                        |
+| `enable_video`             | 0       | register `/dev/video0`                    |
+| `firmware_upload`          | 0       | upload `MZ0380.HD.HEX` to the card        |
+| `enable_dma`               | 0       | alloc rings, request MSI, set bus master  |
+| `enable_audio`             | 0       | register an ALSA snd_card                 |
+| `video_ring_entries`       | 16      | video DMA ring slot count                 |
+| `video_ring_entry_size`    | 524288  | bytes per video ring slot                 |
+| `audio_ring_entries`       | 8       | audio DMA ring slot count                 |
+| `audio_ring_entry_size`    | 32768   | bytes per audio ring slot                 |
+| `procfs_verbosity`         | 1       | debug-richness of `/proc/mz0380-*`        |
+| `debug`                    | 0       | dprintk gate                              |
+
+## Capture
+
+```bash
+# H.264 elementary stream
+ffmpeg -f v4l2 -pixel_format h264 -i /dev/video0 -t 10 -c copy out.h264
+
+# PCM audio
+arecord -D hw:CARD=mz0380,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 out.wav
+```
+
+## Diagnostics
+
+| Path                            | What                                     |
+|---                              |---                                       |
+| `/proc/mz0380`                  | device list + BAR map                    |
+| `/proc/mz0380-state`            | live state (firmware/IRQ counts/format)  |
+| `/proc/mz0380-snapshot`         | targeted register snapshot (5 profiles)  |
+| `/proc/mz0380-control`          | SDK-grouped control surface              |
+| `/proc/mz0380-experiment`       | bounded register probe + property write  |
+
+## Status
+
+This is a bring-up driver. Phases:
+
+- [x] PCI probe, BAR map, V4L2 node registered (probe-safe)
+- [x] 7 H.264 encoder controls correlated to BAR5 mailbox slots
+- [x] Firmware loader + upload state machine (offsets `CHECKME`)
+- [x] DMA ring alloc + MSI IRQ handler + ring drain (offsets `CHECKME`)
+- [x] vb2 streaming: REQBUFS/QBUF/DQBUF/STREAMON/STREAMOFF
+- [x] HDMI signal detect via mailbox + V4L2 DV_TIMINGS
+- [x] ALSA HDMI audio capture (PCM S16_LE)
+- [ ] Mainline `linux-media` submission
+
+Register offsets marked `CHECKME` in `mz0380-reg.h` are working
+hypotheses derived from device-side `ep.ko` strings. Refine via
+`/proc/mz0380-experiment` correlation runs before flipping
+`firmware_upload=1` / `enable_dma=1` on production hardware.
+
+## License
+
+GPLv2 or later.

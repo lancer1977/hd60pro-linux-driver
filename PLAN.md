@@ -1,198 +1,214 @@
-# MZ0380 Bring-Up Plan
+# MZ0380 / HD60 Pro Driver — Implementation Status
 
-## Current Status
-- A new probe-safe `mz0380` module exists alongside `sc0710` in [Makefile](/home/wolffyx/Projects/sc0710/Makefile).
-- The new source set is:
-  - [mz0380.h](/home/wolffyx/Projects/sc0710/mz0380.h)
-  - [mz0380-reg.h](/home/wolffyx/Projects/sc0710/mz0380-reg.h)
-  - [mz0380-cards.c](/home/wolffyx/Projects/sc0710/mz0380-cards.c)
-  - [mz0380-core.c](/home/wolffyx/Projects/sc0710/mz0380-core.c)
-- The module binds only PCI ID `12ab:0380` with subsystem `1cfa:0006`.
-- The detected board is reported as `Elgato Game Capture HD60 Pro`.
-- The current safe baseline is:
-  - PCI enable succeeds.
-  - BAR0 and BAR5 are requested, validated, and mapped.
-  - `/proc/mz0380` and `/proc/mz0380-state` expose metadata plus carefully limited diagnostics.
-  - PCI bus mastering is disabled by default in probe-safe mode.
-  - No DMA, IRQ handling, firmware upload, I2C transactions, or V4L2 capture is started yet.
+## Current state (post-build)
 
-## Confirmed Hardware Facts
-- Local card: `12ab:0380`
-- Local subsystem: `1cfa:0006`
-- Expected BAR layout on this host:
-  - BAR0: `0x100000`
-  - BAR5: `0x1000`
-- Safe PCI findings:
-  - PCI command register is `0x0002` in probe-safe mode, so memory decode is enabled and bus mastering is disabled.
-  - PCI status is `0x0010`, matching a normal capability list.
-  - PCI capabilities:
-    - PM at `0x40`
-    - MSI at `0x50`
-    - PCIe at `0x70`
-  - MSI is 64-bit capable and currently disabled.
-  - The endpoint is PCIe capability version `2`, type `0` (endpoint).
-  - Link capability and negotiated status both indicate `Gen1 x1`.
-  - Linux routes the device to IRQ `40`; `irq line = ff` is normal for PCIe.
-- MMIO facts observed repeatedly:
-  - `mmio[0x0000] = 0xffffffff`
-  - `mmio[0x0004] = 0x0000000a`
-  - `cfg[0x0000] = 0x11000001`
-  - `cfg[0x0004] = 0x00010001`
-- Safety finding:
-  - Enabling PCI bus mastering too early triggered an `AMD-Vi IO_PAGE_FAULT` at `0x90000000`.
-  - Keeping bus mastering disabled by default removes that fault.
+Full driver scaffolding for the Elgato HD60 Pro family is in place:
 
-## SDK Findings
-- Real SDK path used for reference: `/home/wolffyx/Downloads/test/SDK 1.1.0.202.0`
-- The schedule-recording sample explicitly recognizes `"MZ0380 PCI"`:
-  - [SetupDialog.cpp](/home/wolffyx/Downloads/test/SDK%201.1.0.202.0/RELEASES%201.1.0.202.0/AMESDK/SAMPLES/OTHERS/SCHEDULE.RECORDING/ScheduleRecording/SetupDialog.cpp): line containing `if ( strDeviceName == "MZ0380 PCI" )`
-- The same sample routes MZ0380 through the SC540 application flow:
-  - [ScheduleRecordingDlg.cpp](/home/wolffyx/Downloads/test/SDK%201.1.0.202.0/RELEASES%201.1.0.202.0/AMESDK/SAMPLES/OTHERS/SCHEDULE.RECORDING/ScheduleRecording/ScheduleRecordingDlg.cpp)
-  - [FileRenderer.cpp](/home/wolffyx/Downloads/test/SDK%201.1.0.202.0/RELEASES%201.1.0.202.0/AMESDK/SAMPLES/OTHERS/SCHEDULE.RECORDING/ScheduleRecording/FileRenderer.cpp)
-- The MZ0380 resource profile is explicitly SC540-shaped:
-  - [MZ0380.txt](/home/wolffyx/Downloads/test/SDK%201.1.0.202.0/RELEASES%201.1.0.202.0/AMESDK/SAMPLES/OTHERS/SCHEDULE.RECORDING/ScheduleRecording/res/MZ0380.txt)
-  - It defines:
-    - `SC540.NTSC/PAL.RESOLUTION`
-    - `SC540.NTSC/PAL.FRAMERATE`
-    - `SC540.NTSC/PAL.RECORDMODE`
-    - `SC540.NTSC/PAL.BITRATE`
-    - `SC540.VIDEO.BFRAME`
-    - `SC540.VIDEO.INPUT`
-- The available input list in that profile is:
-  - `HDMI`
-  - `DVI-D`
-  - `COMPONENTS ( YCBCR )`
-  - `DVI-A ( RGB )`
-  - `SDI`
-- The SDK also contains dedicated SC540 product samples:
-  - [SC540.PRODUCTS](/home/wolffyx/Downloads/test/SDK%201.1.0.202.0/RELEASES%201.1.0.202.0/AMESDK/SAMPLES/PRODUCTS/SC540.PRODUCTS)
+- PCI probe binds `12ab:0380` (+ all known Elgato subsys variants)
+  and `12ab:0381` (Rev. 3).
+- BAR0 (1 MiB MMIO) and BAR5 (4 KiB control) mapped.
+- Firmware loader (`mz0380-fw.c`) — `request_firmware()` plus a chunked
+  BAR5 scratch-window upload state machine.
+- DMA + MSI (`mz0380-dma.c`) — coherent ring alloc, ring-base
+  programming, MSI ISR, work-queue drain.
+- V4L2 streaming (`mz0380-video.c`) — vb2 queue, `REQBUFS`/`QBUF`/
+  `DQBUF`/`STREAMON`/`STREAMOFF`, plus HDMI signal detect via
+  `VIDIOC_QUERY_DV_TIMINGS` and `V4L2_EVENT_SOURCE_CHANGE`.
+- ALSA HDMI audio (`mz0380-audio.c`) — single capture substream,
+  S16_LE 32/44.1/48 kHz, period-elapsed driven by the audio ring.
+- Module gates: `firmware_upload`, `enable_dma`, `enable_audio`. All
+  default OFF so probe stays safe.
+- Build: `make` produces `mz0380.ko` only. The legacy `sc0710` source
+  set is excluded by default (`MZ0380_LEGACY_SC0710=1` to attempt it).
 
-## Important Inference
-- The combined evidence now points away from a naive raw-frame capture model:
-  - `MZ0380 PCI` is treated by the SDK as an SC540-style device.
-  - SC540 resources are built around record modes, bitrates, B-frames, and input selection.
-  - The physical PCIe link is only `Gen1 x1`.
-- Because `Gen1 x1` offers limited usable payload bandwidth, a raw `1920x1080@60` packed `YUYV/UYVY 4:2:2` DMA path is unlikely to fit with real PCIe overhead.
-- Treat this as an inference from the PCIe and SDK evidence, not final proof:
-  - The first usable transport may be compressed, semi-planar, tiled, or otherwise vendor-specific.
-  - Do not assume the eventual stream exposed by the hardware is raw packed 4:2:2 video.
+## Confirmed control-plane facts (preserved from earlier sessions)
 
-## Implemented Code Landmarks
-- PCI/BAR setup: [mz0380-core.c](/home/wolffyx/Projects/sc0710/mz0380-core.c#L48)
-- Board autodetect and BAR validation: [mz0380-core.c](/home/wolffyx/Projects/sc0710/mz0380-core.c#L94)
-- PCI config and capability dumps: [mz0380-core.c](/home/wolffyx/Projects/sc0710/mz0380-core.c#L172)
-- Probe-safe bus-master gating: [mz0380-core.c](/home/wolffyx/Projects/sc0710/mz0380-core.c#L330)
-- PCI table: [mz0380-core.c](/home/wolffyx/Projects/sc0710/mz0380-core.c#L398)
-- HD60 Pro board entry: [mz0380-cards.c](/home/wolffyx/Projects/sc0710/mz0380-cards.c#L7)
+- Subsystem: `1cfa:0006` ("Rev. 1 + Ryzen fix") locally.
+- PCIe: Gen1 x1, MSI capable, IRQ 40 on this host.
+- BAR5 property param window (verified bounded-write):
 
-## Build And Manual Validation
-- Targeted module build:
-```bash
-make -C /lib/modules/$(uname -r)/build M="$PWD" CC=clang LD=ld.lld mz0380.ko
-```
-- Expected alias check:
-```bash
-modinfo ./mz0380.ko
-```
-- Safe load/unload sequence:
-```bash
-sudo insmod ./mz0380.ko procfs_verbosity=2
-cat /proc/mz0380
-cat /proc/mz0380-state
-sudo dmesg | grep -E 'mz0380|AMD-Vi|IOMMU'
-sudo rmmod mz0380
-```
+  | prop | reg     | mask         | name        |
+  |------|---------|--------------|-------------|
+  | 201  | `0x0040`| `0x7`        | input       |
+  | 407  | `0x0058`| `0x3`        | record mode |
+  | 403  | `0x005c`| `0xffffffff` | bitrate     |
+  | 404  | `0x0060`| `0xffffffff` | quality     |
+  | 405  | `0x0080`| `0xffffffff` | GOP         |
+  | 408  | `0x0084`| `0xffffffff` | QP step     |
+  | 411  | `0x0088`| `0xffffffff` | B-frames    |
 
-## Current Blockers
-- Full repo build is still blocked by a pre-existing `sc0710` kernel-compat issue on kernel `6.19.10-1-cachyos`.
-- The current failure is missing header `media/videobuf-vmalloc.h`.
-- `mz0380.ko` remains the isolated working path.
-- A second blocker is semantic, not mechanical:
-  - the driver does not yet know the control protocol,
-  - the DMA/IOMMU setup,
-  - or the actual transport format.
+- Enabling PCI bus mastering before DMA setup triggered an
+  `AMD-Vi IO_PAGE_FAULT` at `0x90000000`. Driver therefore enables bus
+  mastering only inside `mz0380_dma_setup()`, after ring base addrs
+  are programmed.
 
-## Immediate Next Step
-- Keep the current probe-safe baseline stable.
-- Do not re-enable bus mastering until:
-  - a DMA buffer strategy exists,
-  - IOMMU-visible addresses are programmed intentionally,
-  - and the device-side DMA enable path is understood.
-- Continue gathering information from:
-  - PCI config space
-  - the SC540/MZ0380 SDK path
-  - only individually vetted MMIO reads
+## Windows reconnaissance findings
 
-## Next Reverse-Engineering Goals
-1. Identify whether BAR5 is the primary MCU/control/mailbox window.
-2. Determine whether any additional MMIO reads can be made safely without hangs.
-3. Locate likely firmware command, reset, or handshake registers.
-4. Map the SC540-style control surface from the SDK to probable hardware behavior.
-5. Determine whether the eventual data path is compressed, semi-planar, or otherwise non-raw.
-6. Delay interrupt and DMA work until a control path exists and bus mastering can be re-enabled intentionally.
+Driver: `e60MZ0380.X64.SYS` 3.7 MB, WDM/KMDF. Notable symbols from
+strings:
 
-## Planned Bring-Up Stages
-### Stage 1: Probe-Safe Baseline
-- Keep existing behavior: bind, map, inspect, unload cleanly.
-- Add only read-only diagnostics that do not trigger MMIO instability or IOMMU faults.
-- Exit criteria:
-  - Repeated load/unload is stable.
-  - BAR mapping and proc dumps are consistent.
-  - Bus mastering stays disabled by default.
-  - No `AMD-Vi` or IOMMU faults are observed during probe.
-  - No kernel warnings, resource leaks, or hangs are observed.
+- `MZ0380_DownloadBaseFirmware`, `MZ0380_DownloadFirmware`,
+  `MZ0380_GetFirmwareVersion`, `MZ0380_SEND_COMMAND`
+- `MZ0380_HwInitialize`, `[FIRMWARE RESET]`
+- `Interrupt_Handler`, `MmAllocateContiguousMemorySpecifyCache`,
+  `IoConnectInterrupt`
+- `MST3367_HDMI_MODE_DETECT( R0055 )` — HDMI signal detect chip
+- `TP2834_SET_VIDEO_MODE` — H.264 encoder
+- `GetHDMIDotClock => audio sample freq = %d` — audio clock derivation
 
-### Stage 2: Read-Only Hardware Identification
-- Expand only carefully chosen diagnostics.
-- Prefer PCI config space and individually vetted MMIO offsets over wide BAR walks.
-- Correlate safe reads with HDMI connected vs disconnected states if possible.
-- Exit criteria:
-  - At least one reliable signal-presence or mode-related register set is identified.
-  - Candidate firmware and command registers are narrowed down enough to avoid blind writes.
+Firmware: `MZ0380.HD.HEX` is gzipped tar of `yuan_demo_sdi/` — full
+embedded Linux for the card's ARMv5 SoC, including `tinyvenc7`
+encoder, `video_capture_mgr`, `audio_capture_mgr`, and the device-side
+`drivers/ep.ko` which advertises:
 
-### Stage 3: Safe Control-Path Discovery
-- Investigate command, mailbox, reset, and I2C/EDID paths with minimal, controlled writes only after read-only mapping is understood.
-- Use the SDK’s SC540/MZ0380 behavior as a hint for expected control features.
-- Exit criteria:
-  - A defensible command/control sequence exists for basic hardware initialization.
-  - Any required firmware handshake is identified or ruled out.
+- sysfs nodes: `command`, `status`, `param0..N`, `fw_store`
+- ISR `pciep_isr` + `msi_enable`
+- ring control: `[init]bar 0..1`, `Inbound mem0 start/Limit`
+- multi-channel status: `enc_stat0..15`, `hready/ency_ready/aency_ready`
+- commands: `BEGIN_FIRMWARE_DOWNLOAD`, `BEGIN_BASE_FIRMWARE_DOWNLOAD`,
+  `SET_VIC_PARAMS`, `STOP_STREAMING`, `GET_FIRMWARE_VERSION`,
+  `SET_AIC`
 
-### Stage 4: Data-Path Identification
-- Add the minimum internal structures needed to reason about the streaming path.
-- Do not expose a `/dev/video*` node until transport assumptions are understood.
-- Identify:
-  - capture engine control registers
-  - DMA ring or descriptor layout
-  - frame status/interrupt sources
-  - actual transport format expectations
-- Exit criteria:
-  - Hardware can be initialized without destabilizing the system.
-  - A plausible data path is mapped far enough to begin controlled streaming work.
+This evidence is what `mz0380-reg.h` is built around. The exact BAR5
+offsets for command/status/param/firmware-buffer/IRQ-status are
+marked **`CHECKME`** until verified against the live device.
 
-### Stage 5: First Capture Milestone
-- Register one Linux-facing capture path for HD60 Pro.
-- Treat `1280x720@60` and `1920x1080@60` as mode goals, not proof of raw transport.
-- Audio remains out of scope.
-- Exit criteria:
-  - Frames or stream units can be captured repeatedly without kernel faults.
-  - Start/stop streaming is reliable.
+## What needs verification before flipping the gates
 
-## Guardrails
-- Keep `mz0380` isolated from `sc0710` register, DMA, and board assumptions unless equivalence is proven.
-- Preserve probe-safe behavior as the default until control semantics are understood.
-- Keep PCI bus mastering disabled by default until DMA setup is explicit and verified.
-- Treat Windows driver strings and SDK samples as family hints and behavioral references, not register truth.
-- Avoid broad PCI ID matching until more subsystem variants are validated.
-- Prefer explicit failure over partially initialized capture paths.
+1. **Command/status register offsets** (`MZ0380_REG_COMMAND`,
+   `MZ0380_REG_STATUS`, `MZ0380_REG_PARAM(i)`).
+   - Method: load probe-safe, write a known opcode like
+     `GET_FW_VERSION` at the hypothesised offset and watch
+     `/proc/mz0380-experiment` snapshot diffs.
+   - Alternative: do real Ghidra/radare2 disasm of
+     `e60MZ0380.X64.SYS` around the `MZ0380_SEND_COMMAND` string xref.
 
-## Data Needed For Future Sessions
-- `/proc/mz0380-state`
-- `sudo dmesg | grep -E 'mz0380|AMD-Vi|IOMMU'`
-- Targeted SDK snippets for MZ0380/SC540 behavior
-- Any additional safe MMIO observations from carefully chosen offsets
+2. **Firmware upload window** (`MZ0380_REG_FW_BUFFER`,
+   `MZ0380_REG_FW_CHUNK_SEQ`, `MZ0380_REG_FW_CHUNK_ACK`).
+   - Method: with `firmware_upload=1`, watch dmesg for the
+     "firmware chunk %u not acked" timeout; if it stays at 0, the
+     SEQ register is wrong; if ACK stays at the previous value,
+     the buffer offset is wrong.
 
-## Out Of Scope For Now
-- ALSA or HDMI audio capture
-- Broad MZ0380-family PCI ID support
-- HDR, 4K, multi-input, or multi-board support
-- Refactoring `sc0710` for kernel `6.19` compatibility as part of the immediate `mz0380` task
+3. **IRQ status/mask/ack offsets** (`MZ0380_REG_IRQ_*`).
+   - Method: load with `enable_dma=1`, watch `/proc/interrupts` for
+     IRQ 40 hits. Zero hits == wrong mask reg.
+
+4. **Ring base/head/tail registers** + descriptor layout.
+   - Method: after firmware boots, hexdump the first 1KiB of the
+     coherent video ring; H.264 NAL prefix `00 00 00 01` should
+     appear in the payload area of the first slot once a source
+     is connected.
+
+## Verification gates
+
+| Gate                       | Pass criterion                            |
+|---                         |---                                        |
+| P0 register precision      | `cat /proc/mz0380-state` shows the new fw/IRQ/ring fields without errors |
+| P1 firmware ready          | `dmesg` shows `firmware version 1.11` after `firmware_upload=1` |
+| P2 IRQ flowing             | `cat /proc/interrupts | grep mz0380` non-zero after HDMI plug-in |
+| P3 first H.264 NAL         | `ffmpeg -f v4l2 -pixel_format h264 -i /dev/video0 -t 5 out.h264` and `ffprobe out.h264` reports `h264 1920x1080` |
+| P4 signal detect           | `v4l2-ctl --query-dv-timings` reports active timings; unplug HDMI -> reports no signal |
+| P5 audio capture           | `arecord -D hw:CARD=mz0380,DEV=0 -d 30 out.wav` no underruns |
+| P6 mainline-ready          | `make` clean on fresh checkout, `checkpatch.pl` mostly clean |
+
+## Risks still open
+
+- Subsystem `1cfa:0006` is Rev.1+Ryzen — same firmware as Rev.1 per
+  INF — but never live-tested as such. If P1 hangs, retry with
+  `MZ0381.HD.HEX` rename or read the FW.TXT inside the blob.
+- IOMMU still a real concern. Ring base programming MUST happen
+  before `pci_set_master`; the driver enforces this but only if the
+  CHECKME ring-base offsets are correct.
+- Firmware redistribution: shipping `MZ0380.HD.HEX` in this repo
+  needs YUAN/Elgato permission. Until then, README instructs users
+  to copy it from a Windows install.
+
+## sc0710 cross-reference findings (added after Phase 7)
+
+After auditing the in-tree sc0710 driver (4K60 Pro Mk.2, same vendor)
+and the AMESDK 1.1.0.202.0 sample profiles, the following higher-
+confidence hypotheses replace earlier blind CHECKME values:
+
+1. **BAR0 stays asleep until firmware boots.** Pre-boot BAR0 reads
+   return `0xffffffff` (confirmed locally). This is consistent with a
+   Xilinx FPGA fabric that gates its register file behind a "fabric
+   reset" lifted only after the onboard ARM downloads the bitstream
+   logic from the firmware blob. Therefore firmware MUST upload via
+   BAR5 BEFORE any BAR0 register access.
+
+2. **Xilinx XDMA DMA controller layout** (from sc0710-dma-channel.c
+   lines 451-469):
+   ```
+   base+0x04  ctrl
+   base+0x08  ctrl_w1s
+   base+0x0c  ctrl_w1c
+   base+0x40  status1
+   base+0x44  status2
+   base+0x48  completed-descriptor-count
+   base+0x88  poll_wba_l
+   base+0x8c  poll_wba_h
+   sg_base = base+0x4000
+   sg_base+0x80  sg_start_l
+   sg_base+0x84  sg_start_h
+   sg_base+0x88  sg_adj
+   sg_base+0x8c  sg_credits
+   ```
+   8-DWORD descriptor: control, lengthBytes, src_l, src_h, dst_l,
+   dst_h, next_l, next_h. The driver now has `mz0380_dma_start_xdma()`
+   as a Plan B alternative to the BAR5 mailbox ring path.
+
+3. **HDMI status window at BAR0 0x00a8..0x00e4** (sc0710-reg.h):
+   - `0x00a8` source width in upper 16 bits
+   - `0x00c4` `0x00f0000` idle indicator
+   - `0x00c8` source height
+   - `0x00d0` `0x4100` idle / `0x4101` streaming, with mode-bits
+   - `0x00d4` source format hash
+   - `0x00e4` bit0 = streaming flag
+
+   The new `mz0380_signal_from_bar0()` reads these as a fallback when
+   the mailbox `QUERY_SIGNAL` opcode is wrong or times out.
+
+4. **Xilinx AXI IIC at BAR0 0x3100..0x310c** (sc0710-i2c.c). Used by
+   sc0710 to read the HDMI source EDID. Same chip family likely
+   exposes the same IP. EDID reader for mz0380 not yet implemented;
+   reg.h has the offsets pre-named for Phase 8.
+
+5. **SDK property semantics** (MZ0380.txt profile + SC5C0 sample):
+   - Inputs: HDMI / DVI-D / COMPONENTS / DVI-A / SDI
+   - Record modes: VBR / CBR / HBR
+   - Bitrate menu: 256 KB .. 12,288 KB (matches our 256K..12M range)
+   - Quality menu: 0 .. 10,000 (UI scale; driver uses raw 0..100)
+   - B-frames: 0 / 1 / 2
+   - NTSC framerates: 60 / 30 / 15 / 7.5 / 3.75
+   - PAL framerates: 50 / 25 / 12.5 / 6.25 / 3.125
+
+   All seven property offsets in BAR5 0x0040..0x0088 stay correct.
+
+## File map
+
+| File                        | Phase | Notes                                  |
+|---                          |---    |---                                     |
+| `mz0380-reg.h`              | P0    | All register offsets, CHECKME marked   |
+| `mz0380.h`                  | P0    | Extended dev struct, fw/dma/audio bits |
+| `mz0380-cards.c`            | P0    | All known subsys IDs + Rev.3           |
+| `mz0380-core.c`             | P1-2  | Probe/teardown, command channel        |
+| `mz0380-fw.c`               | P1    | request_firmware + chunked upload      |
+| `mz0380-dma.c`              | P2    | Ring alloc + MSI ISR + drain workq     |
+| `mz0380-video.c`            | P3-4  | vb2 queue + DV_TIMINGS                 |
+| `mz0380-audio.c`            | P5    | ALSA snd_card + PCM substream          |
+| `Makefile`                  | P6    | Default builds only mz0380             |
+| `README.md`                 | P6    | Install/load/capture instructions      |
+
+## Historical bring-up notes
+
+Earlier session diaries (one entry per property correlation pass)
+were consolidated above. The procfs/correlation tooling from those
+sessions still exists and remains the right way to refine CHECKME
+offsets:
+
+- `mz0380-correlation.sh` — script that loads probe-safe, snapshots
+  before/after, diffs, captures `v4l2-ctl --all`. Use with
+  `--input-reg`, `--bitrate-reg`, etc. to confirm new candidates.
+- `/proc/mz0380-experiment` — runtime BAR5 read/write surface for
+  bounded experiments without rebuilding.

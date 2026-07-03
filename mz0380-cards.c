@@ -1,5 +1,14 @@
 /*
  *  Driver for MZ0380 based capture cards.
+ *
+ *  Board ID table + setup. Subsystem variants known from the Windows
+ *  GameCaptureHD60Pro.inf:
+ *
+ *    PCI\VEN_12AB&DEV_0380&SUBSYS_00031CFA  Rev. 1
+ *    PCI\VEN_12AB&DEV_0380&SUBSYS_00051CFA  Rev. 2 (never released)
+ *    PCI\VEN_12AB&DEV_0380&SUBSYS_00061CFA  Rev. 1 + Ryzen fix
+ *    PCI\VEN_12AB&DEV_0381&SUBSYS_00101CFA  Rev. 3 (uses MZ0381 firmware)
+ *    PCI\VEN_12AB&DEV_0380&SUBSYS_12AB05CF  Prototype
  */
 
 #include "mz0380.h"
@@ -8,22 +17,39 @@ struct mz0380_board mz0380_boards[] = {
 	[MZ0380_BOARD_UNKNOWN] = {
 		.name = "UNKNOWN/GENERIC",
 		.windows_driver = "unknown",
-		.firmware_name = "unknown",
+		.firmware_name = NULL,
 	},
 	[MZ0380_BOARD_ELGATO_HD60_PRO] = {
 		.name = "Elgato Game Capture HD60 Pro",
 		.windows_driver = "e60MZ0380.X64.SYS",
-		.firmware_name = "MZ0380.HD.HEX",
+		.firmware_name = "mz0380/MZ0380.HD.HEX",
+		.firmware_base_name = NULL,
+	},
+	[MZ0380_BOARD_ELGATO_HD60_PRO_REV3] = {
+		.name = "Elgato Game Capture HD60 Pro (Rev.3)",
+		.windows_driver = "e60MZ0380.X64.SYS",
+		.firmware_name = "mz0380/MZ0381.HD.HEX",
+		.firmware_base_name = NULL,
 	},
 };
 const unsigned int mz0380_bcount = ARRAY_SIZE(mz0380_boards);
 
 struct mz0380_subid mz0380_subids[] = {
-	{
-		.subvendor = 0x1cfa,
-		.subdevice = 0x0006,
-		.card = MZ0380_BOARD_ELGATO_HD60_PRO,
-	},
+	/* Rev. 1 (original) */
+	{ .subvendor = 0x1cfa, .subdevice = 0x0003,
+	  .card = MZ0380_BOARD_ELGATO_HD60_PRO },
+	/* Rev. 2 (never released) - treat as Rev. 1 */
+	{ .subvendor = 0x1cfa, .subdevice = 0x0005,
+	  .card = MZ0380_BOARD_ELGATO_HD60_PRO },
+	/* Rev. 1 + Ryzen fix - confirmed in this test rig */
+	{ .subvendor = 0x1cfa, .subdevice = 0x0006,
+	  .card = MZ0380_BOARD_ELGATO_HD60_PRO },
+	/* Rev. 3 - device id 0x0381, different firmware blob */
+	{ .subvendor = 0x1cfa, .subdevice = 0x0010,
+	  .card = MZ0380_BOARD_ELGATO_HD60_PRO_REV3 },
+	/* Prototype */
+	{ .subvendor = 0x12ab, .subdevice = 0x05cf,
+	  .card = MZ0380_BOARD_ELGATO_HD60_PRO },
 };
 const unsigned int mz0380_idcount = ARRAY_SIZE(mz0380_subids);
 
@@ -53,15 +79,51 @@ void mz0380_card_list(struct mz0380_dev *dev)
 		       dev->name, i, mz0380_boards[i].name);
 }
 
-void mz0380_card_setup(struct mz0380_dev *dev)
+int mz0380_card_setup(struct mz0380_dev *dev)
 {
+	int ret;
+
+	mz0380_capture_state_init(dev);
+	mz0380_sync_hw_input_select(dev, "probe");
+	mz0380_sync_hw_quality(dev, "probe");
+	mz0380_sync_hw_gop(dev, "probe");
+	mz0380_sync_hw_bitrate(dev, "probe");
+	mz0380_sync_hw_b_frames(dev, "probe");
+	mz0380_sync_hw_qp_step(dev, "probe");
+	mz0380_sync_hw_record_mode(dev, "probe");
+
 	switch (dev->board) {
 	case MZ0380_BOARD_ELGATO_HD60_PRO:
-		/*
-		 * Keep the first implementation probe-safe. We only identify
-		 * and map resources here until the command and DMA interfaces
-		 * have been reverse engineered.
-		 */
+	case MZ0380_BOARD_ELGATO_HD60_PRO_REV3:
 		break;
+	default:
+		return 0;
 	}
+
+	if (!mz0380_enable_video) {
+		printk(KERN_INFO
+		       "%s: probe-safe V4L2 node disabled; load with enable_video=1 when you want /dev/video*\n",
+		       dev->name);
+		return 0;
+	}
+
+	ret = mz0380_video_register(dev);
+	if (ret)
+		return ret;
+
+	if (mz0380_enable_audio) {
+		ret = mz0380_audio_register(dev);
+		if (ret) {
+			pr_warn("%s: audio register failed (%d) - continuing without ALSA\n",
+				dev->name, ret);
+		}
+	}
+
+	return 0;
+}
+
+void mz0380_card_cleanup(struct mz0380_dev *dev)
+{
+	mz0380_audio_unregister(dev);
+	mz0380_video_unregister(dev);
 }
