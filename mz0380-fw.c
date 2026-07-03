@@ -183,20 +183,32 @@ void mz0380_fw_info_dump(struct seq_file *m, struct mz0380_dev *dev)
 			   MZ0380_MB_PARAM(i), mz_mmio_read(dev, MZ0380_MB_PARAM(i)));
 
 	/*
-	 * With booted firmware the bridge register file is reachable via
-	 * mailbox reg-read commands. Reg 0x12 bit0 = input signal present
-	 * (safe to read; the read-to-clear IRQ regs 0x10/13/14/15 are NOT
-	 * dumped here to avoid eating events).
+	 * Peripheral register probe over the (now working) mailbox. NOTE:
+	 * the HDMI-signal register is NOT yet identified - reg 0x12 was a
+	 * guess and reads 0 even with a source connected (the HD60 Pro's
+	 * HDMI receiver is a different chip than the analog TVP5160 path).
+	 * Dump a few candidate bridge regs read-only for RE correlation
+	 * rather than asserting a signal state we cannot trust.
 	 */
 	if (dev->fw_state == MZ0380_FW_STATE_READY) {
-		u32 sig;
+		/*
+		 * Non-clearing chip-0x90 regs only: the ISR treats 0x13/0x14/
+		 * 0x15 (and re-reads 0x10) as read-to-clear, so cat'ing them
+		 * from /proc would eat the card's signal-change events.
+		 */
+		static const u8 regs[] = { 0x11, 0x12, 0x16, 0x17, 0x8b };
+		unsigned int i;
+		u32 v;
 
-		if (mz0380_periph_read(dev, MZ0380_CHIP_BRIDGE,
-				       MZ0380_BRIDGE_SIGNAL, &sig) == 0)
-			seq_printf(m, "  hdmi signal: %s (bridge[0x12]=0x%08x)\n",
-				   (sig & 1) ? "present" : "absent", sig);
-		else
-			seq_puts(m, "  hdmi signal: query failed\n");
+		seq_puts(m, "  bridge probe (chip 0x90, UNVERIFIED):");
+		for (i = 0; i < ARRAY_SIZE(regs); i++) {
+			if (mz0380_periph_read(dev, MZ0380_CHIP_BRIDGE,
+					       regs[i], &v) == 0)
+				seq_printf(m, " [0x%02x]=%08x", regs[i], v);
+			else
+				seq_printf(m, " [0x%02x]=ERR", regs[i]);
+		}
+		seq_putc(m, '\n');
 	}
 }
 EXPORT_SYMBOL_GPL(mz0380_fw_info_dump);
