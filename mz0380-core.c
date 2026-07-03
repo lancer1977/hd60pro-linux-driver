@@ -3264,6 +3264,64 @@ static int mz0380_proc_create(void)
  * thread (FUN_140284380): BAR5 flag first, then the BAR0 event word,
  * then the 0x400 doorbell. Also deasserts INTx.
  */
+/*
+ * M4 diagnostic: empirically locate the post-boot mailbox layout.
+ *
+ * ep.ko (card side) allocates a fresh dma_coherent(0x60) command buffer on boot
+ * and maps host BAR0 to it via the inbound window based at dma_handle+4, so the
+ * post-boot opcode/STATUS offsets differ from the bootloader's (which we use).
+ * Rather than guess the offset, sweep candidate (opcode_off, doorbell_off)
+ * layouts: for each, issue GET_BOARD_VERSION and see whether any word in the
+ * 0x60 mailbox region changes away from the 0xdddddddd poison / our own writes.
+ * Read-modify only within the 0x60 mailbox aperture - safe.
+ */
+void mz0380_mailbox_scan(struct mz0380_dev *dev)
+{
+	static const u32 op_off[]   = { 0x00, 0x04 };
+	static const u32 bell_off[] = { 0x00, 0x04 };
+	unsigned int oi, bi, w;
+
+	pr_info("%s: mailbox scan: baseline region dump:\n", dev->name);
+	for (w = 0; w < 0x60; w += 4)
+		pr_info("%s:   base[0x%02x] = %08x\n", dev->name, w,
+			mz_mmio_read(dev, w));
+
+	for (oi = 0; oi < ARRAY_SIZE(op_off); oi++) {
+		for (bi = 0; bi < ARRAY_SIZE(bell_off); bi++) {
+			u32 o = op_off[oi], b = bell_off[bi];
+			bool changed = false;
+
+			/* clear the region we own, without touching the poison
+			 * word until after, so we can spot a real card write */
+			for (w = 0; w < 0x60; w += 4)
+				if (w != MZ0380_MB_STATUS)
+					mz_mmio_write(dev, w, 0);
+			/* opcode GET_BOARD_VERSION at candidate offset */
+			mz_mmio_write(dev, o, MZ0380_CMD_GET_BOARD_VERSION);
+			wmb();
+			mz_mmio_write(dev, b, MZ0380_MB_FIRE);
+			msleep(50);
+
+			for (w = 0; w < 0x60; w += 4) {
+				u32 v = mz_mmio_read(dev, w);
+
+				if (v != 0 && v != 0xdddddddd &&
+				    v != MZ0380_CMD_GET_BOARD_VERSION) {
+					pr_info("%s: scan op@0x%02x bell@0x%02x: base[0x%02x]=%08x (RESPONSE?)\n",
+						dev->name, o, b, w, v);
+					changed = true;
+				}
+			}
+			if (!changed)
+				pr_info("%s: scan op@0x%02x bell@0x%02x: no change\n",
+					dev->name, o, b);
+			mz0380_mb_ack_event(dev);
+		}
+	}
+	pr_info("%s: mailbox scan done\n", dev->name);
+}
+EXPORT_SYMBOL_GPL(mz0380_mailbox_scan);
+
 void mz0380_mb_ack_event(struct mz0380_dev *dev)
 {
 	mz_cfg_write(dev, MZ0380_CFG_INT_FLAG, MZ0380_CFG_INT_ACK_VAL);
@@ -3469,6 +3527,8 @@ int mz0380_card_init(struct mz0380_dev *dev)
 			mz_cfg_read(dev, MZ0380_CFG_INT_FLAG),
 			mz_cfg_read(dev, MZ0380_CFG_NOTIFY_PTR0),
 			mz_cfg_read(dev, MZ0380_CFG_NOTIFY_PTR1));
+		if (mz0380_dma_handshake)
+			mz0380_mailbox_scan(dev);
 		return ret;
 	}
 	pr_info("%s: CMD_INIT answered on attempt %u (status=0x%08x)\n",
