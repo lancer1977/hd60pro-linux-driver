@@ -3423,38 +3423,40 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 		bool done = false;
 		u32 event;
 
+		/*
+		 * Poll QUIETLY: check STATUS and EVENT, and ack ONLY when a
+		 * real event is pending. The earlier "ack every tick" scheme
+		 * fired the 0x400 doorbell every 1 ms, which aborts a
+		 * STATUS-completing command (0x01/0x0a) before the card
+		 * finishes it - the mailbox scan proved a silent wait
+		 * completes reliably where the ack-storm did not.
+		 */
 		do {
-			/*
-			 * Windows-clone tick: read the event word, then ALWAYS
-			 * run the ack/rearm sequence (the Windows event thread
-			 * does this unconditionally at 1 ms cadence, event or
-			 * not - post-boot firmware appears to require the 0x400
-			 * kick to keep servicing the mailbox).
-			 */
-			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
-			mz0380_mb_ack_event(dev);
-			if (event & MZ0380_MB_EVENT_CMD_DONE) {
-				pr_info("%s: EVENT=0x%08x during command 0x%x (cmd-done), acked\n",
-					dev->name, event, opcode);
-				done = true;
-				break;
-			}
-			if (event)
-				pr_info("%s: EVENT=0x%08x during command 0x%x (other), acked\n",
-					dev->name, event, opcode);
 			status = mz_mmio_read(dev, MZ0380_MB_STATUS);
 			/*
 			 * Completion = bit0, or the firmware's 0xaaaaaaaa
-			 * success stamp (GET_BOARD_VERSION). The 0xdddddddd
-			 * boot stamp also has bit0 set but is NOT a
-			 * completion - seen to fake-complete a command
-			 * 0.25 ms after fw boot.
+			 * success stamp (GET_BOARD_VERSION/INIT). The
+			 * 0xdddddddd boot stamp also has bit0 set but is NOT a
+			 * completion.
 			 */
 			if (status == MZ0380_MB_STATUS_OK_STAMP ||
 			    ((status & MZ0380_MB_STATUS_DONE) &&
 			     status != MZ0380_MB_STATUS_BOOT_STAMP)) {
 				done = true;
 				break;
+			}
+			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+			if (event) {
+				bool cmd_done = event & MZ0380_MB_EVENT_CMD_DONE;
+
+				mz0380_mb_ack_event(dev);
+				pr_info("%s: EVENT=0x%08x during command 0x%x (%s), acked\n",
+					dev->name, event, opcode,
+					cmd_done ? "cmd-done" : "other");
+				if (cmd_done) {
+					done = true;
+					break;
+				}
 			}
 			usleep_range(900, 1100);
 			waited += 1;
