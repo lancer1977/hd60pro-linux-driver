@@ -70,6 +70,24 @@ m2)
 	echo "[M2] PASS if dmesg shows a firmware version / boot success and a BAR0"
 	echo "     read returns something other than 0xffffffff afterwards."
 	;;
+m4)
+	echo "[M4] building..."; make -s || exit 1
+	unload; load_deps
+	echo "[M4] loading firmware_upload=1 dma_handshake=1 (bus master + MSI, NO ring programming)..."
+	dmesg -C 2>/dev/null || true
+	insmod "$MOD" procfs_verbosity=2 snapshot_profile=6 firmware_upload=1 \
+		dma_handshake=1 enable_video=1
+	rc=$?
+	sleep 2
+	echo "===== dmesg ====="
+	dmesg | grep -iE 'mz0380|CMD_INIT|board|EVENT|handshake|signal|MSI' \
+		| grep -vE 'Modules linked in|Unloaded tainted' | tail -50
+	echo "insmod rc=$rc"
+	dump
+	echo
+	echo "[M4] PASS if CMD_INIT is answered and 'board reports running firmware'"
+	echo "     appears; then hdmi signal should read present/absent."
+	;;
 *)
-	echo "unknown stage '$STAGE' (use m0 or m2)"; exit 1;;
+	echo "unknown stage '$STAGE' (use m0, m2 or m4)"; exit 1;;
 esac

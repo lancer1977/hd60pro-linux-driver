@@ -167,6 +167,17 @@ module_param_named(enable_dma, mz0380_enable_dma, bool, 0444);
 MODULE_PARM_DESC(enable_dma,
 		 "allocate ring buffers, request MSI, enable bus mastering; off by default");
 
+/*
+ * M4 diagnostic: enable bus mastering + MSI/ISR BEFORE firmware load, but do
+ * NOT program any (still-unverified) ring addresses. Safe because the card has
+ * no host DMA target to write to; tests whether the post-boot mailbox doorbell
+ * only reaches the card once bus mastering is on.
+ */
+bool mz0380_dma_handshake;
+module_param_named(dma_handshake, mz0380_dma_handshake, bool, 0444);
+MODULE_PARM_DESC(dma_handshake,
+		 "enable bus master + MSI (no ring programming) before firmware handshake; M4 diagnostic");
+
 bool mz0380_enable_audio;
 module_param_named(enable_audio, mz0380_enable_audio, bool, 0444);
 MODULE_PARM_DESC(enable_audio,
@@ -3593,6 +3604,18 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 				mz0380_irq_release(dev);
 			}
 		}
+	} else if (mz0380_dma_handshake) {
+		/*
+		 * M4 diagnostic: enable bus mastering ONLY - no MSI, no ring
+		 * programming. Keeps the trusted STATUS/EVENT poll path (MSI
+		 * would route completion through the still-unverified ISR
+		 * status offsets). Isolates the single variable: does the
+		 * post-boot doorbell only reach the card with bus mastering
+		 * on? Must precede the firmware handshake in card_setup.
+		 */
+		pci_set_master(pci_dev);
+		pr_info("%s: dma_handshake: bus mastering on (poll path)\n",
+			dev->name);
 	} else if (allow_bus_master) {
 		/* legacy escape hatch: bus-master without DMA setup */
 		pci_set_master(pci_dev);

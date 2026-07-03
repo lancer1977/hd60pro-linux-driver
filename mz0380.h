@@ -479,6 +479,7 @@ static inline void mz0380_audio_period_elapsed(struct mz0380_dev *dev) {}
 /* Module-param gates */
 extern bool mz0380_firmware_upload_enabled;
 extern bool mz0380_enable_dma;
+extern bool mz0380_dma_handshake;
 extern bool mz0380_enable_audio;
 extern unsigned int mz0380_video_ring_entries;
 extern unsigned int mz0380_video_ring_entry_size;
