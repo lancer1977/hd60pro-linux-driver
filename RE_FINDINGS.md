@@ -147,3 +147,40 @@ One SDK function sizes and allocates all DMA memory. MZ0380 matches via
 
 Note: BAR5[0x30]=bar0+0x4 and BAR5[0x38]=bar0+0x5f exist pre-boot already,
 so those two are card-programmed defaults, not host DMA pointers.
+
+## THE ORACLE: firmware blob is a full Linux SDK; card-side ep.ko serves the mailbox
+
+MZ0380.HD.HEX = gzip -> GNU tar "yuan_demo_sdi/" = complete ARM Linux userland
+for the card SoC (project SC5C0). rc.local loads drivers then runs
+video_capture_mgr / audio_capture_mgr / yuan_ioctrl. The host-facing PCIe
+mailbox is implemented by drivers/ep.ko (ARM ELF, not stripped) - this is the
+authoritative post-boot command spec, no more guessing from the Windows side.
+
+Extracted: scratchpad/fw/yuan_demo_sdi/. Key funcs in ep.ko:
+  pciep_isr @ 0x11234       - host command dispatcher (the real ISR)
+  pciep_isr_clrint @ 0x10d68
+  command_store/show        - sysfs command attr
+
+### ep.ko command model (RE-confirmed)
+- Command buffer base = inbound_mem0_start + 4 (== host BAR0 phys + 4), recomputed
+  every doorbell from *(ep_regs + 0x10). Matches BAR5[0x30]=bar0+4, BAR5[0x38]=bar0+0x5f.
+- Layout at that base: word0 = opcode, word1.. = params, word10 (= bar0+0x2c,
+  our STATUS) = completion slot.
+- Completion is per-opcode, TWO mechanisms:
+  * opcode 0x01 (INIT), 0x0a (GET_VERSION), 0x02/0x03/0x04 (SET banks): write
+    STATUS word10. GET_VERSION writes version to word1/word2 (bar0+8/0x0c) and
+    STATUS = 0xaaaaaaaa (DAT_00011978) when ready, else DAT_0001197c.
+  * opcode 0x0b/0x0e (FW download), 0x2a/0x29 (signal): sysfs_notify -> raises the
+    host EVENT 0x800 instead of writing STATUS. (Explains why fw upload completes
+    via EVENT, not STATUS.)
+- Unknown opcode -> prints "$$$command: 0x%08x" + 10 params and returns WITHOUT
+  writing STATUS (host sees a timeout).
+
+### Why the live command path (INIT/version/signal) is still deaf post-boot
+Pre-boot the bootloader answers 0x0b with a fixed inbound mapping. Post-boot ep.ko
+brings up the full inbound/DMA window; until the host establishes that window
+(bus-master DMA, currently disabled by enable_dma=0), the doorbell IRQ fetches the
+command from the wrong card-RAM address and STATUS stays at ep.ko's 0xdddddddd
+poison value. => the post-boot control path is gated on DMA/bus-master (M4), not on
+opcode correctness. mz0380_card_init() is Windows-accurate and should light up once
+the inbound window is programmed.

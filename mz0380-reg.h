@@ -105,8 +105,15 @@
 #define MZ0380_MB_INT_ACK              0x400   /* doorbell value acking an event   */
 #define MZ0380_MB_RESET                MZ0380_MB_INT_ACK /* old name, same value   */
 #define MZ0380_MB_STATUS_DONE          BIT(0)  /* MZ0380_MB_STATUS bit0            */
+#define MZ0380_MB_STATUS_OK_STAMP      0xaaaaaaaa /* fw stamps STATUS on success   */
+#define MZ0380_MB_STATUS_BOOT_STAMP    0xdddddddd /* fw stamps STATUS after boot   */
 #define MZ0380_MB_EVENT_CMD_DONE       BIT(11) /* EVENT bit11 = command complete   */
 #define MZ0380_MB_POLL_ITERS           50      /* SEND_COMMAND polls 0x32 times    */
+
+/* BAR5 notify pointers the host must program before CMD_INIT
+ * (FUN_140278bb0): physical BAR0 addresses of the mailbox slots. */
+#define MZ0380_CFG_NOTIFY_PTR0         0x30    /* <- bar0 phys + 0x04              */
+#define MZ0380_CFG_NOTIFY_PTR1         0x38    /* <- bar0 phys + 0x5f              */
 
 /*
  * BAR5 side of the interrupt handshake (Windows event thread
@@ -147,8 +154,12 @@
 #define MZ0380_BRIDGE_CTL18             0x18  /* bit7 toggled as a reset strobe   */
 #define MZ0380_BRIDGE_CTL19             0x19  /* event ack/mask (bits 0x30 kept)  */
 
+/* Post-boot handshake (RE-confirmed, FUN_140278bb0) */
+#define MZ0380_CMD_INIT                 0x01  /* hello/init, no params, retried    */
+#define MZ0380_CMD_GET_BOARD_VERSION    0x0a  /* STATUS=0xaaaaaaaa on success,
+					       * running fw version -> PARAM 0x08/0x0c */
+
 /* Opcodes not yet resolved by RE - placeholders (CHECKME) */
-#define MZ0380_CMD_GET_FW_VERSION       0x01  /* CHECKME (host reads version from blob) */
 #define MZ0380_CMD_SET_VIC_PARAMS       0x10  /* CHECKME */
 #define MZ0380_CMD_SET_AIC              0x11  /* CHECKME */
 #define MZ0380_CMD_START_STREAMING      0x12  /* CHECKME */

@@ -201,28 +201,21 @@ void mz0380_fw_info_dump(struct seq_file *m, struct mz0380_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mz0380_fw_info_dump);
 
-int mz0380_firmware_query_version(struct mz0380_dev *dev)
+/*
+ * Parse the "MM.mm" ASCII sidecar version file (MZ0380.FW.TXT, shipped
+ * next to the HEX blob). This is where the Windows driver gets the
+ * EXPECTED firmware version from - there is no version-query opcode.
+ */
+static bool mz0380_fw_parse_version(const u8 *d, size_t len,
+				    u32 *major, u32 *minor)
 {
-	u32 status;
-	int ret;
-
-	ret = mz0380_send_command(dev, MZ0380_CMD_GET_FW_VERSION,
-				  NULL, 0, &status, 500);
-	if (ret)
-		return ret;
-
-	/*
-	 * ep.ko prints "FIRMWARE VERSION: %d.%d" - param0 holds the
-	 * packed major/minor or two adjacent params.
-	 */
-	dev->fw_version_major = (dev->cmd_last_param[0] >> 16) & 0xffff;
-	dev->fw_version_minor = dev->cmd_last_param[0] & 0xffff;
-
-	pr_info("%s: firmware version %u.%u\n",
-		dev->name, dev->fw_version_major, dev->fw_version_minor);
-	return 0;
+	if (len < 5 || !isdigit(d[0]) || !isdigit(d[1]) || d[2] != '.' ||
+	    !isdigit(d[3]) || !isdigit(d[4]))
+		return false;
+	*major = (d[0] - '0') * 10 + (d[1] - '0');
+	*minor = (d[3] - '0') * 10 + (d[4] - '0');
+	return true;
 }
-EXPORT_SYMBOL_GPL(mz0380_firmware_query_version);
 
 int mz0380_firmware_load(struct mz0380_dev *dev)
 {
@@ -265,6 +258,36 @@ int mz0380_firmware_load(struct mz0380_dev *dev)
 		return 0;
 	}
 
+	/* expected version from the optional sidecar file */
+	{
+		const struct firmware *vf;
+		u32 want_major = 0, want_minor = 0;
+		bool have_want = false;
+
+		if (!firmware_request_nowarn(&vf, "mz0380/MZ0380.FW.TXT",
+					     &dev->pci->dev)) {
+			have_want = mz0380_fw_parse_version(vf->data, vf->size,
+							    &want_major,
+							    &want_minor);
+			release_firmware(vf);
+		}
+
+		/*
+		 * Handshake with whatever firmware is already running (the
+		 * card keeps it across reloads). If it matches the shipped
+		 * version, skip the ~21 s upload+boot entirely.
+		 */
+		if (mz0380_card_init(dev) == 0 && have_want &&
+		    dev->fw_version_major == want_major &&
+		    dev->fw_version_minor == want_minor) {
+			pr_info("%s: card already runs firmware %u.%u, skipping upload\n",
+				dev->name, want_major, want_minor);
+			dev->fw_state = MZ0380_FW_STATE_READY;
+			mutex_unlock(&dev->fw_lock);
+			return 0;
+		}
+	}
+
 	ret = mz0380_fw_upload_blob(dev, fw);
 	if (ret) {
 		dev->fw_state = MZ0380_FW_STATE_FAILED;
@@ -274,7 +297,10 @@ int mz0380_firmware_load(struct mz0380_dev *dev)
 		return ret;
 	}
 
-	mz0380_firmware_query_version(dev);
+	/* post-boot handshake; also reads the now-running version */
+	if (mz0380_card_init(dev))
+		pr_warn("%s: post-boot handshake failed - mailbox may stay deaf\n",
+			dev->name);
 
 	mutex_unlock(&dev->fw_lock);
 	return 0;

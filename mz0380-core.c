@@ -3302,8 +3302,15 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 	dev->cmd_complete = false;
 	smp_wmb();
 
-	/* clear status latch, then ring the doorbell */
-	mz_mmio_write(dev, MZ0380_MB_STATUS, 0);
+	/*
+	 * Clear the status latch - but never stomp the firmware's stamp
+	 * values (Windows only clears STATUS in its poll path; the IRQ path
+	 * used for INIT/fw-download leaves it alone entirely).
+	 */
+	status = mz_mmio_read(dev, MZ0380_MB_STATUS);
+	if (status != MZ0380_MB_STATUS_BOOT_STAMP &&
+	    status != MZ0380_MB_STATUS_OK_STAMP)
+		mz_mmio_write(dev, MZ0380_MB_STATUS, 0);
 	wmb();
 	mz_mmio_write(dev, MZ0380_MB_DOORBELL, MZ0380_MB_FIRE);
 
@@ -3342,31 +3349,45 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 		 * eventually stops signalling.
 		 */
 		unsigned int waited = 0;
-		unsigned int max_wait = max(timeout_ms * 10u,
+		unsigned int max_wait = max(timeout_ms,
 					    (unsigned int)MZ0380_MB_POLL_ITERS);
 		bool done = false;
 		u32 event;
 
 		do {
-			status = mz_mmio_read(dev, MZ0380_MB_STATUS);
-			if (status & MZ0380_MB_STATUS_DONE) {
+			/*
+			 * Windows-clone tick: read the event word, then ALWAYS
+			 * run the ack/rearm sequence (the Windows event thread
+			 * does this unconditionally at 1 ms cadence, event or
+			 * not - post-boot firmware appears to require the 0x400
+			 * kick to keep servicing the mailbox).
+			 */
+			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+			mz0380_mb_ack_event(dev);
+			if (event & MZ0380_MB_EVENT_CMD_DONE) {
+				pr_info("%s: EVENT=0x%08x during command 0x%x (cmd-done), acked\n",
+					dev->name, event, opcode);
 				done = true;
 				break;
 			}
-			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
-			if (event) {
-				bool cmd_done = event & MZ0380_MB_EVENT_CMD_DONE;
-
-				mz0380_mb_ack_event(dev);
-				pr_info("%s: EVENT=0x%08x during command 0x%x (%s), acked\n",
-					dev->name, event, opcode,
-					cmd_done ? "cmd-done" : "other");
-				if (cmd_done) {
-					done = true;
-					break;
-				}
+			if (event)
+				pr_info("%s: EVENT=0x%08x during command 0x%x (other), acked\n",
+					dev->name, event, opcode);
+			status = mz_mmio_read(dev, MZ0380_MB_STATUS);
+			/*
+			 * Completion = bit0, or the firmware's 0xaaaaaaaa
+			 * success stamp (GET_BOARD_VERSION). The 0xdddddddd
+			 * boot stamp also has bit0 set but is NOT a
+			 * completion - seen to fake-complete a command
+			 * 0.25 ms after fw boot.
+			 */
+			if (status == MZ0380_MB_STATUS_OK_STAMP ||
+			    ((status & MZ0380_MB_STATUS_DONE) &&
+			     status != MZ0380_MB_STATUS_BOOT_STAMP)) {
+				done = true;
+				break;
 			}
-			usleep_range(100, 200);
+			usleep_range(900, 1100);
 			waited += 1;
 		} while (waited < max_wait);
 
@@ -3406,6 +3427,68 @@ out:
 EXPORT_SYMBOL_GPL(mz0380_send_command);
 
 /*
+ * Post-boot handshake (Windows FUN_140278bb0): program the BAR5 notify
+ * pointers with the physical BAR0 mailbox addresses, ack, then send
+ * CMD_INIT until the firmware answers. Follow up with GET_BOARD_VERSION
+ * (success stamp 0xaaaaaaaa) whose result in PARAM 0x08/0x0c is the
+ * RUNNING firmware version. The mailbox ignores most opcodes until this
+ * dance is done.
+ */
+int mz0380_card_init(struct mz0380_dev *dev)
+{
+	resource_size_t bar0 = pci_resource_start(dev->pci, 0);
+	unsigned int attempt;
+	u32 status = 0;
+	int ret = -ETIMEDOUT;
+
+	mz_cfg_write(dev, MZ0380_CFG_NOTIFY_PTR0, lower_32_bits(bar0) + 0x04);
+	mz_cfg_write(dev, MZ0380_CFG_NOTIFY_PTR1, lower_32_bits(bar0) + 0x5f);
+	wmb();
+	mz0380_mb_ack_event(dev);
+
+	for (attempt = 0; attempt < 10 && ret; attempt++)
+		ret = mz0380_send_command(dev, MZ0380_CMD_INIT, NULL, 0,
+					  &status, 600);
+	if (ret) {
+		pr_warn("%s: CMD_INIT got no answer (%d), STATUS=%08x EVENT=%08x RESULT=%08x bar5[dc]=%08x bar5[30]=%08x bar5[38]=%08x\n",
+			dev->name, ret,
+			mz_mmio_read(dev, MZ0380_MB_STATUS),
+			mz_mmio_read(dev, MZ0380_MB_EVENT),
+			mz_mmio_read(dev, MZ0380_MB_RESULT),
+			mz_cfg_read(dev, MZ0380_CFG_INT_FLAG),
+			mz_cfg_read(dev, MZ0380_CFG_NOTIFY_PTR0),
+			mz_cfg_read(dev, MZ0380_CFG_NOTIFY_PTR1));
+		return ret;
+	}
+	pr_info("%s: CMD_INIT answered on attempt %u (status=0x%08x)\n",
+		dev->name, attempt, status);
+
+	{
+		u32 params[2] = { 0, 0 };
+
+		ret = -ETIMEDOUT;
+		for (attempt = 0; attempt < 10 && ret; attempt++)
+			ret = mz0380_send_command(dev,
+						  MZ0380_CMD_GET_BOARD_VERSION,
+						  params, 2, &status, 5000);
+	}
+	if (ret) {
+		pr_warn("%s: GET_BOARD_VERSION got no answer (%d)\n",
+			dev->name, ret);
+		return ret;
+	}
+
+	msleep(100);
+	dev->fw_version_major = mz_mmio_read(dev, MZ0380_MB_PARAM(1));
+	dev->fw_version_minor = mz_mmio_read(dev, MZ0380_MB_PARAM(2));
+	pr_info("%s: board reports running firmware %u.%u (status=0x%08x)\n",
+		dev->name, dev->fw_version_major, dev->fw_version_minor,
+		status);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_card_init);
+
+/*
  * Peripheral register file access via mailbox opcodes 0x1a/0x1b
  * (Windows FUN_1402777e4 / FUN_1402851cc). Read results land in the
  * PARAM3 slot (BAR0+0x10). Requires booted firmware.
@@ -3417,8 +3500,15 @@ int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val)
 
 	ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ, params, 3,
 				  NULL, 1000);
-	if (ret)
+	if (ret) {
+		pr_info("%s: REG_READ chip=0x%02x reg=0x%02x failed (%d), STATUS=%08x EVENT=%08x RESULT=%08x P3=%08x\n",
+			dev->name, chip, reg, ret,
+			mz_mmio_read(dev, MZ0380_MB_STATUS),
+			mz_mmio_read(dev, MZ0380_MB_EVENT),
+			mz_mmio_read(dev, MZ0380_MB_RESULT),
+			mz_mmio_read(dev, MZ0380_MB_PARAM(3)));
 		return ret;
+	}
 	if (val)
 		*val = dev->cmd_last_param[3];
 	return 0;
@@ -3453,6 +3543,13 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 	}
 
 	pci_clear_master(pci_dev);
+	/*
+	 * We service the card by polling (like the Windows event thread);
+	 * no IRQ handler is registered, so mask INTx at the PCI level.
+	 * A pending assert on the (shared) line otherwise spins the kernel
+	 * in unclaimed-interrupt handling between event and ack.
+	 */
+	pci_intx(pci_dev, 0);
 	pci_read_config_byte(pci_dev, PCI_CLASS_REVISION, &dev->pci_rev);
 	pci_read_config_byte(pci_dev, PCI_LATENCY_TIMER, &dev->pci_lat);
 

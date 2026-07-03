@@ -442,7 +442,7 @@ int mz0380_periph_write(struct mz0380_dev *dev, u8 chip, u8 reg, u32 val);
 /* Firmware (mz0380-fw.c) */
 int mz0380_firmware_load(struct mz0380_dev *dev);
 void mz0380_firmware_release(struct mz0380_dev *dev);
-int mz0380_firmware_query_version(struct mz0380_dev *dev);
+int mz0380_card_init(struct mz0380_dev *dev);
 const char *mz0380_fw_state_name(enum mz0380_fw_state s);
 void mz0380_fw_info_dump(struct seq_file *m, struct mz0380_dev *dev);
 
