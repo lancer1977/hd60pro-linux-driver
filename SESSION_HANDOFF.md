@@ -1,45 +1,70 @@
-# Session Handoff — MZ0380 / HD60 Pro driver
-
-Plan file: `/home/wolffyx/.claude/plans/i-want-to-create-happy-prism.md`
-RE details: `RE_FINDINGS.md`  |  Test script: `mz0380-m0m2-test.sh`
+# MZ0380 driver — session handoff
 
 ## Project
-Open-source Linux PCIe driver for Elgato HD60 Pro (YUAN MZ0380, PCI `12ab:0380`,
-subsys `1cfa:0006`). Repo `/home/wolffyx/Projects/sc0710` had full scaffolding
-(`mz0380-*.c/h`) + 7 correlation-confirmed BAR5 encoder-property offsets.
+Open-source Linux V4L2 driver for the Elgato HD60 Pro (YUAN MZ0380,
+PCI 12ab:0380, subsys 1cfa:0006). Repo: /home/wolffyx/Projects/sc0710.
+Clean-room RE of the Windows driver + firmware; own hardware. Not security work.
 
-## Decisions locked (with user)
-1. Format path: **hybrid** — raw YV12 for validation, keep H.264 encoder controls, expose both.
-2. Register oracle: **Ghidra RE** of Windows driver `e60MZ0380.X64.SYS` (on disk, Ghidra installed).
-3. Live risk: proceed **up to firmware upload** (M0–M2). DMA/bus-master (M3+) needs separate go-ahead.
+## State: CONTROL PATH WORKS (verified on hardware)
+Firmware upload+boot AND the post-boot command mailbox are fully working and
+deterministic. Card runs firmware 1.11, answers commands, reports version, and
+peripheral register read/write over the mailbox works.
 
-## THE key finding (RE-confirmed, corrects the repo)
-Command mailbox + firmware buffer are on **BAR0**, NOT BAR5 (repo's model was inverted).
-- `ctx+0x108` = BAR0 (mailbox+fw), `ctx+0x110` = BAR5 (DMA ptrs + property cache).
-- Proof: BAR5 0x30/0x38 hold BAR0 phys ptrs `fc200004`/`fc20005f` = lspci BAR0 `fc200000`.
-- Mailbox: doorbell@0x00 (fire=0x800), opcode@0x04, result@0x08 (0=ok), status@0x2c (bit0=done), fw buf@0x60.
-- Firmware = whole blob to BAR0+0x60 between BEGIN(0x0b)/COMMIT(0x0c); base fw 0x0e/0x0f. No chunk protocol.
+Load it:
+    sudo ./mz0380-m0m2-test.sh m2      # upload/handshake (no bus master needed)
+    sudo ./mz0380-m0m2-test.sh m4      # same + bus master + mailbox scan diag
+m2 alone reaches: "CMD_INIT answered" -> "board reports running firmware 1.11"
+-> "card already runs firmware 1.11, skipping upload" (fast path, no 21s boot).
 
-## Done this session (builds clean)
-- M0 observability: snapshot profile 6, CFG trace → 0x00e4, BAR0 mailbox dump in `/proc/mz0380-state`.
-- M1 RE: `RE_FINDINGS.md` (decompiled `e60MZ0380.X64.SYS`).
-- M2 code: rewrote `mz0380-reg.h` mailbox/fw defs, `mz0380_send_command` (core.c),
-  `mz0380-fw.c` upload, fixed ISR (dma.c) + signal (video.c) to BAR0.
+## The protocol (RE-confirmed, on BAR0 — see RE_FINDINGS.md + memory)
+- Mailbox in BAR0: opcode @0x04, params @0x08.., doorbell @0x00 (=0x800),
+  STATUS @0x2c, fw buffer @0x60, event word @0x30.
+- Completion: STATUS reads 0xaaaaaaaa success stamp (NOT bit0). 0xdddddddd is a
+  boot stamp, NOT completion. Long ops (fw dl) signal via EVENT(0x30) bit11.
+- Event ack (ONLY when EVENT!=0): BAR5[0xdc]=2; BAR0[0x30]=0; doorbell 0x400.
+- Opcodes: 0x01 INIT, 0x0a GET_BOARD_VERSION, 0x0b/0x0c fw dl begin/commit
+  (commit = fire-and-forget, ~21s boot), 0x1a/0x1b peripheral reg read/write
+  (chip 0x90 bridge, 0xb8 TVP5160 analog).
+- Firmware blob = gzip+tar = full ARM Linux SDK; card serves the mailbox from
+  drivers/ep.ko. ep.ko IS the command spec oracle (decompiled).
 
-## NEXT — start here
-1. **User runs live test** (needs sudo/TTY — agent has none):
-   - `sudo ./mz0380-m0m2-test.sh m0` → gate: do `bar0[...]` lines read structured
-     values (mailbox live) or `0xffffffff` (asleep, need wake sequence)?
-   - if live: `sudo ./mz0380-m0m2-test.sh m2` → pass = boot success + BAR0 ≠ 0xffffffff.
-2. **M3 RE pass (offline, safe, do anytime):** decompile IRQ + ring offsets —
-   `Interrupt_Handler` = FUN_14024ba60, streaming setup = FUN_1402829a0.
-   Ghidra project cached at `scratchpad/re/proj/mz0380`; reuse `DecompMZ0380.java`
-   (edit the addr list). Logs: `scratchpad/re/{ghidra,decomp}.log`.
-3. **M4:** add `V4L2_PIX_FMT_YV12` to `mz0380-video.c` enum/try/s/g_fmt (lines ~311–380),
-   size `w*h*3/2`, colorspace SMPTE170M, keep H.264 as 2nd format.
+## THE key fix (why it was deaf before)
+The poll loop fired the 0x400 ack doorbell every 1ms unconditionally; that
+ABORTS a STATUS-completing command before the card finishes. Fix: poll
+silently, ack ONLY when EVENT(0x30)!=0. Bus mastering is NOT required.
 
-## Watch out
-- Never enable bus mastering by hand; only `mz0380_dma_setup()` may, after ring base
-  programmed (IOMMU-fault guard, group 24). Keep `enable_dma=0` until M3 authorized.
-- Firmware blob at `/lib/firmware/mz0380/MZ0380.HD.HEX` (present). Card at `04:00.0`.
-- Unresolved/CHECKME: GET_FW_VERSION opcode, QUERY_SIGNAL opcode, IRQ regs, ring regs.
+## Commits this session (on main, not pushed)
+550fab0 honest bridge probe (stop asserting bogus signal)
+71c2862 docs: M4 control-path success
+2ab7c36 fix: quiet mailbox poll  <-- the breakthrough
+4c267c0 M4 mailbox layout scan diagnostic
+43ad905 fix: bus master ordering
+728c01e M4 dma_handshake diagnostic
+3e4440a post-boot handshake + ep.ko command spec
+1b05934 periph reg access, event drain, DMA RE notes
+6b1d434 firmware upload+boot via BAR0 mailbox
+
+## OPEN / next milestone: frame capture (M4 second half)
+1. HDMI signal register UNKNOWN. bridge[0x12] was a wrong guess. Windows
+   streaming thread FUN_1402829a0 is the ANALOG (TVP5160/chip 0xb8) path — the
+   HD60 Pro's HDMI receiver is a different chip, not yet located.
+   CHEAP: cat /proc/mz0380-state | grep 'bridge probe' with source connected vs
+   not; see which of 0x11/0x12/0x16/0x17/0x8b flips.
+2. Nothing yet COMMANDS the card to select HDMI input / start the video front
+   end — we only cache the input value. Need input-select + SET_VIC +
+   START_STREAMING opcodes (RE ep.ko pciep_isr cmd 2/3/4 SET banks + Windows
+   SET_VIC_PARAMS / AUTO.INPUT path).
+3. Frame DMA ring: mz0380-dma.c ring-register offsets are GUESSES. Need real
+   offsets before enabling frame DMA (RE DMA alloc FUN_14028d254 consumers +
+   XDMA channel regs). enable_dma=0 still the guardrail.
+
+## RE tooling (reusable)
+Ghidra project cached: scratchpad/re/proj/mz0380 (Windows .sys AND card ep.ko
+both imported). Reuse scratchpad/re/DecompMZ0380.java (edit addr list),
+-process <name> -noanalysis -postScript. Firmware extracted:
+scratchpad/fw/yuan_demo_sdi/. Key funcs: Windows init FUN_140278bb0, streaming
+FUN_1402829a0, DMA alloc FUN_14028d254; card ep.ko pciep_isr @0x11234.
+
+## Guardrails
+No manual bus-mastering needed for control (confirmed). enable_dma=0 until ring
+offsets verified. Blob + card present; firmware persists across reloads.
