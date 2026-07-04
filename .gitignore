@@ -10,3 +10,8 @@
 # IDE / tooling
 .idea/
 .claude/
+# RE source material (large vendor binaries) - kept local, not committed
+windowsDriver/
+sc0710-*.c
+sc0710-*.h
+sc0710.h

@@ -696,117 +696,25 @@ static const struct v4l2_dv_timings mz0380_no_signal = {
 };
 
 /*
- * sc0710-style BAR0 fallback signal read.
- *
- * Once firmware is up, mz0380's Xilinx fabric should expose the same
- * HDMI-source-status registers used by sc0710:
- *   BAR0[0x00a8] = width-related word
- *   BAR0[0x00c8] = source height (e.g. 0x438 == 1080)
- *   BAR0[0x00d0] = bit0 streaming, upper = mode
- *   BAR0[0x00e4] = bit0 streaming flag
- *
- * Returns true if a coherent lock signal was read.
+ * HDMI signal "query". RE_FINDINGS.md M6/M7: this firmware exposes NO card->host
+ * signal or standard query - the QCAP SDK header states plainly that
+ * "MZ0380 PCI DON'T SUPPORT AUTO STANDARD DETECTION". The video standard is
+ * host-supplied via SET_VIC_PARAMS (see mz0380_activate_hdmi_locked); the only
+ * feedback the card gives back is a no_signal-change nudge (EVENT bit11),
+ * tracked in dev->signal_locked. So VIDIOC_QUERY_DV_TIMINGS can honestly return
+ * only the last host-set / cached timing. The old sc0710-style BAR0 status
+ * window (0xa8..0xe4) is un-backed on this card and has been removed.
  */
-static bool mz0380_signal_from_bar0(struct mz0380_dev *dev,
-				    struct v4l2_dv_timings *out)
-{
-	u32 ctrl, height_w, status_a, streaming;
-	u32 width;
-	u32 height;
-
-	if (dev->fw_state != MZ0380_FW_STATE_READY)
-		return false;
-
-	ctrl       = mz_mmio_read(dev, MZ0380_REG_HDMI_CONTROL);
-	height_w   = mz_mmio_read(dev, MZ0380_REG_HDMI_HEIGHT);
-	status_a   = mz_mmio_read(dev, MZ0380_REG_HDMI_STATUS_A);
-	streaming  = mz_mmio_read(dev, MZ0380_REG_HDMI_STREAMING);
-
-	if (ctrl == 0xffffffff || height_w == 0)
-		return false;
-
-	height = height_w & 0xffff;
-	/* sc0710 encodes width in upper 16 bits of 0x00a8 */
-	width  = (mz_mmio_read(dev, MZ0380_REG_HDMI_WIDTH) >> 16) & 0xffff;
-
-	if (!width || !height)
-		return false;
-
-	*out = (struct v4l2_dv_timings){
-		.type = V4L2_DV_BT_656_1120,
-		.bt = {
-			.width      = width,
-			.height     = height,
-			.interlaced = (status_a & 0x200) ? 1 : 0,
-			.standards  = V4L2_DV_BT_STD_CEA861,
-			.pixelclock = (u64)width * height * 60,
-		},
-	};
-	dev->signal_locked = (streaming & 1) != 0;
-	return true;
-}
-
 int mz0380_query_signal(struct mz0380_dev *dev,
 			struct v4l2_dv_timings *out)
 {
-	u32 status = 0;
-	int ret;
-
-	if (!dev->dma_armed) {
-		*out = dev->detected_timings;
-		return dev->signal_locked ? 0 : -ENOLCK;
-	}
-
-	/* Prefer mailbox; fall back to BAR0 sc0710-style probe. */
-	ret = mz0380_send_command(dev, MZ0380_CMD_QUERY_SIGNAL,
-				  NULL, 0, &status, 500);
-	if (ret) {
-		if (mz0380_signal_from_bar0(dev, out)) {
-			dev->detected_timings = *out;
-			return dev->signal_locked ? 0 : -ENOLCK;
-		}
-		return ret;
-	}
-
-	/*
-	 * CHECKME: the QUERY_SIGNAL opcode and its status encoding are not yet
-	 * RE-confirmed (the sc0710-style BAR0 HDMI-status window in
-	 * mz0380_signal_from_bar0() is the grounded path). Until then, treat a
-	 * completed command with a non-zero returned width as a signal lock.
-	 */
-	dev->signal_locked = (status & MZ0380_MB_STATUS_DONE) &&
-			     dev->cmd_last_param[0] != 0;
-
 	if (!dev->signal_locked) {
 		dev->detected_timings = mz0380_no_signal;
 		*out = mz0380_no_signal;
 		return -ENOLCK;
 	}
 
-	/*
-	 * Returned params encoding (inferred from ep.ko
-	 * "n_input_video_resolution_cx/cy/fps/interleaved"):
-	 *    param0 = width
-	 *    param1 = height
-	 *    param2 = fps_q8 (frames/sec scaled by 256)
-	 *    param3 = bit0 interleaved
-	 */
-	{
-		struct v4l2_dv_timings t = {
-			.type = V4L2_DV_BT_656_1120,
-		};
-		u32 fps_q8 = dev->cmd_last_param[2];
-
-		t.bt.width        = dev->cmd_last_param[0];
-		t.bt.height       = dev->cmd_last_param[1];
-		t.bt.interlaced   = dev->cmd_last_param[3] & 1;
-		t.bt.pixelclock   = (u64)t.bt.width * t.bt.height *
-				    (fps_q8 ? fps_q8 : (60 << 8)) / 256;
-		t.bt.standards    = V4L2_DV_BT_STD_CEA861;
-
-		dev->detected_timings = t;
-		*out = t;
-	}
+	*out = dev->detected_timings;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_query_signal);

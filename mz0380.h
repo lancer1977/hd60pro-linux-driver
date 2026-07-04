@@ -217,6 +217,23 @@ struct mz0380_property_experiment {
 	u32 after_cfg_trace[MZ0380_CFG_TRACE_COUNT];
 };
 
+/*
+ * Live card-event watcher (diagnostic). A kthread samples the BAR0 EVENT word
+ * at high rate and records each edge - with the payload words the card writes
+ * at BAR0+0x40..0x4c - into a ring exposed at /proc/mz0380-events. This is how
+ * signal-change / no-signal notifications are caught, since the card pushes
+ * them as edge events rather than exposing a pollable status register.
+ */
+struct mz0380_event_rec {
+	u64 t_ns;		/* local_clock() timestamp                */
+	u32 event;		/* BAR0 EVENT word (0x30)                 */
+	u32 payload[4];		/* BAR0 0x40..0x4c payload/DPC-arg words  */
+	u32 status;		/* BAR0 STATUS (0x2c)                     */
+	u32 intflag;		/* BAR5 CFG interrupt flag                */
+};
+
+#define MZ0380_EVENT_RING_SIZE 256
+
 struct mz0380_dev {
 	struct list_head devlist;
 	struct pci_dev *pci;
@@ -296,6 +313,15 @@ struct mz0380_dev {
 	bool v4l2_registered;
 	bool ctrl_handler_initialized;
 	bool video_registered;
+
+	/* Live event watcher */
+	struct mz0380_event_rec event_ring[MZ0380_EVENT_RING_SIZE];
+	unsigned int event_head;
+	unsigned int event_count;
+	u64 event_seen;
+	spinlock_t event_lock;
+	struct task_struct *event_kthread;
+	bool event_watching;
 };
 
 extern struct mz0380_board mz0380_boards[];

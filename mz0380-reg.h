@@ -159,12 +159,42 @@
 #define MZ0380_CMD_GET_BOARD_VERSION    0x0a  /* STATUS=0xaaaaaaaa on success,
 					       * running fw version -> PARAM 0x08/0x0c */
 
-/* Opcodes not yet resolved by RE - placeholders (CHECKME) */
-#define MZ0380_CMD_SET_VIC_PARAMS       0x10  /* CHECKME */
-#define MZ0380_CMD_SET_AIC              0x11  /* CHECKME */
-#define MZ0380_CMD_START_STREAMING      0x12  /* CHECKME */
-#define MZ0380_CMD_STOP_STREAMING       0x13  /* CHECKME */
-#define MZ0380_CMD_QUERY_SIGNAL         0x20  /* CHECKME */
+/*
+ * Opcodes RE-confirmed from ep.ko disassembly (see RE_FINDINGS.md M6/M7).
+ * SET_VIC_PARAMS is the host->card "select input + declare video standard"
+ * command: field layout (byte offsets in the firmware command buffer, which
+ * the mailbox packs as opcode->0x04, params->0x08..):
+ *   cmd[5]=fps  cmd[6]=input-code  cmd[8:9]=width(u16)  cmd[10:11]=height(u16)
+ *   cmd[0x22]=int_reduce flag. width==0||height==0 -> firmware sets no_signal.
+ */
+#define MZ0380_CMD_SET_VIC_PARAMS       0x29  /* 41: select input + WxH/fps    */
+#define MZ0380_CMD_SET_AIC_INT_MODE     0x2d  /* 45: audio int mode            */
+#define MZ0380_CMD_GPIO_READ            0x14  /* 20: read GPIO bitmap          */
+#define MZ0380_CMD_GPIO_SET             0x15  /* 21: set GPIO data (prop 941)  */
+#define MZ0380_CMD_GPIO_DIR             0x17  /* 23: set GPIO direction (940)  */
+
+/* Input codes for SET_VIC_PARAMS cmd[6] (QCAP qcap.h). */
+#define MZ0380_INPUT_CODE_COMPOSITE     0
+#define MZ0380_INPUT_CODE_HDMI          2
+#define MZ0380_INPUT_CODE_DVI_D         3
+#define MZ0380_INPUT_CODE_COMPONENT     4
+#define MZ0380_INPUT_CODE_SDI           6
+#define MZ0380_INPUT_CODE_AUTO          7
+
+/*
+ * UNVERIFIED streaming opcodes still referenced by mz0380-dma.c. The ep.ko
+ * disasm (M6) found NO dedicated start-streaming opcode - the encoder/XDMA is
+ * armed by cfg banks (op2/4/8) + SET_VIC_PARAMS, so 0x12/0x13 are very likely
+ * bogus and the DMA start/stop path is milestone-C work to be rewired. Kept at
+ * their historical values only so the streaming path compiles until then.
+ */
+#define MZ0380_CMD_START_STREAMING      0x12  /* UNVERIFIED - see M6 */
+#define MZ0380_CMD_STOP_STREAMING       0x13  /* UNVERIFIED - see M6 */
+
+/*
+ * Disproven guesses (absent from the ep.ko dispatcher): SET_AIC=0x11,
+ * QUERY_SIGNAL=0x20. There is no card->host signal query.
+ */
 #define MZ0380_CMD_RESET                0xFF  /* CHECKME */
 
 /*

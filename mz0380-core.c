@@ -3,6 +3,8 @@
  */
 
 #include <linux/uaccess.h>
+#include <linux/kthread.h>
+#include <linux/sched/clock.h>
 
 #include "mz0380.h"
 
@@ -28,6 +30,56 @@ static unsigned int snapshot_profile = 1;
 module_param(snapshot_profile, int, 0644);
 MODULE_PARM_DESC(snapshot_profile,
 		 "targeted register snapshot profile: 1=known-safe baseline, 2=baseline plus experimental BAR5 low-offset window, 3=profiles 1-2 plus experimental BAR0 signal window, 4=profiles 1-3 plus extended BAR5 window, 5=profiles 1-4 plus second extended BAR5 window, 6=profiles 1-5 plus M0 mailbox/ring/firmware BAR5 windows (0x00c0..0x00e4, 0x0200..0x0234, 0x0300..0x0410)");
+
+static unsigned int scan_bar = MZ0380_MAP_BAR_MMIO;
+module_param(scan_bar, uint, 0644);
+MODULE_PARM_DESC(scan_bar,
+		 "/proc/mz0380-scan target BAR: 0=BAR0/MMIO (default, HDMI signal window), 1=BAR5/CFG");
+
+static unsigned int scan_start;
+module_param(scan_start, uint, 0644);
+MODULE_PARM_DESC(scan_start,
+		 "/proc/mz0380-scan first byte offset (4-byte aligned); default 0x0000");
+
+static unsigned int scan_len = 0x48;
+module_param(scan_len, uint, 0644);
+MODULE_PARM_DESC(scan_len,
+		 "/proc/mz0380-scan window length in bytes; default 0x48 covers the sc0710-style HDMI status regs (0x00a8..0x00e4)");
+
+static bool scan_unsafe;
+module_param(scan_unsafe, bool, 0644);
+MODULE_PARM_DESC(scan_unsafe,
+		 "/proc/mz0380-scan: read ALL offsets in the window, not just proven-safe BAR0 ranges. DANGER: an un-backed post-boot BAR0 offset stalls the CPU on readl until the PCIe completion timeout (looks like a hard hang). Each read is logged to dmesg first so a stall's culprit offset is recoverable. Default false");
+
+static unsigned int periph_chip = MZ0380_CHIP_BRIDGE;
+module_param(periph_chip, uint, 0644);
+MODULE_PARM_DESC(periph_chip,
+		 "/proc/mz0380-periph-scan target chip id: 0x90=bridge/FPGA reg file (default, HDMI front-end), 0xb8=TVP5160 analog");
+
+static unsigned int periph_start;
+module_param(periph_start, uint, 0644);
+MODULE_PARM_DESC(periph_start,
+		 "/proc/mz0380-periph-scan first peripheral register index; default 0x00");
+
+static unsigned int periph_count = 0x40;
+module_param(periph_count, uint, 0644);
+MODULE_PARM_DESC(periph_count,
+		 "/proc/mz0380-periph-scan number of registers to read via REG_READ (0x1a); default 0x40");
+
+static bool periph_probe;
+module_param(periph_probe, bool, 0644);
+MODULE_PARM_DESC(periph_probe,
+		 "/proc/mz0380-periph-scan diagnostic: for the first few registers, issue REG_READ and dump EVERY mailbox return slot (STATUS/EVENT/PARAM/payload) so the slot that actually carries the read-back value can be located. Default false");
+
+static unsigned int event_sample_us = 200;
+module_param(event_sample_us, uint, 0644);
+MODULE_PARM_DESC(event_sample_us,
+		 "/proc/mz0380-events watcher: EVENT-word poll interval in microseconds; default 200");
+
+static bool event_auto_ack = true;
+module_param(event_auto_ack, bool, 0644);
+MODULE_PARM_DESC(event_auto_ack,
+		 "/proc/mz0380-events watcher: ack each recorded event (rearm the card for the next edge). Turn off to capture a single sticky event without acking. Default true");
 
 static bool allow_experimental_writes;
 module_param(allow_experimental_writes, bool, 0644);
@@ -2021,6 +2073,7 @@ static int mz0380_dev_setup(struct mz0380_dev *dev)
 	init_waitqueue_head(&dev->fw_wait);
 	init_waitqueue_head(&dev->cmd_wait);
 	spin_lock_init(&dev->buf_lock);
+	spin_lock_init(&dev->event_lock);
 	INIT_LIST_HEAD(&dev->buf_list);
 	dev->fw_state = MZ0380_FW_STATE_NONE;
 	atomic_set(&dev->irq_count, 0);
@@ -2802,6 +2855,595 @@ static int mz0380_proc_experiment_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+/*
+ * BAR0 offsets proven to complete a readl without stalling the PCIe link:
+ * these are already read live by mz0380_mailbox_scan() (0x00..0x60) and
+ * mz0380_signal_from_bar0() (0xa8..0xe4). A blind read of an un-backed BAR0
+ * offset post-boot does NOT return 0xffffffff - it stalls the CPU on the readl
+ * until the host completion timeout, which presents as a hard hang. So the scan
+ * only reads inside these ranges unless the operator opts in with scan_unsafe=1.
+ */
+struct mz0380_safe_range {
+	u32 start;	/* inclusive */
+	u32 end;	/* exclusive */
+};
+
+static const struct mz0380_safe_range mz0380_scan_safe_mmio[] = {
+	{ 0x0000, 0x0060 },	/* bootloader / mailbox aperture */
+	{ 0x00a0, 0x00e8 },	/* sc0710-style HDMI status block  */
+};
+
+static bool mz0380_scan_offset_safe(unsigned int map, u32 reg)
+{
+	unsigned int i;
+
+	/* BAR5/CFG is a small fully-backed 4K window; sweeping it is safe. */
+	if (map != MZ0380_MAP_BAR_MMIO)
+		return true;
+
+	for (i = 0; i < ARRAY_SIZE(mz0380_scan_safe_mmio); i++)
+		if (reg >= mz0380_scan_safe_mmio[i].start &&
+		    reg < mz0380_scan_safe_mmio[i].end)
+			return true;
+
+	return false;
+}
+
+/*
+ * Raw contiguous register-window dump for signal-source discovery.
+ *
+ * Emits one 4-byte register per line in a diff-stable format:
+ *     bar0[0x00a8] = 12345678
+ * so two captures (HDMI source plugged vs unplugged) can be compared with
+ * plain diff(1) to see exactly which register(s) track cable/lock state.
+ * The window (BAR, start, length) is retunable live via the scan_bar /
+ * scan_start / scan_len module params under /sys/module/mz0380/parameters/.
+ * Read-only and bounded to the mapped BAR length - never touches the card.
+ */
+static void mz0380_dump_scan_window(struct seq_file *m, struct mz0380_dev *dev)
+{
+	unsigned int map = scan_bar;
+	u32 start = scan_start & ~0x3u;
+	resource_size_t bar_len;
+	u64 end;
+	u32 reg;
+
+	if (map >= MZ0380_MAX_MAPS || !dev->lmmio[map]) {
+		seq_printf(m, "  scan       : bar index %u unmapped\n", map);
+		return;
+	}
+
+	bar_len = dev->bar_len[map];
+	end = (u64)start + (scan_len ? scan_len : 0x48);
+	if (end > bar_len)
+		end = bar_len;
+
+	seq_printf(m,
+		   "  scan bar%d 0x%04x..0x%04llx (len 0x%x, bar_len 0x%llx, mode %s)\n",
+		   dev->bar_nr[map], start, end, scan_len,
+		   (unsigned long long)bar_len,
+		   scan_unsafe ? "UNSAFE-all-offsets" : "safe-ranges-only");
+
+	if ((u64)start >= end) {
+		seq_puts(m, "  scan       : empty window (start past bar_len)\n");
+		return;
+	}
+
+	for (reg = start; reg < end; reg += 4) {
+		if (!scan_unsafe && !mz0380_scan_offset_safe(map, reg)) {
+			seq_printf(m,
+				   "  bar%d[0x%04x] = ........ (skipped: outside safe range; scan_unsafe=1 to read)\n",
+				   dev->bar_nr[map], reg);
+			continue;
+		}
+
+		/*
+		 * Log the target before the readl so that if an un-backed
+		 * offset stalls the link, the last line in dmesg after the
+		 * (possibly forced) recovery pinpoints the culprit.
+		 */
+		if (scan_unsafe)
+			pr_info("%s: scan probing bar%d[0x%04x]\n",
+				dev->name, dev->bar_nr[map], reg);
+
+		seq_printf(m, "  bar%d[0x%04x] = %08x\n",
+			   dev->bar_nr[map], reg, mz_read(dev, map, reg));
+	}
+}
+
+static int mz0380_proc_scan_show(struct seq_file *m, void *v)
+{
+	struct mz0380_dev *dev;
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist) {
+		seq_printf(m, "%s\n", dev->name);
+		mz0380_dump_scan_window(m, dev);
+	}
+	mutex_unlock(&devlist);
+
+	return 0;
+}
+
+/*
+ * Peripheral register-file scan for signal-source discovery.
+ *
+ * Unlike /proc/mz0380-scan (raw BAR0 reads, most of which are un-backed
+ * post-boot), this walks a chip's registers through the proven mailbox
+ * REG_READ (0x1a) command path - the same route mz0380_periph_read() uses to
+ * reach the HDMI bridge (chip 0x90) and the TVP5160 (0xb8). Each register is
+ * emitted diff-stably as:
+ *     periph[0x90][0x12] = 00000001
+ * so a plugged-vs-unplugged diff reveals which bridge register actually tracks
+ * HDMI signal lock (the old 0x12 "bit0 = signal present" guess is unverified).
+ * A short per-read timeout bounds the cost of a non-responding register.
+ */
+static void mz0380_dump_periph_scan(struct seq_file *m, struct mz0380_dev *dev)
+{
+	u8 chip = periph_chip & 0xff;
+	unsigned int reg;
+	unsigned int start = periph_start & 0xff;
+	unsigned int end = start + periph_count;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		seq_puts(m, "  periph     : firmware not ready (load firmware_upload=1)\n");
+		return;
+	}
+	if (end > 0x100)
+		end = 0x100;
+
+	/*
+	 * Diagnostic: the read-back result slot for REG_READ is a guess
+	 * (periph_read() reads PARAM3). If a bridge scan returns all-zero, the
+	 * card may be writing the value into a different slot. Issue REG_READ
+	 * for the first few registers and dump every candidate return word so
+	 * the real result slot is visible. send_command() has already snapshotted
+	 * all PARAM slots into cmd_last_param[]; STATUS/EVENT/payload are re-read
+	 * (all within the safe 0x00..0x5c mailbox aperture).
+	 */
+	if (periph_probe) {
+		unsigned int n = min(periph_count, 4u);
+		unsigned int i;
+
+		seq_printf(m,
+			   "  periph PROBE: REG_READ(0x1a) chip 0x%02x, full slot dump for %u reg(s)\n",
+			   chip, n ? n : 1);
+		for (reg = start; reg < start + (n ? n : 1); reg++) {
+			u32 params[3] = { chip, reg, 0 };
+			u32 status = 0;
+			int ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ,
+						      params, 3, &status, 500);
+
+			seq_printf(m, "  --- reg 0x%02x: send ret=%d STATUS[0x2c]=%08x ---\n",
+				   reg, ret, status);
+			for (i = 0; i < MZ0380_REG_PARAM_MAX; i++)
+				seq_printf(m, "    PARAM(%2u)[bar0+0x%02x] = %08x%s\n",
+					   i, MZ0380_MB_PARAM(i),
+					   dev->cmd_last_param[i],
+					   i == 0 ? "  <- opcode echo" :
+					   i == 1 ? "  <- RESULT slot"  :
+					   i == 3 ? "  <- periph_read() reads here" : "");
+			seq_printf(m, "    EVENT[0x30]      = %08x\n",
+				   mz_mmio_read(dev, MZ0380_MB_EVENT));
+			seq_printf(m, "    PAYLOAD0[0x40]   = %08x\n",
+				   mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD0));
+			seq_printf(m, "    PAYLOAD1[0x44]   = %08x\n",
+				   mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1));
+			seq_printf(m, "    PAYLOAD2[0x48]   = %08x\n",
+				   mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2));
+			seq_printf(m, "    PAYLOAD3[0x4c]   = %08x\n",
+				   mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3));
+		}
+		return;
+	}
+
+	seq_printf(m,
+		   "  periph chip 0x%02x regs 0x%02x..0x%02x via REG_READ(0x1a)%s\n",
+		   chip, start, end ? end - 1 : start,
+		   dev->dma_armed ? "" :
+		   " [dma not armed - reads may fail; load dma_handshake=1]");
+
+	for (reg = start; reg < end; reg++) {
+		u32 params[3] = { chip, reg, 0 };
+		int ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ,
+					      params, 3, NULL, 200);
+
+		if (ret)
+			seq_printf(m,
+				   "  periph[0x%02x][0x%02x] = ........ (err %d)\n",
+				   chip, reg, ret);
+		else
+			seq_printf(m, "  periph[0x%02x][0x%02x] = %08x\n",
+				   chip, reg, dev->cmd_last_param[3]);
+	}
+}
+
+static int mz0380_proc_periph_scan_show(struct seq_file *m, void *v)
+{
+	struct mz0380_dev *dev;
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist) {
+		seq_printf(m, "%s\n", dev->name);
+		mz0380_dump_periph_scan(m, dev);
+	}
+	mutex_unlock(&devlist);
+
+	return 0;
+}
+
+/* ===== live card-event watcher ==========================================
+ *
+ * The card notifies signal/format changes as edge events on the BAR0 EVENT
+ * word (0x30), carrying data in the payload words at 0x40..0x4c, rather than
+ * exposing a pollable status register. A kthread samples EVENT at high rate and
+ * records each edge into a per-device ring; /proc/mz0380-events dumps the ring
+ * (read) and starts/stops/clears the watcher (write). Snapshot the payloads
+ * before acking, since the ack clears the event.
+ */
+static void mz0380_event_record(struct mz0380_dev *dev, u32 event)
+{
+	struct mz0380_event_rec snap;
+	unsigned long flags;
+
+	snap.t_ns       = local_clock();
+	snap.event      = event;
+	snap.payload[0] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD0);
+	snap.payload[1] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1);
+	snap.payload[2] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2);
+	snap.payload[3] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3);
+	snap.status     = mz_mmio_read(dev, MZ0380_MB_STATUS);
+	snap.intflag    = mz_cfg_read(dev, MZ0380_CFG_INT_FLAG);
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+	dev->event_ring[dev->event_head] = snap;
+	dev->event_head = (dev->event_head + 1) % MZ0380_EVENT_RING_SIZE;
+	if (dev->event_count < MZ0380_EVENT_RING_SIZE)
+		dev->event_count++;
+	dev->event_seen++;
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+}
+
+static int mz0380_event_thread(void *data)
+{
+	struct mz0380_dev *dev = data;
+	u32 last = 0;
+
+	while (!kthread_should_stop()) {
+		u32 event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+
+		if (event && event != last) {
+			/*
+			 * Serialise the ack (which rings the 0x400 doorbell)
+			 * with the command channel so an in-flight command is
+			 * never aborted mid-flight.
+			 */
+			mutex_lock(&dev->cmd_lock);
+			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+			if (event) {
+				mz0380_event_record(dev, event);
+				if (event_auto_ack)
+					mz0380_mb_ack_event(dev);
+			}
+			mutex_unlock(&dev->cmd_lock);
+			last = event_auto_ack ? 0 : event;
+		} else if (!event) {
+			last = 0;
+		}
+		usleep_range(event_sample_us, event_sample_us + 50);
+	}
+	return 0;
+}
+
+static void mz0380_event_watch_start(struct mz0380_dev *dev)
+{
+	if (dev->event_watching)
+		return;
+	dev->event_kthread = kthread_run(mz0380_event_thread, dev,
+					 "mz0380-events/%u", dev->nr);
+	if (IS_ERR(dev->event_kthread)) {
+		dev->event_kthread = NULL;
+		return;
+	}
+	dev->event_watching = true;
+}
+
+static void mz0380_event_watch_stop(struct mz0380_dev *dev)
+{
+	if (dev->event_kthread) {
+		kthread_stop(dev->event_kthread);
+		dev->event_kthread = NULL;
+	}
+	dev->event_watching = false;
+}
+
+static void mz0380_event_ring_clear(struct mz0380_dev *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+	dev->event_head = 0;
+	dev->event_count = 0;
+	dev->event_seen = 0;
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+}
+
+static void mz0380_dump_events(struct seq_file *m, struct mz0380_dev *dev)
+{
+	struct mz0380_event_rec *snap;
+	unsigned int count, head, i, idx;
+	u64 seen, t0;
+	unsigned long flags;
+
+	seq_printf(m, "  watcher    : %s (sample %u us, auto_ack %d)\n",
+		   dev->event_watching ? "running" : "stopped",
+		   event_sample_us, event_auto_ack);
+	seq_printf(m,
+		   "  live       : EVENT[0x30]=%08x STATUS[0x2c]=%08x intflag=%08x\n",
+		   mz_mmio_read(dev, MZ0380_MB_EVENT),
+		   mz_mmio_read(dev, MZ0380_MB_STATUS),
+		   mz_cfg_read(dev, MZ0380_CFG_INT_FLAG));
+
+	snap = kmalloc_array(MZ0380_EVENT_RING_SIZE, sizeof(*snap), GFP_KERNEL);
+	if (!snap) {
+		seq_puts(m, "  (out of memory)\n");
+		return;
+	}
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+	count = dev->event_count;
+	head = dev->event_head;
+	seen = dev->event_seen;
+	for (i = 0; i < count; i++) {
+		idx = (head - count + i + MZ0380_EVENT_RING_SIZE) %
+		      MZ0380_EVENT_RING_SIZE;
+		snap[i] = dev->event_ring[idx];
+	}
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+
+	seq_printf(m, "  recorded   : %u shown of %llu total edges%s\n",
+		   count, seen,
+		   seen > count ? " (ring wrapped, oldest lost)" : "");
+	if (!count) {
+		seq_puts(m,
+			 "  (none; 'echo start > /proc/mz0380-events', toggle the HDMI source, then re-read)\n");
+		kfree(snap);
+		return;
+	}
+
+	t0 = snap[0].t_ns;
+	for (i = 0; i < count; i++)
+		seq_printf(m,
+			   "  +%9llu us  EVENT=%08x  p=%08x %08x %08x %08x  STATUS=%08x intflag=%08x\n",
+			   (unsigned long long)(snap[i].t_ns - t0) / 1000,
+			   snap[i].event,
+			   snap[i].payload[0], snap[i].payload[1],
+			   snap[i].payload[2], snap[i].payload[3],
+			   snap[i].status, snap[i].intflag);
+
+	kfree(snap);
+}
+
+static int mz0380_proc_events_show(struct seq_file *m, void *v)
+{
+	struct mz0380_dev *dev;
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist) {
+		seq_printf(m, "%s\n", dev->name);
+		mz0380_dump_events(m, dev);
+	}
+	mutex_unlock(&devlist);
+
+	return 0;
+}
+
+static ssize_t mz0380_proc_events_write(struct file *file,
+					const char __user *buffer,
+					size_t count, loff_t *ppos)
+{
+	struct mz0380_dev *dev;
+	char *cmd;
+	ssize_t ret = -EINVAL;
+
+	if (!count || *ppos != 0)
+		return count ? -EINVAL : 0;
+	if (count >= MZ0380_PROC_CMD_MAX)
+		return -E2BIG;
+
+	cmd = memdup_user_nul(buffer, count);
+	if (IS_ERR(cmd))
+		return PTR_ERR(cmd);
+	strim(cmd);
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist) {
+		if (!strcmp(cmd, "start")) {
+			mz0380_event_watch_start(dev);
+			ret = count;
+		} else if (!strcmp(cmd, "stop")) {
+			mz0380_event_watch_stop(dev);
+			ret = count;
+		} else if (!strcmp(cmd, "clear")) {
+			mz0380_event_ring_clear(dev);
+			ret = count;
+		}
+	}
+	mutex_unlock(&devlist);
+
+	if (ret > 0)
+		*ppos += count;
+	kfree(cmd);
+	return ret;
+}
+
+/*
+ * HDMI activation (RE_FINDINGS.md M7). The card only presents itself as an HDMI
+ * sink - asserting HPD and serving EDID so the source starts outputting - after
+ * the host selects the input and declares the video standard. The QCAP SDK does
+ * this via SET_VIDEO_INPUT(HDMI)+RUN; the mailbox equivalent is SET_VIC_PARAMS
+ * (op41). Firing it here is the minimal probe for "does the source wake?".
+ *
+ * Field packing: the mailbox writes opcode->0x04 and params[i]->0x08+4i, and the
+ * firmware reads the buffer as bytes with cmd[N] == mailbox(0x04+N). So
+ * params[0] carries cmd[5]=fps (byte1) and cmd[6]=input (byte2); params[1]
+ * carries cmd[8:9]=width (low u16) and cmd[10:11]=height (high u16). params[7]
+ * covers cmd[0x22]=int_reduce, left 0.
+ */
+static int mz0380_activate_hdmi_locked(struct mz0380_dev *dev, u32 input,
+				       u32 width, u32 height, u32 fps)
+{
+	u32 params[8] = { 0 };
+	u32 status = 0;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		pr_warn("%s: HDMI activate skipped - firmware not ready (load firmware_upload=1 dma_handshake=1)\n",
+			dev->name);
+		return -ENODEV;
+	}
+
+	params[0] = ((input & 0xff) << 16) | ((fps & 0xff) << 8);
+	params[1] = ((height & 0xffff) << 16) | (width & 0xffff);
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
+				  ARRAY_SIZE(params), &status, 500);
+	pr_info("%s: HDMI activate: SET_VIC_PARAMS(input=%u %ux%u@%u) ret=%d status=0x%08x result=0x%08x - now check the OUT port / source\n",
+		dev->name, input, width, height, fps, ret, status,
+		dev->cmd_last_param[0]);
+	return ret;
+}
+
+static int mz0380_proc_hdmi_show(struct seq_file *m, void *v)
+{
+	struct mz0380_dev *dev;
+
+	seq_puts(m, "usage: echo \"[input] [width] [height] [fps]\" > /proc/mz0380-hdmi\n");
+	seq_puts(m, "  defaults: 2 1920 1080 60   input codes: HDMI=2 DVI=3 COMPONENT=4 SDI=6 AUTO=7\n");
+	seq_puts(m, "  fires SET_VIC_PARAMS (op41): host declares input + standard so the\n");
+	seq_puts(m, "  card asserts HPD/EDID and the HDMI source wakes. Watch dmesg + OUT port.\n");
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist)
+		seq_printf(m, "%s: fw %s\n", dev->name,
+			   mz0380_fw_state_name(dev->fw_state));
+	mutex_unlock(&devlist);
+	return 0;
+}
+
+static ssize_t mz0380_proc_hdmi_write(struct file *file,
+				      const char __user *buffer,
+				      size_t count, loff_t *ppos)
+{
+	struct mz0380_dev *dev;
+	u32 input = MZ0380_INPUT_CODE_HDMI, width = 1920, height = 1080, fps = 60;
+	char *cmd;
+
+	if (!count || *ppos != 0)
+		return count ? -EINVAL : 0;
+	if (count >= MZ0380_PROC_CMD_MAX)
+		return -E2BIG;
+
+	cmd = memdup_user_nul(buffer, count);
+	if (IS_ERR(cmd))
+		return PTR_ERR(cmd);
+	strim(cmd);
+	sscanf(cmd, "%u %u %u %u", &input, &width, &height, &fps);
+	kfree(cmd);
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist)
+		mz0380_activate_hdmi_locked(dev, input, width, height, fps);
+	mutex_unlock(&devlist);
+
+	*ppos += count;
+	return count;
+}
+
+/*
+ * Generic mailbox command passthrough for RE (RE_FINDINGS.md M7). Sends an
+ * arbitrary opcode + params and dumps the returned status/param slots, so the
+ * front-end/HPD bring-up can be probed without a recompile per opcode - e.g.
+ * GPIO direction/data (op 0x17/0x15, SL6010 GPIO props 940/941), config banks
+ * (op 0x02/0x04/0x08). Root-only (0644) and gated on firmware-ready.
+ */
+static int mz0380_raw_command_locked(struct mz0380_dev *dev, u32 opcode,
+				     const u32 *params, unsigned int nparams)
+{
+	u32 status = 0;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		pr_warn("%s: raw cmd skipped - firmware not ready\n", dev->name);
+		return -ENODEV;
+	}
+	if (nparams + 1 > MZ0380_REG_PARAM_MAX)
+		nparams = MZ0380_REG_PARAM_MAX - 1;
+
+	ret = mz0380_send_command(dev, opcode, params, nparams, &status, 500);
+	pr_info("%s: raw cmd op=0x%02x n=%u ret=%d status=0x%08x out=%08x %08x %08x %08x\n",
+		dev->name, opcode, nparams, ret, status,
+		dev->cmd_last_param[0], dev->cmd_last_param[1],
+		dev->cmd_last_param[2], dev->cmd_last_param[3]);
+	return ret;
+}
+
+static int mz0380_proc_cmd_show(struct seq_file *m, void *v)
+{
+	struct mz0380_dev *dev;
+
+	seq_puts(m, "usage: echo \"<opcode> [p0 p1 ...]\" > /proc/mz0380-cmd  (hex 0x.. or dec)\n");
+	seq_puts(m, "  sends one mailbox command; results go to dmesg (status + first 4 return slots).\n");
+	seq_puts(m, "  e.g. GPIO all-out: '0x17 0xffff' then all-high: '0x15 0xffff'; read GPIO: '0x14'.\n");
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist)
+		seq_printf(m, "%s: fw %s\n", dev->name,
+			   mz0380_fw_state_name(dev->fw_state));
+	mutex_unlock(&devlist);
+	return 0;
+}
+
+static ssize_t mz0380_proc_cmd_write(struct file *file,
+				     const char __user *buffer,
+				     size_t count, loff_t *ppos)
+{
+	u32 vals[MZ0380_REG_PARAM_MAX] = { 0 };
+	struct mz0380_dev *dev;
+	unsigned int n = 0;
+	char *cmd, *p, *tok;
+
+	if (!count || *ppos != 0)
+		return count ? -EINVAL : 0;
+	if (count >= MZ0380_PROC_CMD_MAX)
+		return -E2BIG;
+
+	cmd = memdup_user_nul(buffer, count);
+	if (IS_ERR(cmd))
+		return PTR_ERR(cmd);
+	strim(cmd);
+
+	p = cmd;
+	while ((tok = strsep(&p, " \t")) != NULL && n < ARRAY_SIZE(vals)) {
+		if (!*tok)
+			continue;
+		if (kstrtou32(tok, 0, &vals[n])) {
+			kfree(cmd);
+			return -EINVAL;
+		}
+		n++;
+	}
+	kfree(cmd);
+	if (n < 1)
+		return -EINVAL;
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist)
+		mz0380_raw_command_locked(dev, vals[0], &vals[1], n - 1);
+	mutex_unlock(&devlist);
+
+	*ppos += count;
+	return count;
+}
+
 static int mz0380_proc_state_show(struct seq_file *m, void *v)
 {
 	struct mz0380_dev *dev;
@@ -3121,6 +3763,31 @@ static int mz0380_proc_experiment_open(struct inode *inode, struct file *filp)
 	return single_open(filp, mz0380_proc_experiment_show, NULL);
 }
 
+static int mz0380_proc_scan_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, mz0380_proc_scan_show, NULL);
+}
+
+static int mz0380_proc_periph_scan_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, mz0380_proc_periph_scan_show, NULL);
+}
+
+static int mz0380_proc_events_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, mz0380_proc_events_show, NULL);
+}
+
+static int mz0380_proc_hdmi_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, mz0380_proc_hdmi_show, NULL);
+}
+
+static int mz0380_proc_cmd_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, mz0380_proc_cmd_show, NULL);
+}
+
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 0, 0)
 static struct file_operations mz0380_proc_fops = {
 	.open = mz0380_proc_open,
@@ -3154,6 +3821,44 @@ static struct file_operations mz0380_proc_experiment_fops = {
 	.open = mz0380_proc_experiment_open,
 	.read = seq_read,
 	.write = mz0380_proc_experiment_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static struct file_operations mz0380_proc_scan_fops = {
+	.open = mz0380_proc_scan_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static struct file_operations mz0380_proc_periph_scan_fops = {
+	.open = mz0380_proc_periph_scan_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static struct file_operations mz0380_proc_events_fops = {
+	.open = mz0380_proc_events_open,
+	.read = seq_read,
+	.write = mz0380_proc_events_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static struct file_operations mz0380_proc_hdmi_fops = {
+	.open = mz0380_proc_hdmi_open,
+	.read = seq_read,
+	.write = mz0380_proc_hdmi_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+static struct file_operations mz0380_proc_cmd_fops = {
+	.open = mz0380_proc_cmd_open,
+	.read = seq_read,
+	.write = mz0380_proc_cmd_write,
 	.llseek = seq_lseek,
 	.release = single_release,
 };
@@ -3193,10 +3898,53 @@ static struct proc_ops mz0380_proc_experiment_fops = {
 	.proc_lseek = seq_lseek,
 	.proc_release = single_release,
 };
+
+static struct proc_ops mz0380_proc_scan_fops = {
+	.proc_open = mz0380_proc_scan_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_ops mz0380_proc_periph_scan_fops = {
+	.proc_open = mz0380_proc_periph_scan_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_ops mz0380_proc_events_fops = {
+	.proc_open = mz0380_proc_events_open,
+	.proc_read = seq_read,
+	.proc_write = mz0380_proc_events_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_ops mz0380_proc_hdmi_fops = {
+	.proc_open = mz0380_proc_hdmi_open,
+	.proc_read = seq_read,
+	.proc_write = mz0380_proc_hdmi_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+static struct proc_ops mz0380_proc_cmd_fops = {
+	.proc_open = mz0380_proc_cmd_open,
+	.proc_read = seq_read,
+	.proc_write = mz0380_proc_cmd_write,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
 #endif
 
 static void mz0380_proc_remove(void)
 {
+	remove_proc_entry("mz0380-cmd", NULL);
+	remove_proc_entry("mz0380-hdmi", NULL);
+	remove_proc_entry("mz0380-events", NULL);
+	remove_proc_entry("mz0380-periph-scan", NULL);
+	remove_proc_entry("mz0380-scan", NULL);
 	remove_proc_entry("mz0380-experiment", NULL);
 	remove_proc_entry("mz0380-control", NULL);
 	remove_proc_entry("mz0380-snapshot", NULL);
@@ -3234,6 +3982,37 @@ static int mz0380_proc_create(void)
 
 	pe = proc_create("mz0380-experiment", 0644, NULL,
 			 &mz0380_proc_experiment_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-scan", 0444, NULL, &mz0380_proc_scan_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-periph-scan", 0444, NULL,
+			 &mz0380_proc_periph_scan_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-events", 0644, NULL, &mz0380_proc_events_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-hdmi", 0644, NULL, &mz0380_proc_hdmi_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-cmd", 0644, NULL, &mz0380_proc_cmd_fops);
 	if (!pe) {
 		mz0380_proc_remove();
 		return -ENOMEM;
@@ -3718,6 +4497,9 @@ static void mz0380_finidev(struct pci_dev *pci_dev)
 	mutex_lock(&devlist);
 	list_del(&dev->devlist);
 	mutex_unlock(&devlist);
+
+	/* stop the event watcher before any MMIO mapping is torn down */
+	mz0380_event_watch_stop(dev);
 
 	mz0380_dma_stop(dev);
 	mz0380_dev_unregister(dev);

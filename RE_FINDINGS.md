@@ -210,3 +210,452 @@ quiet poll alone suffices without it is untested.
 Remaining for full capture (M4 second half): program the frame DMA ring (real
 ring-register offsets still a guess in mz0380-dma.c) and drive SET_VIC /
 START_STREAMING over the now-working command channel.
+
+## M4b SIGNAL-DETECT: BAR0 dead end, pivot to bridge-chip command path (2026-07-04)
+
+Hardware plug/unplug diff via the new `/proc/mz0380-scan` (BAR0 window,
+per-read `pr_info` trace):
+
+- BAR0/MMIO is only backed at **0x04..0x5c** (the command-mailbox aperture).
+  0x00 reads 0xffffffff. Every offset >= 0x60 eats a ~200 ms PCIe completion
+  timeout then returns 0xffffffff -- NOT a hard hang, just ~0.2 s/read, so a
+  blind wide BAR0 sweep looks frozen (that was the earlier "freeze").
+- The sc0710-ported HDMI window (0xa8..0xe4 in `mz0380_signal_from_bar0()`)
+  sits in that dead zone => reads never change on plug/unplug.
+  **The sc0710 register model does not apply here; HDMI signal is NOT a BAR0
+  register.** Those guesses should be dropped from `mz0380_signal_from_bar0()`.
+
+Correct surface = the HDMI **bridge chip (0x90)** via the proven mailbox
+`REG_READ (0x1a)` path (`mz0380_periph_read`). New `/proc/mz0380-periph-scan`
+walks a chip's register file diff-stably. The old `MZ0380_BRIDGE_SIGNAL 0x12
+bit0` label is unverified -- the hunt (`PERIPH=1 ./mz0380-signal-hunt.sh`)
+finds which bridge register really tracks lock. Needs `dma_handshake=1`.
+
+Tooling: `/proc/mz0380-scan` (raw BAR, safe-range gated), `/proc/mz0380-periph-scan`
+(bridge/TVP5160 via 0x1a), `mz0380-signal-hunt.sh` (capture + diff analyzer,
+LOCK-BIT vs ACTIVITY).
+
+## M4c EP.KO COMMAND ORACLE — signal is NOT a register, and 0x1a is bogus (2026-07-04)
+
+Re-extracted the card firmware (`tar xzf /lib/firmware/mz0380/MZ0380.HD.HEX`,
+gzip+tar rooted at `yuan_demo_sdi/`) and disassembled the card's PCIe-endpoint
+mailbox server `drivers/ep.ko` (ARM, not stripped) with llvm-objdump. The
+command dispatcher is `pciep_isr`: it reads the opcode with `ldr r6,[r4]`
+(r4 = inbound command buffer; [r4+0]=host BAR0+0x04 opcode, [r4+4]=host 0x08
+RESULT, [r4+8]=host 0x0c, ...) and branches on a fixed opcode set.
+
+Opcodes actually dispatched by fw 1.11:
+  1,2,4,6,7,8,9,10,11,14,15,20,21,23,34,41,42,45,47,49,80,82,96,97,98,100,110,123,124
+Identified so far:
+  - 10 (0x0a) GET_BOARD_VERSION  -> writes version to [r4+4]/[r4+8] (host PARAM1/2). MATCHES.
+  -  1 INIT, 11 fw-download BEGIN, 14 fw related (debug-printed in tail).
+  -  2 / 8  copy a block of host words into card config state (SET_* setters).
+  - 41 (0x29) SET_VIC_PARAMS: reads width/height FROM the host command, prints
+       "SET_VIC_PARAMS(fw %d) size(%dx%d) fps(%d)"; if width==0||height==0 it
+       sets the card `no_signal` global (data sym `no_signal` @0x71c) and prints
+       "cmd(%d) => no signal". So the HOST supplies resolution; the card derives
+       no-signal from a zero size.
+
+KEY CORRECTIONS (previous guesses were wrong):
+  - 0x1a REG_READ / 0x1b REG_WRITE are NOT card commands. Opcode 26 (0x1a)
+    dispatches to a sysfs_notify stub, not a peripheral read. The earlier
+    "bridge chip 0x90 reg read confirmed" was the mailbox returning a constant
+    0x48 (the RESULT slot), never real register data. `mz0380_periph_read()` and
+    the whole bridge-register model are built on a bogus opcode.
+  - Guessed opcodes SET_VIC_PARAMS=0x10, QUERY_SIGNAL=0x20, START_STREAMING=0x12
+    are absent from the dispatcher; SET_VIC is really 0x29 (41).
+  - There is NO mailbox getter that returns input width/height/signal. HDMI
+    signal presence is therefore NOT pollable via a command in this firmware.
+
+SIGNAL MODEL (reconciles the QCAP SDK): QCAP exposes signal via CALLBACKS
+(QCAP_REGISTER_NO_SIGNAL_DETECTED_CALLBACK / SIGNAL_REMOVED) and the result code
+NO_SIGNAL_DETECTED=0x9, not a poll. The card detects format itself (video_capture_mgr
++ libvideocap + the front-end receiver) into `g_stream_info` (44B @0x640) and
+raises a host EVENT. reg.h already reserves EVT_PAYLOAD0..3 at BAR0+0x40..0x4c
+("DPC args"). => the real signal/format path is the card->host EVENT with the
+format carried in the 0x40..0x4c payload words, decoded on the interrupt.
+
+NEXT (correct milestone B): capture EVENT(0x30)+payloads(0x40..0x4c) LIVE across
+a plug/unplug (events are edge-triggered, so sample continuously without reload
+and without acking), and RE which pciep_isr path / card event writes those
+payloads. The two-static-snapshot register diff cannot see an edge event.
+
+================================================================================
+M5  CROSS-REF: sibling 4k60 Pro mk.2 (sc0710) + USB gchd give the EXACT signal
+    blob layout. (Reviewed ~/Downloads/test/elgato-gchd-master + untracked
+    sc0710-i2c.c / sc0710-video.c in this repo.) 2026-07-04.
+================================================================================
+
+The status blob our ARM MCU serves is now known byte-for-byte, from the sibling
+card that reads the SAME ARM MCU over a different transport.
+
+sc0710 (4k60 Pro mk.2) reads HDMI status via an AXI-IIC master at BAR0 0x3100:
+  - ARM MCU is an I2C slave: I2C_DEV__ARM_MCU = (0x32<<1). Host does write-read.
+  - AXI-IIC regs: 0x3100 ctrl (0x2=TX reset,0x1=enable), 0x3104 status
+    (0x44=addr ack, 0xc4=subaddr ack, 0xc8=read done), 0x3108 TX_FIFO
+    (bit8=start, bit9=stop), 0x310C RX_FIFO.
+  - THREE status pages by subaddress: 0x00 -> 26 bytes (HDMI status),
+    0x1a -> 16 bytes (status2), 0x2a -> 16 bytes (status3).
+
+HDMI status blob (subaddr 0x00, 26 bytes) decode (sc0710_i2c_read_hdmi_status):
+    rbuf[0x08]            != 0  => LOCKED (signal present)     <-- the flag
+    rbuf[0x0a..0x0b] LE16      => width            (e.g. 1920)
+    rbuf[0x08..0x09] LE16      => height/field     (e.g. 540; x2 if interlaced)
+    rbuf[0x04..0x05] LE16      => pixelLineV/V-total (e.g. 562)
+    rbuf[0x06..0x07] LE16      => pixelLineH/H-total (e.g. 2200)
+    rbuf[0x0d] & 0x01          => interlaced
+    (rbuf[0x0d] & 0x30) >> 4   => colorimetry 1=BT709 2=BT601 3=BT2020
+    rbuf[0x0f]                 => colorspace 0=YUV422/420 1=YUV444 2=RGB444
+  Captured example (1080i59.94): 1920 / Htot 2200 / Vtot 562 / interlaced.
+  (H,V) -> format via sc0710_format_find_by_timing() table (sc0710-video.c:185+):
+    {1650, 750,1280, 720,0,...720p}, {2200,562,1920,540,1,...1080i}, etc.
+  NO-signal branch just zeroes everything and sets locked=0. There is no
+  distinct "no signal" register - locked byte == 0 IS the no-signal state.
+  (Matches gchd's USB path: it derives the same by SAMPLING a line-period
+  counter and pattern-matching magic sums, and treats a sentinel read
+  0xad4d as "no signal". Colorspace autodetect unreliable there too.)
+
+WHY THIS NAILS MZ0380 (HD60 Pro): same ARM MCU, different transport. sc0710's
+AXI-IIC block (BAR0 0x3100..0x3120) lands in OUR dead zone (BAR0 backed only
+0x04..0x5c) -> HD60 Pro has no AXI-IIC path; the host<->ARM-MCU channel here IS
+the BAR0 mailbox. So the firmware serves this same locked/width/height/H/V blob
+(our g_stream_info 44B@0x640) over the mailbox/EVENT instead of I2C. The sibling
+polls it (sc0710-core.c:230,450) - so on MZ0380 a poll-able form may also exist.
+
+REVISED NEXT (supersedes the blind diff above):
+  1. Run the live event watcher across a cable toggle and decode payload words
+     0x40..0x4c with the template above (hunt for the locked byte + LE16
+     1920/1080/2200/1125 - not "which word flips").
+  2. New probe: read the firmware buffer at BAR0+0x60 for a 26/44-byte blob =
+     the mailbox mirror of sc0710's "I2C read subaddr 0" (g_stream_info@0x640).
+  3. Wire mz0380_signal_from_bar0() to those exact offsets + reuse the
+     sc0710-video.c timing table for fps/scan-mode. Delete remaining guesses.
+
+M5 EMPIRICAL RESULT (2026-07-04, fw 1.11): the idle card reports NO signal to
+the host, two independent ways:
+  a. Live event watcher across a real HDMI plug/unplug: 0 edges. EVENT(0x30)
+     stayed 0, STATUS(0x2c) steady 0x00000001. The card raised no host edge.
+  b. Static two-state diff of the backed mailbox region BAR0 0x00..0x5c
+     (6 unplugged + 6 plugged samples): no word changed with plug state.
+  => In idle (front-end not armed, no input selected, not streaming), there is
+     neither a pollable signal word NOR a pushed event in the host-visible BAR0
+     region. This reconciles everything: fw 1.11 follows the host-forces-format
+     model (SET_VIC_PARAMS 0x29 takes WxH FROM the host); the card does not
+     autodetect-and-report to the host while idle. Matches gchd/elgato ("no
+     continuous autodetect") and the QCAP SET_VIC path.
+  => Signal/format reporting, IF it exists at all, is gated behind arming the
+     pipeline (input-select + start-streaming = milestone C). The sibling
+     sc0710 can read a status blob because its ARM MCU front-end is always
+     powered over AXI-IIC; on HD60 Pro that path is absent (dead zone) and the
+     front-end appears powered down until capture starts.
+  NOTE: mz0380-reg.h still carries STALE sc0710-derived guesses disproven by RE
+     - CMD opcodes 0x10/0x11/0x12/0x13/0x20 (real SET_VIC=0x29; 0x12/0x20 absent
+     from dispatcher), AXI_IIC block @0x3100 (in BAR0 dead zone, no HW), HDMI
+     regs 0xa8..0xe4 (un-backed). Clean these when wiring the real path.
+  OPEN (dispatched to firmware disasm): does a get-stream-info/get-status opcode
+     exist among the real set {6,7,9,11,14,15,20,21,23,34,42,45,47,49,80,82,96,
+     97,98,100,110,123,124}, and which are the real START_STREAMING + INPUT_SELECT?
+
+================================================================================
+M6  DISASM CLOSURE (2026-07-04): ep.ko command set has NO card->host format
+    path. Milestone B is unsupported by fw 1.11 firmware. Evidence-locked.
+================================================================================
+
+Disassembled ep.ko (yuan_demo_sdi variant, ARM EABI5, not stripped; dispatcher
+pciep_isr @.text 0x1210). Full opcode->handler map recovered. Conclusions:
+
+Q1 GET-STATUS OPCODE: NONE (HIGH). The ISR (0x1210..0x1944) never references
+   g_stream_info (.bss+0x640). No handler copies video-format/resolution/fps/
+   signal into the host reply words. The richest reply is GET_VERSION (op10):
+   2 words (fw_version[0],[1]) at reply [4],[8]. GPIO ops 20/21/23 return a bit
+   map at [2]/[8]. That is the entire card->host data surface.
+
+Q3 WHO FILLS g_stream_info: ONLY the card's local userspace, via the on-card
+   char-device ioctl livectrl_ioctl (LIVECTRL_IOCTL_GET_INFO 0x40047005 /
+   SET_INFO 0xC0047005, 44B, copy_to/from_user of .bss+0x640). ep.ko has NO
+   HDMI-detect routine; it never measures format. The front-end (Gennum GV7601
+   SDI/HDMI receiver via spi_gv7601, + vpl_vic / gv7601_audio) lives in sibling
+   .ko modules and is NOT reachable over the PCIe mailbox.
+
+Q4 EVENT EMIT: sysfs_notify + the msi finalizer (0x115c) which sets EVENT bit11
+   (orr #2048) at DBI+0x30 and rings a doorbell = the sole host-notify path.
+   It carries ONLY the event bit; NO format payload. Several opcodes
+   (6,9,15,42,45,47,49,80,96,97,98,110) gate their notify on no_signal
+   (.bss+0x71c) but write no data. BAR0 0x40..0x4c is populated only by
+   config-bank echoes (op2/4/6/8) and op10/21/23 replies - never format.
+
+=> DEFINITIVE MODEL: format is strictly HOST->CARD via SET_VIC_PARAMS (op41,
+   0x29). Correct field layout of the command buffer (cmd[] = mailbox param
+   slots, byte offsets from opcode buffer base):
+     cmd[6]     = VIC / input code (special value 7)
+     cmd[5]     = fps
+     cmd[8..9]  = Width  (u16)
+     cmd[10..11]= Height (u16)
+     cmd[0x22]  = int_reduce flag -> g_interrupt_reduce_enable (.bss+0x630)
+   Width==0 || Height==0  => sets no_signal=1 (.bss+0x71c), prints
+   "cmd(%d) => no signal". Else no_signal=0, stores input code to .data+0x04
+   (windows_select_fw), sysfs_notify. There is NO reverse (card->host) format
+   command. Any host "query signal" design must be abandoned. The host is the
+   SOURCE of format (assert via op41), and gets only a no_signal-change nudge
+   (EVENT bit11) back - exactly the gchd/elgato "no autodetect" model.
+
+REAL OPCODE MAP (replaces the stale CHECKME guesses in mz0380-reg.h):
+   1 INIT | 2 set-cfg-bankA | 4 set-cfg-bankB | 6 enc-status-bank+notify |
+   8 set-enc-params(via host ptr) | 10 GET_VERSION | 11 BEGIN_FW_DL |
+   14 BEGIN_BASE_FW_DL | 20 GPIO-read | 21 GPIO-set | 23 GPIO-dir |
+   34 STOP_STREAMING-area notify | 41 SET_VIC_PARAMS | 45 SET_AIC_INT_MODE |
+   100 PREVIEW_BUF_EX | 123/124 fw-dl variants | 7/9/15/42/47/49/80/82/96/97/98/
+   110 = signal-gated sysfs notifies (no data). START_STREAMING is NOT an ep.ko
+   opcode - the encoder/XDMA lives in the vpl_*/vma_* modules; "start capture"
+   from the host = program cfg banks (op2/4/8) + assert VIC (op41) + arm XDMA
+   host-side. Stale/bogus: 0x10/0x11/0x12/0x13/0x20 (not in dispatch), AXI_IIC
+   @0x3100 (BAR0 dead zone), HDMI regs 0xa8..0xe4 (un-backed).
+
+MILESTONE B: CLOSED - not achievable with this firmware. Proceed to the
+host-forces-format design (V4L2 dv_timings SET by app/EDID, asserted via op41;
+no S_DV_TIMINGS query-from-card, no VIDIOC_QUERY_DV_TIMINGS backed by hardware).
+
+================================================================================
+M7  HDMI ACTIVATION (2026-07-04): the source stays asleep because the card
+    never presents itself as a sink (HPD/EDID). Fix = run the SDK bring-up.
+================================================================================
+
+USER SYMPTOM: HDMI source (camera) plugged into the card's IN port does NOT
+enter HDMI mode / outputs nothing (OUT passthrough dark). Same camera on a real
+monitor DOES wake. => classic HDMI sink-handshake gap: a sink must assert HPD
++ serve a valid EDID over DDC for the source to output. The idle card asserts
+neither, so the source never starts. This is WHY every idle signal test this
+session saw nothing - there was never a signal on the wire to detect.
+
+REFERENCE (Yuan QCAP Linux SDK, ~/Downloads/test/SDK 1.1.0.202.0/.../QCAP/LINUX/
+qcap_linux_sdk_1_88_0). The samples open our exact device by name:
+  QCAP_CREATE("MZ0380 PCI", 0, win, &dev, TRUE, TRUE);
+  // header: "MZ0380 PCI" IS FOR SC350, SC3C0, SC550, SC560, SC5C0
+  // header: SC3C0N4/N8/N16 (MZ0380 PCI) DON'T SUPPORT AUTO STANDARD DETECTION
+Card identity: Yuan SC3C0-family, SoC = SL6010 (per SC280/SC380 guide). The
+"no auto standard detection" line officially confirms M6: host must supply the
+video standard; only signal lock (present/absent) is reported back.
+
+MINIMAL BRING-UP that wakes the source (sc5c0n1.c initialize_capture):
+  QCAP_CREATE(...); register NO_SIGNAL/SIGNAL_REMOVED/FORMAT_CHANGED callbacks;
+  QCAP_SET_VIDEO_INPUT(dev, QCAP_INPUT_TYPE_HDMI /* =2 */);
+  QCAP_SET_AUDIO_INPUT(dev, EMBEDDED_AUDIO /* =0 */);
+  QCAP_RUN(dev);
+No explicit EDID or HPD call - the front-end asserts HPD + serves EDID as a
+side effect of input-select + RUN. Our driver boots the firmware but never
+selects the input or runs the pipeline, so the front-end stays powered down
+and HPD is never asserted. THAT is the gap to close.
+
+INPUT CODES (qcap.h): COMPOSITE0 SVIDEO1 HDMI2 DVI_D3 COMPONENT4 RGB5 SDI6
+  AUTO7 DP8. HDMI = 2. This is the value for op41 SET_VIC_PARAMS cmd[6].
+
+GPIO PATH (SC280/SC380 guide, "access SL6010's GPIO"): property 940 =
+  direction (1=output), 941 = data (1=high). These map to ep.ko GPIO opcodes
+  23 (direction) and 21 (set). HPD to the source is plausibly one of these
+  pins ("GPIO controlled by the first chipset in one board"). Doc example even
+  shows SET(940,0xFFFF);SET(941,0xFFFF) = all 16 pins output-high.
+SIGNAL LOCK IS READABLE after all (AMESDK guide): AMESDK_GET_LOCK(dev[ch],
+  &status) returns a 4-bit value, bit N = channel N lock. So lock (present/
+  absent) is host-visible in the official stack - reconcile with M6: it is the
+  STANDARD (WxH/fps) that is not auto-detected, not the lock bit.
+
+CURRENT DRIVER GAP: input_select is wired as a BAR register poke
+  (input_select_reg module param) - wrong model. Input-select is the op41
+  mailbox command (cmd[6]=input code), not a register write. Rewire to op41.
+
+NEXT (activation, in cheap->involved order):
+  1. Issue op41 SET_VIC_PARAMS(input=HDMI=2, W=1920,H=1080,fps=60) over the
+     mailbox after firmware-ready, then check: does the source wake (OUT lights
+     up / monitor on OUT shows it) and does a no_signal/lock event fire?
+  2. If not, assert the HPD GPIO: op23 set pin(s) to output, op21 drive high
+     (start from the documented all-high, then narrow). Re-check source wake.
+  3. Full RUN = program cfg banks (op2/4/8) + op41 + arm host XDMA. Milestone C.
+
+EXPERIMENT RESULTS (2026-07-05, driver builds; new /proc/mz0380-hdmi op41 +
+/proc/mz0380-cmd generic mailbox sender). Command path CONFIRMED WORKING:
+  - op41 SET_VIC_PARAMS(input=2, various WxH/fps): ret=0, card echoes 0x29 in
+    the result slot (opcode ack). First send after load times out (-110) as a
+    warmup/stale-event drain; subsequent sends complete. => op41 completes but
+    does NOT wake the source and does NOT light OUT. Consistent with the disasm
+    (op41 only stores input + sets no_signal + sysfs_notify; no front-end power).
+  - GPIO fully controllable: op20 GPIO_READ returns 0x48 (bits 3,6) at idle;
+    op23 dir=0xffff then op21 data=0xffff -> re-read op20 returns 0xffff (write
+    verified stuck). Driving ALL GPIO high did NOT wake the source. => GPIO is
+    r/w-able but is NOT the HPD lever (or HPD alone is insufficient w/o EDID).
+  CONCLUSION: neither op41 (declare format) nor GPIO (all-high) makes the card
+  present itself as an HDMI sink. The blocker is the deeper front-end bring-up
+  (receiver power + EDID load + HPD), which lives in the ARM-side modules/app,
+  not ep.ko. Dispatched to a focused firmware RE (front-end chip, boot-vs-
+  on-demand power, HPD mechanism, default-EDID presence, host trigger chain).
+  NB: op41 result slot convention - cmd_last_param[0] = opcode echo, not data.
+  NB: after all-high poke the card GPIO is left 0xffff; reload to restore 0x48.
+
+================================================================================
+M8  ROOT CAUSE (2026-07-05, firmware RE #2): the flashed firmware is the SDI
+    demo build; it has NO HDMI receiver driver. Front-end mismatch.
+================================================================================
+
+Disassembled the whole firmware image (ep.ko + yuan_ioctrl app + front-end .ko's).
+/lib/firmware/mz0380/MZ0380.HD.HEX (914KB gzip, a 2020 Yuan build) extracts to a
+SINGLE tree: yuan_demo_sdi/. Front-end modules shipped: spi_gv7601.ko (Gennum
+GV7601 = 3G-SDI receiver, SPI, /dev/gv7601), NULLSensor.ko, vpl_vic.ko, i2c-gpio.
+The HDMI receiver (ITE IT6604) driver is NOT in the image - IT6604 appears only
+as an uncompiled build option (drivers/Kconfig "HDMI audio (for IT6604)",
+Kbuild IPCam/ + IT6604_Audio.ko under CONFIG_IT6604). => this is the SDI variant
+firmware; nothing in it powers/initialises an HDMI receiver, asserts HDMI HPD, or
+serves EDID. Byte-scan for an EDID header (00 FF FF FF FF FF FF 00) across the
+whole tree = zero. No "hpd"/"edid"/"ddc" strings anywhere.
+
+ARCHITECTURE (front-end agnostic SoC): the external receiver (GV7601 for SDI,
+IT6604 for HDMI) converts the input to BT.1120 16-bit parallel video and feeds
+the SL6010 SoC VIC (vpl_vic.ko, /dev/vpl_vic0; libvideocap.so.13 = the "No
+signal" source). The PCIe/encoder path (ep.ko + vma_* encoders) is identical
+regardless of front-end. So on an HDMI card running THIS firmware, spi_gv7601
+tries SPI to a GV7601 that isn't present, while the card's actual IT6604 (I2C) is
+never initialised -> no HPD/EDID -> the source stays dark. This is the root cause
+of every "source won't wake" result above.
+
+FIRMWARE IS A REGISTER PROXY: yuan_ioctrl (the on-card app) hardcodes NO receiver
+register values. It boots, opens /dev/gv7601 + /dev/i2c-0,1 + /sys/vpl_pciep/
+command, clears the "dency" gate, and blocks in poll() waiting for host commands.
+The HOST supplies every receiver register write over the mailbox:
+  op24 (0x18) GV7601 SPI read      op25 (0x19) GV7601 SPI write
+  op33 (0x21) SPI group read       op34 (0x22) SPI group write
+  op26 (0x1a) I2C read             op27 (0x1b) I2C write
+  (ep.ko forwards opcode<=34,!=41 via sysfs_notify "command" to yuan_ioctrl,
+   which reads a 44B packet, packet[0]=opcode, and dispatches - main switch
+   @0x97c4. GV7601 SPI = 16-bit addr/16-bit data; ioctl(fd,1)=write ioctl(fd,125)
+   =read.) So the receiver init register list lives in the VENDOR HOST driver
+   (QCAP/libvideocap/Windows), NOT the firmware - that is the missing piece.
+
+CONFIRMS op41 is software-only (pciep_isr@0x171c): packet[5]=input, [8]=W u16,
+[0xa]=H u16, [0x22]=int_reduce; W==0||H==0 -> no_signal flag; else set VIC code +
+notify encoder. Touches no receiver reg, no GPIO. Also: i2cdetect/i2cget binaries
+ship in the tarball (they run on the card ARM) documenting the I2C proxy ABI.
+
+IMPLICATION / FORK:
+  A. This is the wrong-front-end firmware. If a retail Elgato (HDMI) firmware or a
+     Yuan HDMI build (with the IT6604 driver + init) exists, flashing THAT brings
+     HDMI up natively. Provenance of MZ0380.HD.HEX (a 2020 Yuan SDI demo) is
+     suspect - it is almost certainly not the retail HD60 Pro firmware.
+  B. Stay on this firmware and host-drive the receiver via the I2C proxy (op26/27):
+     probe /dev/i2c-0,1 for the IT6604, then replay its full power+EDID+HPD init
+     register sequence from the host. Hard - needs the IT6604 register script,
+     which is not in this blob.
+  NEXT (cheap, decisive): probe the front-end. op24 SPI-read a GV7601 chip-ID
+  reg (is an SDI rx even there?) and op26 I2C-scan i2c-0/1 for the IT6604 - see
+  what ACKs. That confirms the physical front-end + whether the proxy can reach
+  it, before committing to A or B. (Need the op24/op26 packet param layout first.)
+
+================================================================================
+M9  FRONT-END IDENTIFIED + FIRMWARE IS CORRECT (2026-07-05, retail Windows
+    driver RE). HDMI receiver = MStar MST3367, host-driven over I2C.
+================================================================================
+
+CORRECTION to M8's "wrong firmware": the flashed /lib/firmware/mz0380/
+MZ0380.HD.HEX is BYTE-IDENTICAL (md5 616643fb..) to the retail Elgato
+MZ0380.HD.HEX, version 01.11 = exactly what the card reports. So the firmware is
+CORRECT. Retail set (Elgato HD60 Pro install): MZ0380.HD/SD.HEX + MZ0381.HD/SD
+.HEX + FW.TXT(01.11). "HD"/"SD" != HDMI/SDI (the .HD blob ships the GV7601 *SDI*
+driver, .SD ships neither) - they are board/version variants, not front-ends.
+
+FRONT-END (from the Windows kernel driver e60MZ0380.X64.SYS, at the dual-boot
+mount /run/media/.../Program Files/Elgato/Game Capture HD60 Pro/): the HDMI
+input receiver is a **MStar MST3367**, driven ENTIRELY by the host over I2C via
+the firmware's MCU I2C proxy (op26/27; "mcu_i2c_access", "i2c_write_bytes"). The
+firmware's spi_gv7601 is for the SDI variant and is vestigial on the HDMI board.
+The .SYS also supports SA7160 / TW2968 (analog SD) and GV7601 (SDI) front-ends -
+Elgato picks MST3367 for HD60 Pro HDMI. There is NO IT6604 here (M8's Kconfig
+IT6604 was a red herring).
+
+The .SYS carries the complete HDMI bring-up (debug strings as anchors):
+  - MST3367 init/power: "MST3367 DELAY", "MST3367_ADC_AUTO_PHASE",
+    "MST3367_HDMI_MODE_DETECT( 0x55 = 0x%x )" (mode/timing read from reg 0x55).
+  - EDID: host BUILDS + LOADS an EDID into the receiver - "CDevice::Enter
+    UpdateEDID", "send EDID data", "update EDID checksum", "[UPDATE.EDID] ELGATO
+    BOARD SC5C0N1 1080P". No raw EDID header (00 FF..00) in the binary, so it is
+    constructed in code or written straight into MST3367 EDID RAM via I2C. For
+    waking the source, ANY valid 1080p CEA EDID should suffice.
+  - HPD: "[HOTPLUG %d]" - an HPD assert path exists (MST3367 register or GPIO).
+  - Mode detect reg 0x55 => this is ALSO a potential real signal/format read
+    (contradicts nothing in M6: that was ep.ko; here the host reads MST3367 regs
+    over I2C directly). GetHDMIDotClock derives pixel clock + audio sample rate.
+
+=> ROOT CAUSE (final): our driver boots the (correct) firmware but never runs the
+MST3367 HDMI-receiver bring-up that the Windows driver does over I2C. No MST3367
+init + no EDID + no HPD => the source sees a dead sink => stays dark. op41/GPIO
+were always irrelevant to this.
+
+NEXT: RE e60MZ0380.X64.SYS to extract (a) the MST3367 power-up/init I2C register
+sequence, (b) EDID load sequence (or use a generic 1080p EDID), (c) HPD/[HOTPLUG]
+assert, (d) MST3367 I2C slave address + which bus, (e) the op26/27 I2C mailbox
+packet framing - then replay it from the Linux driver via /proc/mz0380-cmd.
+Dispatched to a focused Windows-driver RE agent.
+
+================================================================================
+M10 MST3367 BRING-UP RECOVERED (2026-07-05, e60MZ0380.X64.SYS RE). The exact
+    replayable HDMI-receiver init/EDID/HPD/detect sequence. THE unblocker.
+================================================================================
+Full detail in memories [[mz0380-mst3367-i2c-abi]] + [[mz0380-mst3367-edid-and-detect]].
+Windows x64 driver, image base 0x140000000; working copy + disasm in the session
+scratchpad. All verified against call sites.
+
+MAILBOX TRANSPORT (host side, confirms our BAR0 model): single BAR writer
+sub_140285074. Frame = dwords, DOORBELL LAST:
+  +0x00 = 0x800 (doorbell/go, written last)   +0x04 = op-number (verbatim, no shift)
+  +0x08 = word2   +0x0c = word3 (read result returned here for some ops)
+  +0x10 = word4 (I2C write value / I2C read result)   +0x2c = completion, poll bit0
+Ops: 0x1a=I2C read, 0x1b=I2C write, 0x1f=bulk (EDID), 0x15=GPIO-set, 0x14=GPIO-read,
+0x20=MCU raw-I2C passthrough. (These match /proc/mz0380-cmd: opcode->+0x04,
+params->+0x08.. . NB our fw 1.11 ep.ko may stub some; the Windows-paired
+yuan_ioctrl implements them - verify each empirically.)
+
+MST3367 I2C ADDRESSES (8-bit): PRIMARY bank = 0x9C (HDMI core/timing/detect,
+this is the one to use); others 0x88/0x98/0x60/0x90/0x94 (aux banks);
+EDID DDC EEPROM = 0xA0. Paged: to touch a banked reg, first write the page# to
+reg 0x00 (op 0x1b) - pages 0,1,2. Helpers: reg-write sub_14028658c (op0x1b,
+args dev=0x9C,page,reg,val); reg-read sub_140277884 (op0x1a). MCU passthrough
+slave 0x55->0xAA via op 0x20 sub-tag 0x66 (sub_140275804) - separate from banks.
+
+INIT (CAVEAT): NO static {reg,val} table exists. Two runtime megafuncs compute
+values from the detected/forced timing: config sub_14024efc8 (~106 writes, gated
+on input-type @this+0x73a8) + timing/PLL sub_14024dc28 (~69 writes). ADDRESSES/
+ORDER/PAGES/commit-reg are recovered; per-mode VALUES are dynamic. Skeleton
+(dev 0x9C p0): FIRST write reg 0x0F=0x20 (soft-reset/power); then clears 0x54=0,
+0x0E=0, input-select 0x04/0x01, window 0x05/0x06/0x07/0x1F, PLL 0xB2, analog/EQ
+0xE2-0xE4/0xAB, output BT.1120 window 0x18-0x1A/0x2D-0x2F/0x3A/0x3B/0x39/0x2C,
+output timing gen 0x80-0x86; const from sub_14024dc28: 0xB1=0xC0, 0xB4=0x55 then
+RMW &0xFC, page2 0x61. COMMIT/strobe = reg 0x51 (write 0x00 then 0x21 to latch).
+=> the HDMI-1080p data VALUES need a LIVE I2C TRACE of a working Windows bring-up
+(or an MST3367 datasheet). This is the one remaining unknown.
+
+EDID: fully recovered, 256 bytes, checksums valid -> saved verbatim to
+mz0380-edid-hd60pro.txt (from .data @0x140350a20). Write = 8x 32-byte bulk (op
+0x1f) to I2C 0xA0; frame word2 = (len<<16)|(block<<8)|0xA0 then 32 bytes; loop
+0..0x100 step 0x20. Orchestrator CDevice::UpdateEDID sub_14024678c validates
+header + checksum first. Any valid 1080p CEA EDID substitutes.
+
+HPD = a GPIO write (NOT an MST3367 reg): op 0x15, word2=(1<<pin) mask, word3=
+(state<<pin). HPD pin = 1 (mask 0x02, value 0x02). Asserted AFTER EDID load
+(UpdateEDID loads EDID -> logs "[HOTPLUG %d]" -> raises pin, sub_140287d00).
+Plug read-back: op 0x14 GPIO-read, word2=(1<<pin), result bit at +0x0c.
+
+MODE/FORMAT DETECT (real signal read! resurrects milestone B): all op0x1a dev
+0x9C. reg 0x55 = signal status, LOCKED/HDMI when (val & 0x3C)==0x3C (gates
+detect). Timing from regs 0x40-0x45 (dot-clock + H/V total counters, (hi<<8)|lo),
+0x47 (color-depth/pixel-repeat: low nibble 5/6/7 => /5,/3,/2), 0x57&0x3F/0x58/
+0x59&0x3F/0x5A/0x5B/0x5C/0x5F (Htot/Vtot/Hact/Vact/sync), page2 0x28/0x29 (counter
+hi bits), page1 0x01 bit2 (lock/interlace), 0x4C p2 (audio rate). Dot-clock =
+divide 1600000/1250000 by counters; funcs sub_14024d5e0 (detect) + sub_14024a174
+(GetHDMIDotClock).
+
+REPLAYABLE CHECKLIST:
+  1. reset/power: write dev0x9C p0 reg 0x0F=0x20, then 0x0E/0x54 clears.
+  2. run config seq (addresses/order above); HDMI-1080p VALUES from live trace.
+  3. commit: reg 0x51 = 0x00 then 0x21.
+  4. load EDID: 8x32B bulk (op0x1f) to 0xA0 (bytes in mz0380-edid-hd60pro.txt).
+  5. assert HPD: op0x15 pin1 (mask 0x02, val 0x02) - AFTER step 4.
+  6. poll reg 0x55 until (v&0x3C)==0x3C; read timing regs, decode per above.
+ONLY remaining unknown = the per-mode MST3367 register VALUES (step 2). Get via
+a live I2C capture on Windows, or by an op0x1a dump of 0x9C regs after a working
+Windows bring-up, or from the MST3367 datasheet.
