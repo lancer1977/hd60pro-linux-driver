@@ -925,3 +925,85 @@ budget); return the low byte. NAK -> 0x00, ACK -> value, both != 0xa5.
 Milestone B (host reads HDMI format off the receiver) is DONE and in the driver.
 Remaining: EDID push + HPD for sources that gate on EDID; then the DMA/stream
 path (milestone C) and the i2c_adapter-tunnel refactor to reuse hdcapm verbatim.
+
+================================================================================
+M17 STREAMING/DMA PROTOCOL — both-sides RE (ep.ko + e60MZ0380.X64.SYS).
+    The current mz0380-dma.c ring model is FICTIONAL; real path below.
+    (2026-07-05 evening; milestone C)
+================================================================================
+
+Two independent disassembly passes (on-card ep.ko + Windows host driver) plus
+our own empirical opcode knowledge converge on this. The existing DMA code
+(BAR5 ring base/size/head/tail regs, START/STOP 0x12/0x13, IRQ regs at BAR0
+0x100/0x104/0x108) is entirely invented and must be replaced.
+
+REAL MODEL = card-programmed iATU outbound window + BAR0 status window, NOT a
+host-programmed ring:
+- Host allocates contiguous host buffers and DMAs frame data NOWHERE itself;
+  the card's encoder DMAs frames INTO those host buffers via a PCIe iATU
+  outbound window (15 MiB / 0xF00000 per channel) that the card programs from a
+  host-supplied physaddr.
+- Host hands the card the buffer physical addresses via mailbox CONFIG opcodes
+  op 0x02/0x03/0x04/0x05/0x08 (host-side proven). Each is a 12-word command:
+    word0=0x800, word1=opcode, word2=channel, word3=stride(0x2000),
+    word4..=4x (phys_hi, phys_lo) pairs.   (loop channel 0..7)
+  Card-side ep.ko confirms: op2/4/8 ISR handlers bulk-copy host cmd words into
+  the channels[] array; pcie_set_outbound(idx) then copies the {lo,hi} pair into
+  the iATU (elbi_base+0x58/+0x54), region ctrl +0x74, size +0xd4=0xF00000.
+- ARM = mailbox op 0x29 SET_VIC_PARAMS (width/height/fps/interlace/color...).
+  We already send this and it COMPLETES (M13). size==0 -> card sets no_signal;
+  size!=0 -> encoder armed. The card's own video_capture_mgr reacts by setting
+  its internal sysfs flags (hready/epint/dency..wency) - these are CARD-SIDE
+  plumbing, NOT host-facing, so the host does pure mailbox.
+- STOP = mailbox op 0x2a STOP_STREAMING(fw). (Old 0x12/0x13 are bogus.)
+
+FRAME COMPLETION (host-side proven; matches our existing event-ack):
+- IRQ cause = EVENT word BAR0+0x30. bit11 = command-done; byte-lanes bits0..23
+  = per-channel frame-done. 0xEEEEEEEE=error, 0xAAAAAAAA=ready sentinel.
+- Frame token = BAR0+0x40: (token & 7) = completed buffer/descriptor index,
+  (token & ~7) = frame pointer/token. Host xchgs it into its own producer ring,
+  then clears BAR0+0x50 = 0.
+- Per-channel encode status byte = BAR0+0x50+N (== enc_statN sysfs). Packed
+  done-count nibbles at BAR0+0x40/0x44/0x48/0x4c (card-side).
+- ACK (both sides agree, == our working event ack): BAR5(ctx+0x110)+0xDC = 2 ->
+  BAR0+0x30 = 0 -> doorbell BAR0+0x00 = 0x400.
+- Buffer geometry: 8 channels x 0x20 (32) descriptors = 256 slots; per-buffer
+  stride 0x2000; per-descriptor written-length flags in a host array
+  (Windows ctx+0x2590). One full buffer per descriptor index.
+
+OPCODE-NUMBERING CAVEAT (host-side agent error, corrected by our empirics):
+- The Windows-side pass claimed "no op 0x29" and "op 0x15/0x17 = stream enable".
+  WRONG per hardware: op 0x29 SET_VIC completes on our card (M13); op 0x15 is
+  GPIO set (pin9 reset woke the receiver, M15). So op 0x15/0x17 are GPIO, and
+  SET_VIC(0x29) is the real arm. Trust the CARD-SIDE ep.ko opcode map + our
+  empirics; use the host-side pass only for the buffer-address command SHAPE and
+  the completion/token/ack mechanism (which it proved cleanly).
+
+OPEN ITEMS to resolve on hardware (can't be settled statically):
+1. Whether SET_VIC alone starts frames once buffers are set, or a separate
+   enable/kick mailbox op is needed. (Card userspace does epint internally;
+   host may need nothing beyond SET_VIC.)
+2. Exact frame BYTE-LENGTH source: a BAR0 status reg (card-side suggests
+   +0x28..+0x44 window / +0x50+N byte) vs a card-written host-memory field.
+   Read candidates on the completion IRQ and see which tracks frame size.
+3. Which of op2/3/4/5/8 maps to which stream (H.264 vs preview vs audio); start
+   with op2 = the encoded-video buffer set.
+
+DRIVER REWRITE PLAN (mz0380-dma.c), keeping the vb2/IRQ scaffolding:
+  setup:  alloc N contiguous buffers (start 1 channel, 4-8 descriptors of
+          0x2000+ each; H.264 frames are small); send op2 (+3/4/5/8) with their
+          phys pairs; keep the existing MSI request.
+  arm:    on vb2 start_streaming: send SET_VIC_PARAMS(0x29) with detected WxH/fps
+          (reuse mz0380_activate_hdmi_locked packing).
+  isr:    read EVENT BAR0+0x30; if a frame-done lane, read token BAR0+0x40,
+          idx=token&7, copy that buffer to the head vb2 buffer (length from the
+          candidate length reg), vb2_buffer_done; ack (0xDC=2,0x30=0,doorbell
+          0x400) via the existing mz0380_mb_ack_event.
+  stop:   op 0x2a STOP_STREAMING.
+  Replace all CHECKME ring/IRQ reg offsets in reg.h with the BAR0 status-window
+  offsets above; delete the base/size/head/tail ring regs and the xdma plan-B.
+
+Primary evidence: ep.ko pcie_set_outbound@0x5a8, store_channel_done@0xdc8,
+pciep_isr@0x1210, msi.constprop@0x115c, epint_store@0x19b8; Windows arm routine
+0x140278ce0, buffer-addr ops 0x14027957b.., ISR 0x14028ec70 (EVENT@0x30,
+token@0x40), ack 0x14028eca4.
