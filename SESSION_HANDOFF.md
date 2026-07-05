@@ -45,24 +45,30 @@ VERIFIED: `v4l2-ctl --query-dv-timings` returns 1920x1080 total 2200x1125,
 74.25 MHz, CTA-861 VIC 34 (1080p30) from a live source. `mz0380_periph_read`
 now uses a low-byte sentinel poll (RE_FINDINGS M16 read-race gotcha).
 
-## IN PROGRESS (M17): streaming first cut - NEEDS A HARDWARE TEST
-`mz0380-dma.c` rewritten to the real protocol (M17): alloc 4x512KiB host
-buffers, hand physaddrs to the card via mailbox op 0x02 (SET_BUF), arm with
-SET_VIC (0x29), stop with 0x2a. ISR now reads the real cause (EVENT BAR0+0x30,
-bit11=cmd, else frame-done), token at BAR0+0x40 (idx=token&7), acks via the
-existing mz0380_mb_ack_event. Builds clean. UNVERIFIED.
+## STREAMING (M17-M19): infra done, frames NOT yet flowing
+`mz0380-dma.c` rewritten to the real protocol (M17): 4x512KiB host buffers,
+physaddrs to card via op 0x02, arm via SET_VIC (0x29), stop 0x2a. ISR reads the
+real cause (EVENT BAR0+0x30), token BAR0+0x40 (idx&7), acks via
+mz0380_mb_ack_event. Command completion now always polls STATUS (M18 hang fix -
+enabling MSI had made every command time out). Builds + loads clean.
 
-TEST (needs enable_dma=1 enable_video=1 firmware_upload=1):
-  insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
-         enable_video=1 procfs_verbosity=2
-  # HDMI source connected, then start a capture:
-  v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=30 --stream-to=/tmp/o.h264
-  dmesg | grep -iE "mz0380.*(frame token|stream|IRQ)"
-The drain logs token / idx / candidate length regs (0x44/0x48/0x4c) / enc byte
-(0x50) / first 8 bytes of the buffer per frame. That run RESOLVES the 3 open
-items: (a) do frames flow on SET_VIC alone (IRQs fire?), (b) which reg holds
-the byte length, (c) buffer head = 00 00 00 01 => real H.264 landed. Then wire
-the true length + fix buffer count/indexing.
+TESTED (M18/M19): insmod instant, SET_VIC completes, but NO frames - IRQ count
+stays 3, zero frame tokens, capture blocks. video_capture_mgr RE (M19): SET_VIC
+IS the start (it system()-spawns tinyvenc); no separate kick. So the gap is one
+of: SET_VIC struct fields mis-packed (bail branches -> tinyvenc mis/never
+launched), the hready host gate not asserted, or buffer physaddr not landing at
+BAR0+0x08. Frame LENGTH lives in tinyvenc (not ep.ko).
+
+NEXT for frames (pick one; static RE has diminishing returns here):
+ A. LIVE Windows mailbox trace - WinDbg bp on SEND_COMMAND @0x140285074 during a
+    working capture, dump {opcode,args} in order. Resolves ALL unknowns at once:
+    buffer opcode+physaddr, exact SET_VIC 44-byte struct, hready, ordering.
+ B. RE tinyvenc5/7 (extracted in scratchpad fw/yuan_demo_sdi/) for the channels[]
+    struct layout SET_VIC must fill + the frame-length output descriptor, and RE
+    the exact SET_VIC byte fields from video_capture_mgr op-41 (@0x8ea8, bails at
+    0x8eb4/0x8ec4). Then fix mz0380_dma_start packing + find the hready trigger.
+Full detail: RE_FINDINGS M17-M19. The drain already logs token/idx/candidate
+length regs/buffer head bytes, so once frames flow the length falls out.
 
 ## NEXT (after frames flow)
 1. Set the correct frame length from the resolved register; fix vb2 format

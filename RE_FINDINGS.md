@@ -1038,3 +1038,54 @@ so that mapping is suspect. Need: RE video_capture_mgr's mailbox-command
 handling to find which host opcode -> channel start (and confirm the
 buffer-address opcode), rather than guessing on hardware. Frame length reg
 (item #2) and op->stream map (#3) remain open behind this.
+
+================================================================================
+M19 STREAMING START = SET_VIC spawns tinyvenc (video_capture_mgr RE). Remaining
+    gaps need tinyvenc RE or a live Windows trace. (2026-07-05 late)
+================================================================================
+
+RE'd video_capture_mgr (ARM, stripped; resolved via PLT + literal pool). It is a
+command DISPATCHER daemon, not the encoder:
+- opens /sys/vpl_pciep/epint O_RDWR, poll()s it, on event pread()s the 44-byte
+  mailbox command struct, dispatches on cmdbuf[0]=opcode (@0x8df4+).
+- op 41 (SET_VIC, @0x8ea8): populates a per-channel channels[] config from the
+  command bytes, sprintf's a `./tinyvenc5 -D ... -w %d` (or venc7) command line,
+  and **system()-spawns tinyvenc @0x9348**. THIS is the start - there is NO
+  separate epint/ency/hready mailbox kick the host must send. SET_VIC with valid
+  fields IS the "go".
+- op 42 (STOP): killall -9 the encoders, then writes hready=0.
+- BAIL branches in the op-41 handler (why tinyvenc may never spawn):
+    @0x8ec4: if cmdbuf[5] == 0  -> jumps to the no-signal/no-bitstream path.
+    @0x8eb4: if table[cmdbuf[5]] == 8 -> reject.
+  cmdbuf[5] = mailbox byte 0x09 = params[0] bits[15:8]. Our current packing puts
+  fps there (nonzero), so we likely pass 0x8ec4 - but the exact field semantics
+  (channel/format/codec at cmdbuf+4/+5/+6, W/H at +8/+10) are not fully pinned,
+  and a wrong codec/format byte still mis-launches or picks the wrong tinyvenc.
+
+- The *ency sysfs (dency/qency/hency/wency) are written by yuan_ioctrl = the SDI
+  (GV7601) path, NOT the HDMI/MST3367 path. Irrelevant here.
+
+BUFFER-ADDRESS OPCODE (ep.ko pciep_isr): op2 copies host cmd words -> BAR0
++0x08..+0x24; op4 -> +0x48; op8 (PREVIEW_BUF_EX) -> +0x28. None call
+pcie_set_outbound directly; the exported pcie_set_outbound(idx,lo,hi) is called
+by TINYVENC, reading the address the host left at BAR0+0x08 (op2). So op2 is the
+best candidate for the encoded-video buffer physaddr - confirm the words land at
+BAR0+0x08.
+
+FRAME LENGTH: NOT in ep.ko. store_channel_done writes only 4-bit per-channel
+status nibbles (BAR0 +0x40/44/48/4c) + the done token (+0x30) + MSI. The encoded
+byte length is written by tinyvenc into its own output descriptor. => need to RE
+tinyvenc5/7 (now extracted to scratchpad fw/yuan_demo_sdi/) for the length field
++ the exact channels[] struct it consumes.
+
+WHY NO FRAMES (hypotheses, unresolved): (1) SET_VIC struct fields mis-packed so
+tinyvenc launches wrong / not at all; (2) hready gate not asserted by the host
+(host mechanism unknown - card sysfs, host must trigger via a mailbox op/BAR
+write; op1/INIT may or may not set it); (3) buffer physaddr not reaching BAR0+0x08.
+
+RECOMMENDED NEXT (most efficient): a LIVE Windows mailbox trace - breakpoint
+SEND_COMMAND @0x140285074 (or the arm routine @0x140278ce0) in WinDbg during a
+working 1080p capture and dump every {opcode, args} in order. That resolves ALL
+remaining unknowns at once: the exact buffer opcode+physaddr args, the exact
+SET_VIC 44-byte struct, whether/how hready is asserted, and the start ordering.
+Static alternative: RE tinyvenc5 for the channels[] struct + length descriptor.
