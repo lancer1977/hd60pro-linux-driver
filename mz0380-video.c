@@ -696,25 +696,27 @@ static const struct v4l2_dv_timings mz0380_no_signal = {
 };
 
 /*
- * HDMI signal "query". RE_FINDINGS.md M6/M7: this firmware exposes NO card->host
- * signal or standard query - the QCAP SDK header states plainly that
- * "MZ0380 PCI DON'T SUPPORT AUTO STANDARD DETECTION". The video standard is
- * host-supplied via SET_VIC_PARAMS (see mz0380_activate_hdmi_locked); the only
- * feedback the card gives back is a no_signal-change nudge (EVENT bit11),
- * tracked in dev->signal_locked. So VIDIOC_QUERY_DV_TIMINGS can honestly return
- * only the last host-set / cached timing. The old sc0710-style BAR0 status
- * window (0xa8..0xe4) is un-backed on this card and has been removed.
+ * HDMI signal query. The card never pushes format to the host (RE_FINDINGS.md
+ * M6), but the host reads it straight off the MST3367 receiver over the mailbox
+ * I2C proxy once the receiver is out of reset (M15). We delegate to
+ * mz0380_mst3367_read_signal(), which brings the receiver up on first use, then
+ * reads the mode-detect registers and maps the geometry to a v4l2_dv_timings.
+ * -ENOLCK = receiver locked to nothing; -ENODEV = firmware not ready.
  */
 int mz0380_query_signal(struct mz0380_dev *dev,
 			struct v4l2_dv_timings *out)
 {
-	if (!dev->signal_locked) {
+	int ret = mz0380_mst3367_read_signal(dev, out);
+
+	if (ret) {
+		dev->signal_locked = false;
 		dev->detected_timings = mz0380_no_signal;
 		*out = mz0380_no_signal;
-		return -ENOLCK;
+		return ret == -ENODEV ? -ENOLCK : ret;
 	}
 
-	*out = dev->detected_timings;
+	dev->signal_locked = true;
+	dev->detected_timings = *out;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_query_signal);

@@ -4345,9 +4345,25 @@ EXPORT_SYMBOL_GPL(mz0380_card_init);
  * (Windows FUN_1402777e4 / FUN_1402851cc). Read results land in the
  * PARAM3 slot (BAR0+0x10). Requires booted firmware.
  */
+/*
+ * The card's userspace I2C proxy (yuan_ioctrl) writes the read result into the
+ * PARAM3 slot (BAR0+0x10) *after* it posts command completion, so the snapshot
+ * send_command() takes at the completion edge can still hold the previous
+ * command's result (off-by-one on back-to-back reads). The firmware writes only
+ * the low BYTE of that slot, so we pre-load a distinctive sentinel byte and
+ * poll the low byte until the firmware replaces it (NAK -> 0x00, ACK -> value).
+ * If the real value happens to equal the sentinel we simply return it after the
+ * poll budget rather than failing.
+ */
+#define MZ0380_PERIPH_READ_SENTINEL	0xa5u	/* low-byte sentinel */
+#define MZ0380_PERIPH_READ_POLL_US	500
+#define MZ0380_PERIPH_READ_POLL_ITERS	60	/* ~30 ms budget for the result */
+
 int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val)
 {
-	u32 params[3] = { chip, reg, 0 };
+	u32 params[3] = { chip, reg, MZ0380_PERIPH_READ_SENTINEL };
+	u32 result;
+	unsigned int i;
 	int ret;
 
 	ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ, params, 3,
@@ -4361,8 +4377,18 @@ int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val)
 			mz_mmio_read(dev, MZ0380_MB_PARAM(3)));
 		return ret;
 	}
+
+	/* wait for the firmware to replace the sentinel byte with the result */
+	for (i = 0; i < MZ0380_PERIPH_READ_POLL_ITERS; i++) {
+		result = mz_mmio_read(dev, MZ0380_MB_PARAM(3));
+		if ((result & 0xff) != MZ0380_PERIPH_READ_SENTINEL)
+			break;
+		usleep_range(MZ0380_PERIPH_READ_POLL_US,
+			     MZ0380_PERIPH_READ_POLL_US * 2);
+	}
+
 	if (val)
-		*val = dev->cmd_last_param[3];
+		*val = result & 0xff;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_periph_read);

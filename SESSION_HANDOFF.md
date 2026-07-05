@@ -37,22 +37,26 @@ from `docs/re-2026-07-05/`. Remaining work is DRIVER INTEGRATION, not RE.
 - Disasm conflict (minor): 0x1e/0x1f bus1 (our RE) vs bus0 (Windows-side RE).
   MST3367 is bus0 via 0x1a/0x1b either way.
 
-## NEXT: driver integration (RE is done)
-1. Add `mz0380_mst3367_bringup(dev)`: op 0x15 pin3=1, pin9 1->0->1 (+pin8), then
-   the hdcapm init_setup + HDMI/HDCP resets. Call from card_setup (or on
-   input-select). Values: `docs/re-2026-07-05/mst3367-reference-from-gpl-driver.md`.
-2. Add `mz0380_mst3367_query_signal(dev)`: read BANK0 0x55; if (0x55 & 0x3c) read
-   Htot 0x6a/0x6b, Vtot 0x5b/0x5c, hperiod 0x57/0x58, vperiod 0x59/0x5a,
-   interlaced 0x5f&2, Hact BANK2 0x29/0x28; map to v4l2_dv_timings. Reuse the
-   sc0710-video.c timing table / hdcapm mst3367_video_standards[].
-3. Wire into V4L2: honest DV-timings query, signal-present, replace the
-   host-forces-format stubs. Then EDID push (op 0x1f to 0xA0, 8×32B,
-   `docs/re-2026-07-05/elgato-hd60pro-EDID.bin`) + HPD pin1 for sources that
-   gate on EDID (this source locked without it).
-4. Endgame: an `i2c_adapter` whose master_xfer tunnels the mailbox
+## DONE (M16): live signal detect in the driver
+`mz0380-mst3367.c` implements `mz0380_mst3367_bringup()` (pin3=1, pin9 1->0->1,
+pin8, hdcapm init) + `mz0380_mst3367_read_signal()` (poll 0x55, decode timing,
+map to a CEA preset). Wired into `mz0380_query_signal`; primed at card_setup.
+VERIFIED: `v4l2-ctl --query-dv-timings` returns 1920x1080 total 2200x1125,
+74.25 MHz, CTA-861 VIC 34 (1080p30) from a live source. `mz0380_periph_read`
+now uses a low-byte sentinel poll (RE_FINDINGS M16 read-race gotcha).
+
+## NEXT
+1. EDID push (op 0x1f to 0xA0, 8x32B, `docs/re-2026-07-05/elgato-hd60pro-EDID.bin`)
+   + HPD assert (op 0x15 pin1) for sources that gate output on EDID. Current
+   source locks without it, but a strict TV/console will need it.
+2. Milestone C - DMA/stream path: START/STOP opcodes are unverified (M6); the
+   encoder/XDMA arm is via cfg banks (op2/4/8) + SET_VIC. Get /dev/video0
+   actually delivering frames.
+3. Refactor: an `i2c_adapter` whose master_xfer tunnels the mailbox
    (op 0x1a/0x1b/0x20, dev 0x9c) so hdcapm `mst3367-drv.c` runs as a V4L2 i2c
-   subdev nearly unmodified.
-Proven recipe + register decode: RE_FINDINGS M14 (pins) + M15 (success).
+   subdev nearly unmodified (replaces the hand-coded init/detect).
+4. Optional: source-change IRQ/poll so QUERY reflects hot-plug without reload.
+Proven recipe + register decode: RE_FINDINGS M14 (pins) + M15/M16.
 
 ## Gotchas (carried forward)
 - Always sentinel the result slot; stale slots lie (the "127 ACKs on bus1"

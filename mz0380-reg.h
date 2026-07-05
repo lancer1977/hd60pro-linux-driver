@@ -173,6 +173,48 @@
 #define MZ0380_CMD_GPIO_SET             0x15  /* 21: set GPIO data (prop 941)  */
 #define MZ0380_CMD_GPIO_DIR             0x17  /* 23: set GPIO direction (940)  */
 
+/* pattern-check: skip register/pin #define constants, no types or behavior */
+
+/*
+ * GPIO pin map (RE_FINDINGS.md M14, from e60MZ0380.X64.SYS disasm). op 0x15
+ * (GPIO_SET) is single-pin: PARAM1 = mask = (1<<pin), PARAM2 = data =
+ * (level<<pin). Direction is never set over the mailbox (pins are pre-config'd
+ * outputs), so there is no GPIO_DIR step. pin9 held low at power-up is what
+ * kept the MST3367 in reset and the I2C bus dead (M11-M15).
+ */
+#define MZ0380_GPIO_HPD                 1     /* HDMI hot-plug detect          */
+#define MZ0380_GPIO_RX_ENABLE           3     /* receiver / mux enable (=1)    */
+#define MZ0380_GPIO_RX_STRAP            8     /* companion reset/power strap   */
+#define MZ0380_GPIO_RX_RESET            9     /* MST3367 reset, ACTIVE-LOW     */
+
+/*
+ * MST3367 HDMI receiver over the mailbox I2C proxy (op 0x1a read / 0x1b write).
+ * 8-bit device address; the card firmware shifts it >>1 to 7-bit 0x4e. Register
+ * space is banked: write reg 0x00 = bank before touching a banked register.
+ * Register roles + detect math: RE_FINDINGS.md M15 + docs/re-2026-07-05/.
+ */
+#define MST3367_I2C_DEV                 0x9c
+#define MST3367_REG_BANK_SELECT         0x00
+#define MST3367_BANK0                   0x00
+#define MST3367_BANK1                   0x01
+#define MST3367_BANK2                   0x02
+/* BANK0 mode-detect block */
+#define MST3367_B0_DETECT               0x55  /* signal present if (v & 0x3c)  */
+#define MST3367_B0_DETECT_LOCK_MASK     0x3c
+#define MST3367_B0_HPERIOD_HI           0x57  /* hperiod = 1600000/(hi<<8|lo)  */
+#define MST3367_B0_HPERIOD_LO           0x58
+#define MST3367_B0_VPERIOD_HI           0x59  /* vperiod = 1250000/(hi<<8|lo)  */
+#define MST3367_B0_VPERIOD_LO           0x5a
+#define MST3367_B0_VTOTAL_HI            0x5b
+#define MST3367_B0_VTOTAL_LO            0x5c
+#define MST3367_B0_INTERLACE            0x5f  /* bit1 = interlaced             */
+#define MST3367_B0_INTERLACE_BIT        0x02
+#define MST3367_B0_HTOTAL_HI            0x6a
+#define MST3367_B0_HTOTAL_LO            0x6b
+/* BANK2 active-pixel counter */
+#define MST3367_B2_HACTIVE_LO           0x28  /* hactive = (0x29<<8)|0x28      */
+#define MST3367_B2_HACTIVE_HI           0x29
+
 /* Input codes for SET_VIC_PARAMS cmd[6] (QCAP qcap.h). */
 #define MZ0380_INPUT_CODE_COMPOSITE     0
 #define MZ0380_INPUT_CODE_HDMI          2

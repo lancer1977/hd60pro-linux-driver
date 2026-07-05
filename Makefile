@@ -14,6 +14,7 @@ mz0380-objs := \
 	mz0380-cards.o \
 	mz0380-core.o \
 	mz0380-video.o \
+	mz0380-mst3367.o \
 	mz0380-dma.o \
 	mz0380-fw.o \
 	mz0380-audio.o

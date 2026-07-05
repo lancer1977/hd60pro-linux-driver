@@ -296,8 +296,10 @@ struct mz0380_dev {
 	bool streaming;
 
 	/* HDMI signal */
+	// pattern-check: skip adding one bool state flag to existing struct
 	struct v4l2_dv_timings detected_timings;
 	bool signal_locked;
+	bool mst3367_ready;	/* receiver reset released + init applied */
 
 	/* ALSA */
 	struct snd_card *snd_card;
@@ -491,6 +493,12 @@ void mz0380_dma_drain_audio(struct mz0380_dev *dev);
 int mz0380_query_signal(struct mz0380_dev *dev,
 			struct v4l2_dv_timings *timings);
 void mz0380_signal_event(struct mz0380_dev *dev);
+
+// pattern-check: skip two function prototypes, procedural module, no abstraction
+/* MST3367 receiver bring-up + signal detect (mz0380-mst3367.c) */
+int mz0380_mst3367_bringup(struct mz0380_dev *dev);
+int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
+			       struct v4l2_dv_timings *out);
 
 /* ALSA audio (mz0380-audio.c) */
 #if IS_ENABLED(CONFIG_SND)

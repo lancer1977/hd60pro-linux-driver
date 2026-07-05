@@ -100,6 +100,13 @@ int mz0380_card_setup(struct mz0380_dev *dev)
 		return 0;
 	}
 
+	/*
+	 * Release the MST3367 from reset and apply its init now (non-fatal if the
+	 * firmware is not ready yet). This wakes the HDMI input at probe; a later
+	 * VIDIOC_QUERY_DV_TIMINGS re-runs it lazily if it was skipped here.
+	 */
+	mz0380_mst3367_bringup(dev);
+
 	if (!mz0380_enable_video) {
 		printk(KERN_INFO
 		       "%s: probe-safe V4L2 node disabled; load with enable_video=1 when you want /dev/video*\n",

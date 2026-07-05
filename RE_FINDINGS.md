@@ -892,3 +892,36 @@ NEXT: fold steps 1-6 into the driver as mz0380_mst3367_bringup() +
 query_signal, called from card_setup / on an input-select. Then the endgame:
 an i2c_adapter tunneling the mailbox so hdcapm mst3367-drv.c runs as a V4L2
 i2c subdev. Milestone B (real signal/format to host) is now OPEN and WORKING.
+
+================================================================================
+M16 DRIVER INTEGRATION — live VIDIOC_QUERY_DV_TIMINGS working. (2026-07-05 eve)
+================================================================================
+
+Folded the bring-up + detect into the driver (mz0380-mst3367.c):
+  mz0380_mst3367_bringup()     - pin3=1, pin9 1->0->1, pin8 strap, hdcapm init.
+  mz0380_mst3367_read_signal() - poll BANK0 0x55; if locked, read the timing
+                                 regs and map to v4l2_dv_timings via a CEA preset
+                                 table. Wired into mz0380_query_signal() and
+                                 called once at card_setup (dev->mst3367_ready).
+
+RESULT: v4l2-ctl --query-dv-timings returns a full valid timing, e.g.
+  1920x1080, total 2200x1125, pixelclock 74.25 MHz, CTA-861 VIC 34 (1080p30).
+The interlace bit / fps now decode correctly with stable reads; the M15
+"interlaced" read was a racy artifact (see the read-race gotcha below).
+
+*** CRITICAL GOTCHA - mailbox read result race (root of two integration bugs) ***
+The card's userspace proxy (yuan_ioctrl) writes the read result into the PARAM3
+slot (BAR0+0x10) *after* ep.ko posts command completion, and it writes only the
+LOW BYTE of that slot. Two consequences the driver must handle:
+  1. Reading dev->cmd_last_param[3] at the send_command() completion edge returns
+     the PREVIOUS command's byte on back-to-back reads (off-by-one). The manual
+     probe script hid this with a 200 ms "late re-read"; the driver did not.
+  2. A full-word sentinel (0xffffffff) never clears in the high bytes (firmware
+     touches only byte0), so a "high bytes == 0" settle check times out forever.
+FIX (mz0380_periph_read): preload a distinctive LOW-BYTE sentinel (0xa5) into
+the result slot, fire, then poll (slot & 0xff) until it != sentinel (~30 ms
+budget); return the low byte. NAK -> 0x00, ACK -> value, both != 0xa5.
+
+Milestone B (host reads HDMI format off the receiver) is DONE and in the driver.
+Remaining: EDID push + HPD for sources that gate on EDID; then the DMA/stream
+path (milestone C) and the i2c_adapter-tunnel refactor to reuse hdcapm verbatim.
