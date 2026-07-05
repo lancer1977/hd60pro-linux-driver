@@ -1144,3 +1144,26 @@ IRQ, this gate (input-type) is the next thing to resolve.
 Host buffer address: goes to the card via op 0x02 (lands at BAR0+0x08, feeds
 pcie_set_outbound). hready is NOT a hard gate; op2-before-SET_VIC is the real
 requirement.
+
+================================================================================
+M21 hready is NOT the blocker (ep.ko RE). Confirms enable_dma is the sole gate.
+    (2026-07-05 late)
+================================================================================
+
+RE of ep.ko host_ready/channel_done path:
+- /sys/class/vpl_pciep/channel_done: .show=show_host_ready (returns host_ready
+  @.bss+0), .store=store_channel_done. Separate writable node `hready`
+  (hready_store -> kstrtoint -> writes .bss+0 = host_ready).
+- host_ready is a STATUS word, NOT a hard interlock: store_channel_done and the
+  MSI path (msi.constprop @0x18a0) branch on pirq_base != 0, not on host_ready.
+  No `if(host_ready) deliver` test in the frame path.
+- NO host mailbox opcode sets host_ready (op1/INIT included - no such store).
+  It's set by on-card userspace via the hready sysfs node.
+- Re-confirmed op2 (@0x1458): copies mailbox [ep_command+0xc..+0x28] ->
+  ep_regs+0x08..+0x24 = the DMA-target address staging. Matches our op2.
+
+=> hready is a RED HERRING for "no frames". The sole remaining blocker is
+tinyvenc's enable_dma input-type gate (M20: [cfg+2] must be 4/9; HDMI=2/3).
+Next session: don't re-chase hready. Resolve enable_dma via the live Windows
+trace (what the retail driver sends to turn on host-DMA for HDMI) or by fully
+tracing tinyvenc5 main @0xded0 ([r5+2] source, literals @0xef04/0xedbc).
