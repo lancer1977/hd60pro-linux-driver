@@ -252,8 +252,8 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 {
 	u32 params[8] = { 0 };
 	u32 w = dev->capture.width, h = dev->capture.height;
-	u32 fps = dev->capture.timeperframe.denominator ?
-		  dev->capture.timeperframe.denominator : 60;
+	bool interlaced = dev->detected_timings.bt.interlaced;
+	u32 fmt = interlaced ? 3 : 2;   /* byte6: venc5 H.264, 2=prog 3=interlaced */
 	int ret;
 
 	if (!dev->dma_armed)
@@ -266,14 +266,23 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 		return ret;
 	}
 
-	/* SET_VIC_PARAMS packing matches mz0380_activate_hdmi_locked() */
-	params[0] = ((u32)MZ0380_INPUT_CODE_HDMI << 16) | ((fps & 0xff) << 8);
+	/*
+	 * SET_VIC_PARAMS 44-byte struct (RE_FINDINGS.md M20, from video_capture_mgr
+	 * op-41). Each param word is 4 struct bytes: params[0]=struct[4..7], etc.
+	 *   byte4 channel=0, byte6 format (2 prog / 3 interlaced, selects tinyvenc5)
+	 *   byte8..9 width, byte10..11 height, byte22..23 input_w, byte24..25
+	 *   input_h, byte26..27 bitstream_num (MUST be >=1, else the encoder emits
+	 *   nothing - this was the bug that produced a spawned-but-silent encoder).
+	 */
+	params[0] = fmt << 16;                        /* struct[6] = format */
 	params[1] = ((h & 0xffff) << 16) | (w & 0xffff);
+	params[4] = (w & 0xffff) << 16;               /* struct[22..23] input_w */
+	params[5] = (1u << 16) | (h & 0xffff);        /* struct[26..27]=1, [24..25]=input_h */
 
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
 				  ARRAY_SIZE(params), NULL, 2000);
-	pr_info("%s: stream start: SET_VIC(%ux%u@%u) ret=%d\n",
-		dev->name, w, h, fps, ret);
+	pr_info("%s: stream start: SET_VIC(%ux%u %s H.264, bitstreams=1) ret=%d\n",
+		dev->name, w, h, interlaced ? "i" : "p", ret);
 	dev->stream_head = 0;
 	return ret;
 }

@@ -1089,3 +1089,58 @@ working 1080p capture and dump every {opcode, args} in order. That resolves ALL
 remaining unknowns at once: the exact buffer opcode+physaddr args, the exact
 SET_VIC 44-byte struct, whether/how hready is asserted, and the start ordering.
 Static alternative: RE tinyvenc5 for the channels[] struct + length descriptor.
+
+================================================================================
+M20 STREAMING CONTRACT NAILED (tinyvenc5 + video_capture_mgr RE). SET_VIC bug
+    found + fixed; frame-length located. (2026-07-05 late)
+================================================================================
+
+SET_VIC (op 0x29) 44-byte struct - EXACT field map (video_capture_mgr op-41,
+@0x8ea8; channels[] base 0x141d4 stride 60; tinyvenc argv reads this record):
+  struct byte (=param word: params[0]=struct[4..7], params[i]=struct[4+4i..]):
+    [4]     channel (0)
+    [5]     fw/index
+    [6]     FORMAT/CODEC: {2,3}=tinyvenc5 H.264 (2 prog, 3 interlaced - inferred),
+            7=tinyvenc7. MUST be in {2,3} for venc5.
+    [8..9]  width  (LE, MUST be >127)
+    [10..11]height (LE, MUST be >127)
+    [22..23]input_frame_width
+    [24..25]input_frame_height
+    [26..27]bitstream_num (MUST be >=1)
+    [30]    is_nosg
+The op-41 bail branches (0x8eb4 cmp #8; 0x8ec0) are argv/boot-fixed
+(product_type, debug flag), NOT host-controllable, and BOTH still spawn tinyvenc.
+So SET_VIC always launches the encoder; the host-side musts are: width>127,
+height>127, byte6 in {2,3}, bitstream_num>=1.
+
+THE BUG (why the first cut spawned tinyvenc but produced nothing): our SET_VIC
+sent bitstream_num=0 and input_frame_w/h=0 (params[2..7] were 0). FIXED in
+mz0380_dma_start:
+    params[0] = fmt << 16;                    // struct[6] format 2/3
+    params[1] = (h<<16) | w;                  // width, height
+    params[4] = w << 16;                       // struct[22..23] input_w
+    params[5] = (1<<16) | h;                   // struct[26..27]=1, [24..25]=input_h
+(1080p example struct: 29 00 00 00 00 00 02 00 80 07 38 04 00*10 80 07 38 04
+ 01 00 ...; 0x780=1920, 0x438=1080.)
+
+FRAME DELIVERY (tinyvenc5, not stripped):
+- Per frame: DMA via the SoC MMA engine (TK_MMA_SetOptions/ProcessOneFrame,
+  PCIEtOptions @0x7ed8c) from a physically-contiguous MemBroker buffer; ep.ko's
+  ATU outbound window (programmed from the host addr at BAR0+0x08 via
+  pcie_set_outbound) relays it into host DRAM. tinyvenc never reads BAR0 itself.
+- Notify: pwrite(/sys/class/vpl_pciep/channel_done, record, 24) once per frame.
+  record = 6xu32; word0 = channel. ep.ko store_channel_done turns this into the
+  host MSI + the BAR0+0x40/44/48/4c status nibbles + BAR0+0x30 EVENT.
+- FRAME BYTE LENGTH = binary u32 at **enc_stat struct +0x08** (from PB_GetEncBytes
+  delta), also mirrored in the channel_done record. keyframe flag at result+0x94.
+
+RISK / OPEN: tinyvenc's EncodingGroup::enable_dma gate (@0x7ed88) is set 1 only
+when input-type [cfg+0x02] == 4 or 9 in this yuan_demo_sdi build; our HDMI format
+is 2/3. The retail Windows driver clearly DMAs HDMI frames with this same fw, so
+either [cfg+0x02] is a different (input-select) value than byte6, or the gate is
+bypassed on the HDMI path. Watch for it: if the SET_VIC fix still yields no host
+IRQ, this gate (input-type) is the next thing to resolve.
+
+Host buffer address: goes to the card via op 0x02 (lands at BAR0+0x08, feeds
+pcie_set_outbound). hready is NOT a hard gate; op2-before-SET_VIC is the real
+requirement.
