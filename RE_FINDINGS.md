@@ -659,3 +659,236 @@ REPLAYABLE CHECKLIST:
 ONLY remaining unknown = the per-mode MST3367 register VALUES (step 2). Get via
 a live I2C capture on Windows, or by an op0x1a dump of 0x9C regs after a working
 Windows bring-up, or from the MST3367 datasheet.
+
+================================================================================
+M11 OP26/27 ARE LIVE (yuan_ioctrl, 2026-07-05 am) — but every I2C read NAKed
+================================================================================
+
+Disassembled the on-card `yuan_ioctrl` (ARM ELF from the firmware tar). It
+services the I2C-proxy opcodes ep.ko merely sysfs-notifies about — so M4c's
+"0x1a is a stub" was wrong at the SYSTEM level: ep.ko's sysfs_notify hands the
+command buffer to the userspace daemon, which does the real work. Dispatch is
+jump-table on (opcode - 24) @0x97d8; idx8 combo handler @0x9d98.
+
+Mailbox slot map for op 0x1a/0x1b (host BAR0 offsets): dev8 @0x08 (card does
+addr7 = dev8 >> 1), reg @0x0c, val/result @0x10. Doorbell/framing identical to
+the proven SEND_COMMAND path.
+
+EMPIRICAL RESULT (sentinel in the result slot): every read attempt at every
+address on "both buses" left the sentinel untouched — read as NAK-everywhere,
+"not even the EDID EEPROM answers". See M12 for why that conclusion was partly
+an artifact.
+
+================================================================================
+M12 WINDOWS-SIDE RE COMPLETE (2026-07-05 pm) — authoritative I2C protocol,
+    GPL MST3367 driver found, corrections to M10/M11. Docs vendored at
+    docs/re-2026-07-05/ (HD60-PRO-LINUX-DRIVER.md is the reference).
+================================================================================
+
+A Windows-side session disassembled BOTH the retail e60MZ0380.X64.SYS
+(v1.1.0.194; loaded v195 byte-compatible) AND the on-card firmware, and found
+that an existing GPL-v2 driver (stoth68000/hdcapm, Startech USB2HDCAPM — same
+Vatics Mozart 395s + MST3367) already contains the complete MST3367 register
+logic RE'd from the same Windows driver. Cross-validated against our disasm.
+
+VERIFIED PROTOCOL (both sides agree; supersedes M11's bus map):
+  - READ = op 0x1a, WRITE = op 0x1b, dev = 8-BIT 0x9C in the command word;
+    the card computes addr7 = addr8 >> 1 (0x9C -> 0x4E). We already sent 0x9C.
+  - 0x1e/0x1f = multi-byte read_s/write_s on BUS0 (NOT bus1 — M11's bus map
+    was wrong). 0x1c/0x1d = HDCP-encrypted ops, the ONLY bus1 users.
+    0x20 = combo (addr8 @byte0, rw @byte1, len @bytes2-3 of word +0x08;
+    payload from +0x0c; card chunks 16B internally).
+  - Registers are BANKED: write reg 0x00 = bank (0..3) first; Windows caches
+    the current bank (ctx+0x2090). Reg 0x55 etc. are BANK0.
+  - No separate MCU: "mcu version = 0" / "NO MCU" — the SoC is the I2C master.
+    mcu_i2c_access passthrough theory is dead.
+  - Card boots itself from flash at slot power; fw 1.11.1.11 confirmed live.
+
+HARDWARE CONFIRMED (teardown-corroborated): MST3367CMK-LF-170 receiver,
+Vatics Mozart 395s encoder SoC (NOT MStar SL6010), ITE IT6621FN HDMI front-end.
+
+WHY M11 SAW "NAK EVERYWHERE" — reconciliation with the 0xEE-sentinel data:
+  - The bus0 NAK was REAL, not an artifact: fw forces result=0x00 on I2C
+    failure, and every bus0 probe came back 0x00 (sentinel 0xEE overwritten).
+    yuan_ioctrl ran, the kernel I2C_RDWR failed. Result-race excluded for bus0.
+  - But the pin-map theory ("demo firmware's gpio-i2c doesn't reach the
+    MST3367") is now DEAD: the same card, same flashed fw 1.11.1.11, works
+    under Windows on this machine. Bus0 GPIO12/13 does reach the receiver.
+  - => The receiver I2C domain is GATED until something Windows does first.
+    Candidates, in test order: (1) input select / SET_VIC (AUTO.INPUT runs in
+    Windows D0 init before receiver access); (2) MZ0380_HwInitialize-era
+    config setters (op 0x02/0x08 blocks) / windows_select_fw; (3) a GPIO
+    power/reset pin via op 0x15 (HPD is already known = pin1; another pin may
+    be receiver reset — read the bitmap with op 0x14 before guessing);
+    (4) SA7160_HARDWARE_I2C_RESET-equivalent bus recovery.
+  - DISASM CONFLICT to resolve when it matters: our yuan_ioctrl RE put
+    0x1e/0x1f (read_s/write_s) on BUS1; the Windows-side RE of the same binary
+    puts them on BUS0 (only HDCP 0x1c/0x1d on bus1). Either way the MST3367 is
+    bus0 via 0x1a/0x1b; the EDID 0xA0 target of the bulk op 0x1f follows
+    whichever bus 0x1f really uses. Bus1 probes were inconclusive (op 0x1e
+    does NOT force 0 on NAK; sentinel survived = no info).
+
+GPL DRIVER GIVES THE MISSING VALUES (M10's "one remaining unknown" CLOSED):
+hdcapm mst3367-drv.c has init_setup, HPD (BANK0 0xB7 bit1), HDMI reset (BANK2
+0x07 f4->04), HDCP reset (BANK0 0xb8 10->00), mode detect (BANK0 0x55 & 0x3c;
+htotal 0x6a/0x6b, vtotal 0x5b/0x5c, hperiod 1600000/(0x57<<8|0x58), vperiod
+1250000/(0x59<<8|0x5a), interlaced 0x5f bit1, hactive BANK2 0x29<<8|0x28) and
+the full video-standards timing table. Local copy:
+docs/re-2026-07-05/mst3367-reference-from-gpl-driver.md.
+Architecture: register an i2c_adapter whose master_xfer tunnels through the
+mailbox, then reuse mst3367-drv.c as a V4L2 i2c subdev nearly unmodified.
+
+256-byte EDID recovered (valid checksums, "SC530-N1", 1080p60 preferred):
+docs/re-2026-07-05/elgato-hd60pro-EDID.bin — push verbatim.
+
+BRING-UP ORDER (Windows): reset -> write EDID -> assert HPD -> mode detect.
+A source outputs NOTHING until EDID+HPD are presented; reg 0x55 reads
+no-signal even with I2C working — do not conflate with NAK.
+
+NEXT: run ./mz0380-mst3367-test.sh (root, module loaded) — baseline 0x9C read
+(nonzero result = first-ever ACK), GPIO bitmap read, then the gating
+candidates: --with-vic (SET_VIC first), GPL init/reset sequence. First real
+ACK unblocks the whole hdcapm reuse path.
+
+================================================================================
+M13 HDCAPM BRING-UP REPLAYED ON HW — DECISIVE: addressing correct, mailbox
+    result path proven, MST3367 STILL NAKs after input-select + full init.
+    Gate = a host-driven receiver reset/power GPIO. (2026-07-05 evening)
+================================================================================
+
+Ran mz0380-mst3367-test.sh --with-vic on the card (fw 1.11.1.11 live). Results:
+
+ADDRESSING CONFIRMED CORRECT (no double-shift): we send dev 0x9c; the card
+echoes 0x4e back in the dev slot (0x9c >> 1 = 0x4e = 7-bit MST3367). So the
+8-bit-address convention is right and the card shifts exactly once.
+
+MAILBOX RESULT PATH PROVEN WORKING: GPIO read (op 0x14, mask 0xee) returned a
+REAL value 0x20 in the result slot (BAR0+0x0c) — nonzero data comes back when a
+handler produces it. So a 0x00 read result is a true NAK, not a transport bug.
+
+SET_VIC (input select) COMPLETED: ret was -110 only because our wait polls
+STATUS; the card actually signalled completion via EVENT bit11 (=0x800, drained
+before the next command). So input=HDMI(2) 1920x1080@60 WAS selected.
+
+MST3367 STILL DEAD: after --with-vic + the full GPL hdcapm init_setup + HDMI
+reset (B2 0x07 f4/04) + HDCP reset (B0 0xb8 10/00), EVERY read (0x55, 0x6a/0x6b,
+0x5b/0x5c, 0x57-0x5a, 0x5f, 0xb7 in BANK0; 0x28/0x29 in BANK2) returns 0x00 =
+NAK. Since a write to a NAKing device fails silently (status still "done"), the
+init WRITES almost certainly never landed either → the bus is DEAD/GATED, not
+merely unconfigured.
+
+WHY (firmware role clarified): the card firmware is a DUMB I2C PROXY. Disasm of
+the on-card yuan_ioctrl shows NO MST3367 / reset / GPIO / HDMI logic at all —
+only i2c_read/i2c_write/spi. ALL receiver bring-up (SA7160_HARDWARE_I2C_RESET,
+mode detect, etc.) lives in the Windows host driver and is replayed over the
+mailbox. ep.ko owns the GPIO (gpio_direction_output / gpio_set_value, symbol
+gpio_dir_settings), reachable from the host via op 0x14 (read) / 0x15 (set) /
+0x17 (dir). So the missing step is a HOST-driven receiver power/reset GPIO that
+Windows asserts (its SA7160_HARDWARE_I2C_RESET) BEFORE any receiver I2C. HPD is
+GPIO pin1; the receiver reset/power pin is a different, still-unidentified pin.
+
+drivers.sh note (Mozart-SDK generic): bus map `i2c-gpio bus_num=2 scl0=12
+sda0=13 scl1=4 sda1=5`; a comment calls gpio12/13 the SSM2603 audio-codec bus
+and gpio6/7 the "VIC control pins ... from sensor or video chip" (commented-out
+alt). Windows proves /dev/i2c-0 does reach the MST3367 on this same firmware, so
+the pin pair is fine — the blocker is receiver POWER/RESET state, not routing.
+
+NEXT (M14): identify the receiver-reset GPIO and pulse it before I2C.
+  1. Read the FULL GPIO bitmap (op 0x14 mask 0xffffffff) as a baseline.
+  2. Bus-liveness proof: write reg0=0x02 then read reg0 back; 0x02 = bus alive,
+     0x00 = confirmed dead. (Distinguishes gate-from-reset vs wrong-result-slot.)
+  3. Get the exact reset pin from ep.ko's gpio_dir_settings init (disasm in
+     progress) and/or the Windows SA7160_HARDWARE_I2C_RESET's 3 GPIO words
+     (dir/data/mask). Then op 0x17 dir-out + op 0x15 pulse low->high on that
+     pin, re-probe 0x55. CAUTION: some Mozart GPIOs gate PCIe/DMA — use the
+     identified pin, not a blind sweep; reload the module after.
+
+================================================================================
+M14 RECEIVER-RESET GPIO IDENTIFIED (Windows e60MZ0380 disasm, 2026-07-05 eve).
+    The dead I2C bus is because pin9 (MST3367 reset, active-low) is asserted.
+================================================================================
+
+Disassembled the Windows driver's GPIO paths. Two protocol facts + the pin map:
+
+op 0x15 (GPIO SET) is SINGLE-PIN mask+data, NOT a full-bitmap write (corrects an
+ep.ko-disasm guess): the only builder (Win helper 0x140287d00, args dl=pin,
+r8b=level) emits word2 = mask = (1<<pin), word3 = data = (level<<pin). So it
+drives ONLY the masked pin. There is NO op 0x17 (GPIO DIR) builder anywhere —
+Windows never sets direction; pins are pre-configured as outputs by the card
+firmware. op 0x14 (GPIO READ) builder = 0x140277f98.
+
+SA7160_HARDWARE_I2C_RESET (fn 0x140293408) drives NO GPIO — it is pure MMIO to
+the SoC's on-chip I2C-master block (base [ctx+0x108], regs 0xb008 cmd / 0xb00c
+status / 0xbfd8..0xbfe8 clock dividers). It resets the I2C CONTROLLER, not the
+receiver. (So that string was a red herring for the reset pin.)
+
+GPIO PIN MAP (op 0x15, pin = bit index, mask = 1<<pin):
+  pin 1  (0x02)  = HPD (confirmed). assert/deassert around EDID re-read.
+  pin 3  (0x08)  = RX / mux enable. driven =1 once at bring-up (0x14028574f).
+  pin 8  (0x100) = companion reset/power strap, driven low alongside pin9 low.
+  pin 9  (0x200) = *** MST3367 RECEIVER RESET, ACTIVE-LOW ***. Canonical pulse
+                   1->0->1 in 5+ routines (0x14027755c etc). RELEASE = drive
+                   HIGH (1); assert = drive LOW (0).
+  pin 10 (0x400) / pin 11 (0x800) = alt-board-variant resets (guarded branches).
+MST3367 bring-up orchestrator = 0x14028548c: interleaves pin9 reset pulses with
+I2C writes to slaves 0x9a/0x88/0x9c/0xb8 (0x9c = MST3367; the others = front-end
+/ HDCP / companion chips).
+
+=> ROOT CAUSE of the dead bus (M11-M13): the card powers up with pin9 LOW =
+MST3367 held in reset, and nothing on the Linux side ever releases it. Every
+I2C txn NAKs because the chip is in reset. Windows releases pin9 (+ pin3 enable)
+during D0 bring-up before touching the receiver.
+
+FIX (mailbox commands, no direction needed):
+  RX enable:      {0x800, 0x15, 0x08,  0x08}        (pin3 = 1)
+  reset pulse:    {..,0x15,0x200,0x200} high ->
+                  {..,0x15,0x200,0x000} low  (delay) ->
+                  {..,0x15,0x200,0x200} high (release)   (pin9 1->0->1)
+  companion:      pin8 low during the low phase, high on release.
+Then run the hdcapm init + probe reg 0x55.
+
+TEST: ./mz0380-mst3367-test.sh --gpio-reset   (P3g runs exactly this sequence,
+then re-probes 0x55 + a write/read-back bus-liveness check). First nonzero read
+= MST3367 out of reset = whole bring-up unblocked.
+
+================================================================================
+M15  *** SUCCESS *** MST3367 OUT OF RESET, LOCKED TO 1080i. First working HDMI
+     signal detection on Linux. (2026-07-05 evening, ran --gpio-reset)
+================================================================================
+
+Releasing GPIO pin9 (receiver reset) was the whole blocker. Ran
+mz0380-mst3367-test.sh --gpio-reset. Sequence pin3=1 (RX enable), pin9 1->0->1
+(release reset), pin8 companion. Results:
+
+- Immediately after the pin9 pulse (before any register init): reg 0x55 read
+  0x03 (was 0x00), and a write reg0=0x02 read back 0x02 => the I2C bus is LIVE,
+  writes AND reads now ACK. The dead bus was purely pin9 held low.
+- After the hdcapm init_setup + HDMI/HDCP resets, the mode-detect block reads a
+  real locked signal:
+    0x55 = 0x7b   -> & 0x3c = 0x38 (nonzero) = LOCKED / signal present
+    0x6a,0x6b = 08,98 -> Htotal = 0x0898 = 2200
+    0x5b,0x5c = 04,38 -> (vtotal-ish) 0x0438 = 1080
+    0x57,0x58 = 12,8f -> hperiod_raw 0x128f=4751 -> 1600000/4751 ~= 337
+    0x59,0x5a = 10,4f -> vperiod_raw 0x104f=4175 -> 1250000/4175 ~= 300 (=>~30fps)
+    0x5f = 47 -> bit1 set = INTERLACED
+    BANK2 0x28,0x29 = 80,07 -> Hactive = 0x0780 = 1920
+  => 1920 active, Htotal 2200, interlaced, ~30 frame/s = 1080i59.94. Matches the
+  sibling sc0710's known {htot 2200, 1920, interlaced} 1080i signature exactly.
+- User observed: the source (camera) entered HDMI mode and STAYED in it after we
+  ran this — the bring-up genuinely activates the input.
+
+PROVEN END-TO-END BRING-UP RECIPE (host, over the mailbox):
+  1. RX enable:      op 0x15 pin3 = 1        {0x800,0x15,0x08,0x08}
+  2. reset pulse:    op 0x15 pin9 1 -> 0 -> 1 (delay each) ; pin8 low then high
+  3. hdcapm init_setup (BANK writes, docs/re-2026-07-05/mst3367-reference-*.md)
+  4. HDMI reset B2 0x07 f4->04 ; HDCP reset B0 0xb8 10->00
+  5. poll BANK0 0x55; locked when (0x55 & 0x3c) != 0
+  6. read timing: Htot 0x6a/0x6b, Vtot 0x5b/0x5c, hperiod 0x57/0x58,
+     vperiod 0x59/0x5a, interlaced 0x5f&2, Hact BANK2 0x29/0x28; match table.
+  (EDID push + HPD pin1 assert still to be added for sources that gate on EDID;
+   this source locked without it.)
+
+NEXT: fold steps 1-6 into the driver as mz0380_mst3367_bringup() +
+query_signal, called from card_setup / on an input-select. Then the endgame:
+an i2c_adapter tunneling the mailbox so hdcapm mst3367-drv.c runs as a V4L2
+i2c subdev. Milestone B (real signal/format to host) is now OPEN and WORKING.

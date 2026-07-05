@@ -1,111 +1,73 @@
-# MZ0380 Linux driver — session handoff (2026-07-05)
+# MZ0380 Linux driver — session handoff (2026-07-05, evening)
 
 ## Project
 Clean-room Linux V4L2 driver for the **Elgato Game Capture HD60 Pro** (PCIe,
-12ab:0380, subsys 1cfa:0006). Own hardware, RE for interoperability — not
-security. Repo `/home/wolffyx/Projects/sc0710`. Active driver = `mz0380-*.c`;
-the `sc0710-*.c` files are untracked upstream reference (a sibling 4k60 mk.2
-card) — read for ideas, don't build them.
+`12ab:0380`, subsys `1cfa:0006`). Own hardware, RE for interoperability. Repo
+`/home/wolffyx/Projects/sc0710`. Active driver = `mz0380-*.c`; the `sc0710-*.c`
+files are untracked upstream reference (sibling 4k60 mk.2) — read, don't build.
+Card = Yuan MZ0380/SC3C0 board, SoC **Vatics Mozart 395s** (NOT MStar SL6010 —
+teardown-corroborated), HDMI receiver **MST3367CMK-LF-170**, HDMI front-end ITE
+IT6621FN, firmware 1.11.1.11.
 
-Card identity: **Yuan MZ0380 / SC3C0 family, SoC = MStar SL6010**. The vendor
-stack is Yuan QCAP (device name "MZ0380 PCI"). Firmware v01.11.
+## The one-paragraph story — SOLVED (M15)
+Card boots, mailbox works. HDMI was dead because the MST3367 was **held in reset
+by GPIO pin9** (active-low), which the Linux side never released. Releasing it
+(op 0x15: pin3=1 RX enable, pin9 pulse 1->0->1) makes the I2C bus live, and the
+hdcapm init then locks the receiver to the source. **Confirmed on hardware
+2026-07-05:** after --gpio-reset the MST3367 locked to a real 1080i signal
+(reg 0x55=0x7b, Htotal 2200, Hactive 1920, interlaced) read straight over the
+mailbox I2C proxy. First working HDMI signal detection on Linux for this card.
+All downstream pieces (init values, EDID, detect math, timing table) are in hand
+from `docs/re-2026-07-05/`. Remaining work is DRIVER INTEGRATION, not RE.
 
-## The one-paragraph story
-The card boots, the PCIe command mailbox works (GET_VERSION, GPIO, op41 all
-complete). For weeks the blocker was "HDMI source (a camera) plugged into IN
-never turns on / no passthrough on OUT / no signal." This session proved WHY and
-found the fix: **the HDMI input receiver is a MStar MST3367 that must be brought
-up by the HOST over I2C** (init registers + EDID load + HPD assert). Our driver
-boots the (correct, retail-identical) firmware but never runs that bring-up, so
-the card is a dead HDMI sink and the source stays dark. The complete bring-up
-sequence has now been reverse-engineered from Elgato's Windows driver.
+## What is SETTLED (don't re-derive; RE_FINDINGS M11+M12)
+- I2C proxy ABI verified both sides: op 0x1a rd / 0x1b wr, dev **8-bit 0x9C**
+  @BAR0+0x08 (card `>>1`), reg @0x0c, val/result @0x10. Banked: wr reg0=bank.
+- Result semantics: sentinel-survives = handler didn't run; **0x00 = NAK**
+  (fw forces it); nonzero = ACK. M11's NAKs were genuine, not framing bugs.
+- No MCU ("mcu version = 0") — op0x20-passthrough theory dead. Pin-map-wrong
+  theory dead (same fw works under Windows).
+- hdcapm GPL driver = full MST3367 logic (init_setup, HPD chip-side B0/0xB7
+  bit1, HDMI reset B2/0x07 f4→04, HDCP reset B0/0xb8 10→00, detect B0/0x55 &
+  0x3c + timing regs + standards table). Local copy:
+  `docs/re-2026-07-05/mst3367-reference-from-gpl-driver.md`.
+- 256-byte EDID: `docs/re-2026-07-05/elgato-hd60pro-EDID.bin`.
+- Bring-up order: reset → EDID → HPD → detect. Source sends nothing until
+  EDID+HPD; 0x55 no-signal ≠ NAK.
+- Disasm conflict (minor): 0x1e/0x1f bus1 (our RE) vs bus0 (Windows-side RE).
+  MST3367 is bus0 via 0x1a/0x1b either way.
 
-## What is SETTLED (don't re-litigate)
-- **Firmware is correct.** `/lib/firmware/mz0380/MZ0380.HD.HEX` is byte-identical
-  (md5 616643fb..) to the retail Elgato `MZ0380.HD.HEX` v01.11 = what the card
-  reports. Not the problem. ("HD"/"SD" in the filenames != HDMI/SDI.)
-- **Card cannot auto-detect the video standard, and ep.ko has NO card->host
-  signal query.** (RE_FINDINGS M6; QCAP header: "MZ0380 PCI DON'T SUPPORT AUTO
-  STANDARD DETECTION".) So V4L2 timings are host-SET, not queried — EXCEPT we can
-  now read format directly from the MST3367 over I2C (see below), which
-  resurrects real signal detection.
-- **op41 (SET_VIC_PARAMS 0x29) is software-only** — sets a no_signal flag / sizes
-  the encoder VIC / notifies; it touches NO receiver register and NO GPIO. It was
-  never going to wake the source. GPIO all-high likewise did nothing.
-- The firmware is a **register proxy**: the host drives the receiver via I2C over
-  the mailbox. The init values live in the vendor host driver, not the firmware.
+## NEXT: driver integration (RE is done)
+1. Add `mz0380_mst3367_bringup(dev)`: op 0x15 pin3=1, pin9 1->0->1 (+pin8), then
+   the hdcapm init_setup + HDMI/HDCP resets. Call from card_setup (or on
+   input-select). Values: `docs/re-2026-07-05/mst3367-reference-from-gpl-driver.md`.
+2. Add `mz0380_mst3367_query_signal(dev)`: read BANK0 0x55; if (0x55 & 0x3c) read
+   Htot 0x6a/0x6b, Vtot 0x5b/0x5c, hperiod 0x57/0x58, vperiod 0x59/0x5a,
+   interlaced 0x5f&2, Hact BANK2 0x29/0x28; map to v4l2_dv_timings. Reuse the
+   sc0710-video.c timing table / hdcapm mst3367_video_standards[].
+3. Wire into V4L2: honest DV-timings query, signal-present, replace the
+   host-forces-format stubs. Then EDID push (op 0x1f to 0xA0, 8×32B,
+   `docs/re-2026-07-05/elgato-hd60pro-EDID.bin`) + HPD pin1 for sources that
+   gate on EDID (this source locked without it).
+4. Endgame: an `i2c_adapter` whose master_xfer tunnels the mailbox
+   (op 0x1a/0x1b/0x20, dev 0x9c) so hdcapm `mst3367-drv.c` runs as a V4L2 i2c
+   subdev nearly unmodified.
+Proven recipe + register decode: RE_FINDINGS M14 (pins) + M15 (success).
 
-## THE FIX — MST3367 HDMI bring-up
-(full detail in RE_FINDINGS.md "M10" + memories `mz0380-mst3367-i2c-abi`,
-`mz0380-mst3367-edid-and-detect`)
-Mailbox frame (host): dword +0x00=0x800 doorbell (write LAST), +0x04=opcode,
-+0x08/+0x0c/+0x10 = params, poll +0x2c bit0. Ops: 0x1a I2C-read, 0x1b I2C-write,
-0x1f bulk (EDID), 0x15 GPIO-set, 0x14 GPIO-read.
-MST3367 primary I2C addr = **0x9C** (8-bit); EDID EEPROM = **0xA0**. Banked regs
-paged by writing page# to reg 0x00 (pages 0/1/2).
-Ordered checklist:
-  1. Reset/power: write dev 0x9C page0 **reg 0x0F = 0x20**, then 0x0E/0x54 clears.
-  2. Config sequence (addresses/order/pages recovered — see M10). !! the per-mode
-     REGISTER VALUES for HDMI-1080p are computed at runtime and are the ONE piece
-     not statically recoverable — capture them from a **live I2C trace** of a
-     working Windows bring-up (or dump 0x9C regs via op 0x1a after Windows brings
-     it up, or use an MST3367 datasheet).
-  3. Commit strobe: reg 0x51 = 0x00 then 0x21.
-  4. Load EDID: 8x32-byte bulk writes (op 0x1f) to I2C 0xA0 — bytes in
-     `mz0380-edid-hd60pro.txt` (256B, checksums valid; any valid 1080p CEA EDID
-     also works).
-  5. Assert HPD: op 0x15, **GPIO pin 1** (mask 0x02, value 0x02) — AFTER EDID.
-  6. Poll detect: op 0x1a dev 0x9C **reg 0x55** until (val & 0x3C)==0x3C = locked;
-     then read regs 0x40-0x47 / 0x57-0x5F / page2 0x28-0x29 -> resolution + pixel
-     clock (decode in M10). This is a REAL signal/format read.
+## Gotchas (carried forward)
+- Always sentinel the result slot; stale slots lie (the "127 ACKs on bus1"
+  artifact). 0x00 result = NAK by design.
+- pipefail + `grep -q` breaks the reload script; enable_video → pipewire holds
+  video0 → rmmod EBUSY.
+- Load: `modprobe videodev videobuf2-v4l2 videobuf2-dma-sg v4l2-dv-timings
+  snd-pcm` then `insmod ./mz0380.ko firmware_upload=1 dma_handshake=1
+  procfs_verbosity=2`.
+- Tools: `/proc/mz0380-cmd` (raw opcode), `/proc/mz0380-hdmi` (SET_VIC),
+  `/proc/mz0380-scan` (raw BAR0 window via scan_start/scan_len params).
 
-## Tooling already in place (built, compiles clean)
-- `/proc/mz0380-cmd` — generic mailbox sender: `echo "<opcode> [p0 p1 ...]" >`
-  (hex or dec); dumps status + return slots to dmesg. USE THIS to replay the
-  MST3367 sequence (op 0x1b writes, op 0x1a reads, op 0x1f EDID, op 0x15 HPD).
-- `/proc/mz0380-hdmi` — fires op41 (kept as a convenience; now known insufficient).
-- Real opcode map in `mz0380-reg.h` (SET_VIC=0x29, GPIO 0x14/0x15/0x17, input
-  codes). `mz0380_query_signal()` rewritten honest (returns cached/host-set
-  timings). Disproven `signal_from_bar0` + QUERY_SIGNAL dead code removed.
-- Load line: `sudo insmod ./mz0380.ko firmware_upload=1 enable_video=1
-  dma_handshake=1 procfs_verbosity=2` then wait `/proc/mz0380-state` = ready.
-
-## NEXT SESSION — do this
-1. **Verify the I2C path reaches the MST3367.** First confirm the op 0x1a packet
-   framing (device addr in +0x08, reg in +0x0c, result back in +0x10) — read
-   MST3367 reg 0x55 (dev 0x9C). If it ACKs with a plausible byte, the proxy
-   works. NB fw 1.11 ep.ko may implement the I2C ops differently than the
-   Windows-paired firmware — confirm empirically; if op 0x1a/0x1b are stubbed,
-   try op 0x20 (MCU passthrough, slave 0x55->0xAA, sub-tag 0x66).
-2. **Get the per-mode register VALUES** (the only missing piece): boot Windows on
-   the dual-boot drive, run Elgato with the camera at 1080p, capture the I2C
-   register writes — OR after Windows brings it up, dump dev 0x9C regs via op 0x1a
-   from Linux. That yields the exact 1080p config values for step 2 of the fix.
-3. **Wire the bring-up** into the driver (a real `mz0380_mst3367_bringup()` on
-   input-select / stream-start) and retire the /proc experiments. Then the source
-   should wake and capture can start (milestone C: cfg banks + XDMA).
-4. **Re-wire `mz0380_query_signal()`** to read MST3367 reg 0x55 + timing regs over
-   I2C — real VIDIOC_QUERY_DV_TIMINGS.
-
-## Git / state
-Branch `main`, ahead ~10 unpushed. This session is UNCOMMITTED (commit was offered
-several times; user hadn't confirmed). Changed/added: `mz0380-core.c` (+/proc
-hdmi & cmd, honest query_signal callers), `mz0380-video.c` (honest query_signal,
-removed signal_from_bar0), `mz0380-reg.h` (real opcode map), `RE_FINDINGS.md`
-(M5-M10), new `mz0380-edid-hd60pro.txt`, plus the earlier `mz0380-signal-hunt.sh`.
-Do NOT stage `sc0710-*`. Memories added: signal-blob-layout, hdmi-activation,
-mst3367-i2c-abi, mst3367-edid-and-detect (+ updates to bar0-no-signal-regs).
-Suggested first commit: the opcode map + /proc tooling + honest signal path +
-findings + EDID (a clean checkpoint before the MST3367 wiring).
-
-## Reference material on disk
-- Windows driver (the RE source): `/run/media/wolffyx/14CC4DC1CC4D9DBC/Program
-  Files/Elgato/Game Capture HD60 Pro/e60MZ0380.X64.SYS` (+ `.AX` DirectShow
-  filters). Also mirrored under the Steam Proton prefix compatdata/230410.
-- Firmware extracted: `/tmp/mz0380-fw/` (ep.ko, yuan_ioctrl, disasm) — may be
-  cleared on reboot; re-extract `tar xzf /lib/firmware/mz0380/MZ0380.HD.HEX`.
-- QCAP Linux SDK samples (open "MZ0380 PCI"): `~/Downloads/test/SDK 1.1.0.202.0/
-  .../QCAP/LINUX/qcap_linux_sdk_1_88_0/`. SC280/SC380 + Device-Custom-Property
-  guides under `.../AMESDK/DOC/PRODUCTS/`.
-- gchd USB driver (older HDMI capture, resolution-by-timing reference):
-  `~/Downloads/test/elgato-gchd-master/`.
+## Repo state
+Uncommitted: RE_FINDINGS.md M11+M12, `mz0380-mst3367-test.sh`,
+`docs/re-2026-07-05/` (4 vendored docs), this handoff. Commit as a
+checkpoint when convenient. Windows trace kit remains at
+`/run/media/wolffyx/Work/hd60-trace/` (firmware tars + disasm scripts there,
+not vendored).
