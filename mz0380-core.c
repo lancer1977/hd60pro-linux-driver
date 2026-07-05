@@ -4114,7 +4114,6 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 			u32 *status_out, unsigned int timeout_ms)
 {
 	unsigned int i;
-	long left;
 	u32 status;
 	int ret = 0;
 
@@ -4170,31 +4169,17 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 	if (timeout_ms == 0)
 		goto out;
 
-	if (dev->msi_enabled) {
-		left = wait_event_interruptible_timeout(dev->cmd_wait,
-			dev->cmd_complete,
-			msecs_to_jiffies(timeout_ms));
-		if (left == 0) {
-			pr_warn("%s: command 0x%x timed out after %u ms\n",
-				dev->name, opcode, timeout_ms);
-			ret = -ETIMEDOUT;
-			goto out;
-		}
-		if (left < 0) {
-			ret = (int)left;
-			goto out;
-		}
-		status = dev->cmd_last_status;
-	} else {
+	{
 		/*
-		 * No MSI yet: emulate the Windows event thread
-		 * (FUN_140284380). Completion is signalled either by
-		 * MZ0380_MB_STATUS bit0 (short commands, polled by
-		 * MZ0380_SEND_COMMAND itself) or by MZ0380_MB_EVENT bit11
-		 * (command-complete event, normally semaphore-signalled via
-		 * the interrupt). Every event must be acked with
-		 * mz0380_mb_ack_event() or the card keeps INTx asserted and
-		 * eventually stops signalling.
+		 * Command completion is ALWAYS polled, even when MSI is enabled
+		 * for the frame-delivery path. This card signals short-command
+		 * completion via MZ0380_MB_STATUS bit0 with NO interrupt, so
+		 * waiting on an MSI that never arrives times every command out
+		 * (the bug that stalled the whole bring-up once enable_dma was
+		 * set). We additionally honour dev->cmd_complete, which the ISR
+		 * sets if it happens to catch an EVENT-bit11 (command-done)
+		 * interrupt first. Ack only when a real event is pending; the
+		 * old ack-every-tick scheme aborted STATUS-completing commands.
 		 */
 		unsigned int waited = 0;
 		unsigned int max_wait = max(timeout_ms,
@@ -4202,15 +4187,12 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 		bool done = false;
 		u32 event;
 
-		/*
-		 * Poll QUIETLY: check STATUS and EVENT, and ack ONLY when a
-		 * real event is pending. The earlier "ack every tick" scheme
-		 * fired the 0x400 doorbell every 1 ms, which aborts a
-		 * STATUS-completing command (0x01/0x0a) before the card
-		 * finishes it - the mailbox scan proved a silent wait
-		 * completes reliably where the ack-storm did not.
-		 */
 		do {
+			if (dev->cmd_complete) {
+				status = dev->cmd_last_status;
+				done = true;
+				break;
+			}
 			status = mz_mmio_read(dev, MZ0380_MB_STATUS);
 			/*
 			 * Completion = bit0, or the firmware's 0xaaaaaaaa

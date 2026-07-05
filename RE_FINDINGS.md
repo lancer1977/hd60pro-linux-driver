@@ -1007,3 +1007,34 @@ Primary evidence: ep.ko pcie_set_outbound@0x5a8, store_channel_done@0xdc8,
 pciep_isr@0x1210, msi.constprop@0x115c, epint_store@0x19b8; Windows arm routine
 0x140278ce0, buffer-addr ops 0x14027957b.., ISR 0x14028ec70 (EVENT@0x30,
 token@0x40), ack 0x14028eca4.
+
+================================================================================
+M18 STREAMING FIRST-CUT TEST — hang fixed; SET_VIC alone does NOT start frames.
+    (2026-07-05 late)
+================================================================================
+
+Ran the first-cut streaming path (enable_dma=1 enable_video=1). Findings:
+
+BUG FIXED (regression from enabling the MSI ISR): mz0380_send_command took the
+MSI-wait branch whenever msi_enabled, but this card completes short commands via
+STATUS bit0 with NO interrupt (only ~3 MSI ever fire). So every command
+(GPIO 0x15 in bring-up, 0x1b register writes) timed out 500-1000 ms each -> the
+MST3367 bring-up alone stalled insmod ~30 s ("stuck"). Fix: send_command now
+ALWAYS polls STATUS for completion and additionally honours dev->cmd_complete
+(set by the ISR if it catches an EVENT-bit11 command-done). insmod is instant
+again, no timeouts.
+
+EMPIRICAL (open item #1 resolved): with buffers programmed via op 0x02 + arm via
+SET_VIC_PARAMS(0x29, ret=0), NO frames flow: IRQ count stays 3, zero frame-token
+EVENTs, v4l2 capture blocks, /tmp/o.h264 = 0 bytes. => SET_VIC is necessary but
+NOT sufficient; a separate START KICK is required, and/or op 0x02 is not the
+right buffer-address opcode.
+
+STILL UNKNOWN (both RE passes were fuzzy here): the exact HOST mailbox opcode
+that makes the card's video_capture_mgr start a channel. Card-side said the kick
+is an internal `epint` sysfs (set by video_capture_mgr, not host-facing);
+host-side said op 0x17/0x15 "enable" - but op 0x15 is GPIO on our card (M14/M15),
+so that mapping is suspect. Need: RE video_capture_mgr's mailbox-command
+handling to find which host opcode -> channel start (and confirm the
+buffer-address opcode), rather than guessing on hardware. Frame length reg
+(item #2) and op->stream map (#3) remain open behind this.
