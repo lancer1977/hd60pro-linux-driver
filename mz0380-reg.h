@@ -230,8 +230,34 @@
  * bogus and the DMA start/stop path is milestone-C work to be rewired. Kept at
  * their historical values only so the streaming path compiles until then.
  */
-#define MZ0380_CMD_START_STREAMING      0x12  /* UNVERIFIED - see M6 */
-#define MZ0380_CMD_STOP_STREAMING       0x13  /* UNVERIFIED - see M6 */
+#define MZ0380_CMD_START_STREAMING      0x12  /* bogus (absent from dispatcher) */
+
+/* pattern-check: skip streaming register/opcode #define constants (M17) */
+/*
+ * Streaming/DMA protocol (RE_FINDINGS.md M17, both-sides RE). The card DMAs
+ * encoded frames into host buffers via a PCIe iATU outbound window it programs
+ * from host-supplied physical addresses. The host hands those addresses over
+ * with the config-setter opcodes below (12-word command: opcode, channel,
+ * stride, then up to 4 {phys_hi, phys_lo} pairs), arms with SET_VIC_PARAMS
+ * (0x29), and stops with 0x2a. Frame completion arrives as an EVENT (BAR0+0x30)
+ * with the buffer token in BAR0+0x40.
+ */
+#define MZ0380_CMD_SET_BUF_2            0x02  /* buffer phys addrs (primary)   */
+#define MZ0380_CMD_SET_BUF_3            0x03
+#define MZ0380_CMD_SET_BUF_4            0x04
+#define MZ0380_CMD_SET_BUF_5            0x05
+#define MZ0380_CMD_SET_BUF_8            0x08
+#define MZ0380_CMD_STOP_STREAMING       0x2a  /* STOP_STREAMING(fw) - M17      */
+
+/* BAR0 frame-completion status window (M17). EVENT is MZ0380_MB_EVENT (0x30). */
+#define MZ0380_MB_FRAME_TOKEN           0x40  /* (token & 7) = buffer index    */
+#define MZ0380_MB_ENC_STATUS            0x50  /* +N = per-channel status byte  */
+
+/* First-cut streaming geometry (video channel 0). Tunable once frames flow. */
+#define MZ0380_STREAM_VIDEO_CHANNEL     0
+#define MZ0380_STREAM_NR_BUFS           4     /* 4 phys pairs per SET_BUF cmd  */
+#define MZ0380_STREAM_BUF_SIZE          0x80000  /* 512 KiB per H.264 frame    */
+#define MZ0380_STREAM_BUF_STRIDE        MZ0380_STREAM_BUF_SIZE
 
 /*
  * Disproven guesses (absent from the ep.ko dispatcher): SET_AIC=0x11,

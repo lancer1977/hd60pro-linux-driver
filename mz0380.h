@@ -287,6 +287,19 @@ struct mz0380_dev {
 	struct mz0380_ring audio_ring;
 	bool dma_armed;
 
+	// pattern-check: skip preloaded DMA buffer array, plain state, no abstraction
+	/*
+	 * Streaming buffer set (RE_FINDINGS.md M17). The card DMAs encoded
+	 * frames into these host buffers via its iATU outbound window; we hand
+	 * their physaddrs over with the buffer-setter mailbox opcodes. The
+	 * completion EVENT carries the finished buffer index in (token & 7).
+	 */
+	struct mz0380_stream_buf {
+		void *va;
+		dma_addr_t dma;
+	} stream_bufs[MZ0380_STREAM_NR_BUFS];
+	u32 stream_head;	/* next buffer index we expect from the card */
+
 	/* vb2 video streaming */
 	struct vb2_queue vb_queue;
 	struct mutex queue_lock;
@@ -481,7 +494,6 @@ void mz0380_irq_release(struct mz0380_dev *dev);
 int mz0380_dma_setup(struct mz0380_dev *dev);
 void mz0380_dma_teardown(struct mz0380_dev *dev);
 int mz0380_dma_start(struct mz0380_dev *dev);
-int mz0380_dma_start_xdma(struct mz0380_dev *dev, u32 base, dma_addr_t pt);
 void mz0380_dma_stop(struct mz0380_dev *dev);
 int mz0380_dma_ring_alloc(struct mz0380_dev *dev, struct mz0380_ring *r,
 			  u32 nr_entries, u32 entry_size);

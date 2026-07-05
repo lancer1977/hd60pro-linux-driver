@@ -45,18 +45,34 @@ VERIFIED: `v4l2-ctl --query-dv-timings` returns 1920x1080 total 2200x1125,
 74.25 MHz, CTA-861 VIC 34 (1080p30) from a live source. `mz0380_periph_read`
 now uses a low-byte sentinel poll (RE_FINDINGS M16 read-race gotcha).
 
-## NEXT
-1. EDID push (op 0x1f to 0xA0, 8x32B, `docs/re-2026-07-05/elgato-hd60pro-EDID.bin`)
-   + HPD assert (op 0x15 pin1) for sources that gate output on EDID. Current
-   source locks without it, but a strict TV/console will need it.
-2. Milestone C - DMA/stream path: START/STOP opcodes are unverified (M6); the
-   encoder/XDMA arm is via cfg banks (op2/4/8) + SET_VIC. Get /dev/video0
-   actually delivering frames.
-3. Refactor: an `i2c_adapter` whose master_xfer tunnels the mailbox
-   (op 0x1a/0x1b/0x20, dev 0x9c) so hdcapm `mst3367-drv.c` runs as a V4L2 i2c
-   subdev nearly unmodified (replaces the hand-coded init/detect).
-4. Optional: source-change IRQ/poll so QUERY reflects hot-plug without reload.
-Proven recipe + register decode: RE_FINDINGS M14 (pins) + M15/M16.
+## IN PROGRESS (M17): streaming first cut - NEEDS A HARDWARE TEST
+`mz0380-dma.c` rewritten to the real protocol (M17): alloc 4x512KiB host
+buffers, hand physaddrs to the card via mailbox op 0x02 (SET_BUF), arm with
+SET_VIC (0x29), stop with 0x2a. ISR now reads the real cause (EVENT BAR0+0x30,
+bit11=cmd, else frame-done), token at BAR0+0x40 (idx=token&7), acks via the
+existing mz0380_mb_ack_event. Builds clean. UNVERIFIED.
+
+TEST (needs enable_dma=1 enable_video=1 firmware_upload=1):
+  insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
+         enable_video=1 procfs_verbosity=2
+  # HDMI source connected, then start a capture:
+  v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=30 --stream-to=/tmp/o.h264
+  dmesg | grep -iE "mz0380.*(frame token|stream|IRQ)"
+The drain logs token / idx / candidate length regs (0x44/0x48/0x4c) / enc byte
+(0x50) / first 8 bytes of the buffer per frame. That run RESOLVES the 3 open
+items: (a) do frames flow on SET_VIC alone (IRQs fire?), (b) which reg holds
+the byte length, (c) buffer head = 00 00 00 01 => real H.264 landed. Then wire
+the true length + fix buffer count/indexing.
+
+## NEXT (after frames flow)
+1. Set the correct frame length from the resolved register; fix vb2 format
+   (H.264 pixelformat, sizeimage) so the .h264 is playable.
+2. Audio DMA path (currently no-op; enable_audio milestone-C follow-up).
+3. EDID push (op 0x1f to 0xA0, `docs/re-2026-07-05/elgato-hd60pro-EDID.bin`) +
+   HPD (op 0x15 pin1) for sources that gate output on EDID.
+4. Refactor: i2c_adapter tunneling the mailbox so hdcapm mst3367-drv.c runs as a
+   V4L2 subdev; source-change IRQ so QUERY reflects hot-plug without reload.
+Protocol: RE_FINDINGS M17; pins M14; detect M15/M16.
 
 ## Gotchas (carried forward)
 - Always sentinel the result slot; stale slots lie (the "127 ACKs on bus1"

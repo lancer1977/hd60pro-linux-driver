@@ -1,17 +1,19 @@
 /*
  *  Driver for MZ0380 based capture cards.
  *
- *  DMA buffer ring + MSI interrupt handling.
+ *  Frame delivery + MSI interrupt handling (RE_FINDINGS.md M17).
  *
- *  Two rings live in coherent host memory; the card DMAs encoded H.264
- *  bitstream into video_ring and HDMI-extracted PCM samples into
- *  audio_ring. The card produces (advancing TAIL); the host consumes
- *  (advancing HEAD). Both indices are exposed in BAR5 mailbox slots
- *  (see mz0380-reg.h; offsets are CHECKME until verified).
+ *  The card DMAs encoded H.264 frames into host-allocated buffers via a
+ *  PCIe iATU outbound window it programs from the physical addresses we
+ *  hand it with the buffer-setter mailbox opcodes. It arms on SET_VIC and
+ *  signals a finished frame with an EVENT (BAR0+0x30) whose token
+ *  (BAR0+0x40, low 3 bits) names the completed buffer.
  *
- *  Each ring entry has a small header (flags, byte count, PTS) so the
- *  driver knows how much of the entry actually contains valid payload
- *  for a given completion.
+ *  FIRST CUT - unverified on hardware. Three things are still open (M17):
+ *  whether SET_VIC alone starts frames, the exact frame byte-length
+ *  register, and the op->stream mapping. The ISR/drain therefore logs the
+ *  candidate status registers and the head of each delivered buffer so a
+ *  live run can resolve them.
  */
 
 #include "mz0380.h"
@@ -54,40 +56,84 @@ void mz0380_dma_ring_free(struct mz0380_dev *dev, struct mz0380_ring *r)
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_ring_free);
 
-static void mz0380_program_ring(struct mz0380_dev *dev,
-				const struct mz0380_ring *r)
-{
-	u64 base = (u64)r->dma;
+/* --- streaming buffer set (video channel 0) ------------------------------ */
 
-	mz_cfg_write(dev, r->base_reg_lo, lower_32_bits(base));
-	mz_cfg_write(dev, r->base_reg_hi, upper_32_bits(base));
-	mz_cfg_write(dev, r->size_reg,    r->entry_size);
-	mz_cfg_write(dev, r->entries_reg, r->nr_entries);
-	mz_cfg_write(dev, r->head_reg,    0);
+static void mz0380_stream_bufs_free(struct mz0380_dev *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		if (dev->stream_bufs[i].va) {
+			dma_free_coherent(&dev->pci->dev, MZ0380_STREAM_BUF_SIZE,
+					  dev->stream_bufs[i].va,
+					  dev->stream_bufs[i].dma);
+			dev->stream_bufs[i].va = NULL;
+		}
+	}
+}
+
+static int mz0380_stream_bufs_alloc(struct mz0380_dev *dev)
+{
+	unsigned int i;
+
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		dev->stream_bufs[i].va =
+			dma_alloc_coherent(&dev->pci->dev,
+					   MZ0380_STREAM_BUF_SIZE,
+					   &dev->stream_bufs[i].dma, GFP_KERNEL);
+		if (!dev->stream_bufs[i].va) {
+			mz0380_stream_bufs_free(dev);
+			return -ENOMEM;
+		}
+	}
+	dev->stream_head = 0;
+	return 0;
 }
 
 /*
- * MSI ISR. Reads IRQ_STATUS, dispatches to per-source handlers, and
- * acks. Workqueue takes the heavy lifting (copy bytes into vb2
- * buffers) so the ISR stays short.
- *
- * IRQ status/mask/ack live in BAR0 per sc0710 cross-reference;
- * BAR5 is the property/mailbox window only.
+ * Hand the card the buffer physical addresses (M17): one 12-word command,
+ * params = { channel, stride, (phys_hi,phys_lo) x NR_BUFS }. The card copies
+ * these into its channels[] array and programs the iATU outbound window from
+ * them, so its encoder DMA lands in our buffers.
+ */
+static int mz0380_stream_program_bufs(struct mz0380_dev *dev)
+{
+	u32 params[2 + 2 * MZ0380_STREAM_NR_BUFS];
+	unsigned int i;
+
+	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
+	params[1] = MZ0380_STREAM_BUF_STRIDE;
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		u64 phys = (u64)dev->stream_bufs[i].dma;
+
+		params[2 + 2 * i]     = upper_32_bits(phys);
+		params[2 + 2 * i + 1] = lower_32_bits(phys);
+	}
+
+	return mz0380_send_command(dev, MZ0380_CMD_SET_BUF_2, params,
+				   ARRAY_SIZE(params), NULL, 2000);
+}
+
+/*
+ * MSI ISR. The interrupt cause is the EVENT word (BAR0+0x30): bit11 =
+ * command-done (snapshot the mailbox params and wake the command waiter),
+ * any other non-zero value = a per-channel frame-done (defer to the drain
+ * work). Ack via the standard event ack (INT_FLAG=2, EVENT=0, doorbell 0x400).
  */
 static irqreturn_t mz0380_isr(int irq, void *data)
 {
 	struct mz0380_dev *dev = data;
-	u32 status;
+	u32 event;
 
-	status = mz_mmio_read(dev, MZ0380_REG_IRQ_STATUS);
-	if (!status || status == 0xffffffff)
+	event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+	if (!event || event == 0xffffffff)
 		return IRQ_NONE;
 
 	atomic_inc(&dev->irq_count);
 
-	if (status & MZ0380_IRQ_CMD_COMPLETE) {
+	if (event & MZ0380_MB_EVENT_CMD_DONE) {
 		unsigned int i;
-		/* mailbox lives in BAR0 (RE-confirmed) */
+
 		dev->cmd_last_status = mz_mmio_read(dev, MZ0380_MB_STATUS);
 		for (i = 0; i < MZ0380_REG_PARAM_MAX; i++)
 			dev->cmd_last_param[i] =
@@ -95,32 +141,13 @@ static irqreturn_t mz0380_isr(int irq, void *data)
 		smp_wmb();
 		dev->cmd_complete = true;
 		wake_up_all(&dev->cmd_wait);
-	}
-
-	if (status & MZ0380_IRQ_VIDEO_RING_READY) {
+	} else {
+		/* frame-done lane(s) - hand off to the drain worker */
 		atomic_inc(&dev->irq_video_count);
 		schedule_work(&dev->drain_work);
 	}
 
-	if (status & MZ0380_IRQ_AUDIO_RING_READY) {
-		atomic_inc(&dev->irq_audio_count);
-		mz0380_audio_period_elapsed(dev);
-	}
-
-	if (status & MZ0380_IRQ_SIGNAL_CHANGE) {
-		atomic_inc(&dev->irq_signal_count);
-		mz0380_signal_event(dev);
-	}
-
-	if (status & MZ0380_IRQ_FW_READY)
-		wake_up_all(&dev->fw_wait);
-
-	if (status & MZ0380_IRQ_ERROR)
-		pr_warn("%s: ISR error bit set (status=0x%08x)\n",
-			dev->name, status);
-
-	/* ack */
-	mz_mmio_write(dev, MZ0380_REG_IRQ_ACK, status);
+	mz0380_mb_ack_event(dev);
 	return IRQ_HANDLED;
 }
 
@@ -177,9 +204,6 @@ void mz0380_irq_release(struct mz0380_dev *dev)
 	if (!dev->irq_requested)
 		return;
 
-	/* mask everything on the device first */
-	mz_mmio_write(dev, MZ0380_REG_IRQ_MASK, 0);
-
 	free_irq(dev->irq, dev);
 	pci_free_irq_vectors(dev->pci);
 	cancel_work_sync(&dev->drain_work);
@@ -192,58 +216,15 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 {
 	int ret;
 
-	dev->video_ring.base_reg_lo = MZ0380_REG_VIDEO_RING_BASE_LO;
-	dev->video_ring.base_reg_hi = MZ0380_REG_VIDEO_RING_BASE_HI;
-	dev->video_ring.size_reg    = MZ0380_REG_VIDEO_RING_SIZE;
-	dev->video_ring.entries_reg = MZ0380_REG_VIDEO_RING_ENTRIES;
-	dev->video_ring.head_reg    = MZ0380_REG_VIDEO_RING_HEAD;
-	dev->video_ring.tail_reg    = MZ0380_REG_VIDEO_RING_TAIL;
-
-	ret = mz0380_dma_ring_alloc(dev, &dev->video_ring,
-				    mz0380_video_ring_entries,
-				    mz0380_video_ring_entry_size);
+	ret = mz0380_stream_bufs_alloc(dev);
 	if (ret) {
-		pr_err("%s: video ring alloc failed (%d)\n",
-		       dev->name, ret);
+		pr_err("%s: stream buffer alloc failed (%d)\n", dev->name, ret);
 		return ret;
 	}
 
-	dev->audio_ring.base_reg_lo = MZ0380_REG_AUDIO_RING_BASE_LO;
-	dev->audio_ring.base_reg_hi = MZ0380_REG_AUDIO_RING_BASE_HI;
-	dev->audio_ring.size_reg    = MZ0380_REG_AUDIO_RING_SIZE;
-	dev->audio_ring.entries_reg = MZ0380_REG_AUDIO_RING_ENTRIES;
-	dev->audio_ring.head_reg    = MZ0380_REG_AUDIO_RING_HEAD;
-	dev->audio_ring.tail_reg    = MZ0380_REG_AUDIO_RING_TAIL;
-
-	ret = mz0380_dma_ring_alloc(dev, &dev->audio_ring,
-				    mz0380_audio_ring_entries,
-				    mz0380_audio_ring_entry_size);
-	if (ret) {
-		pr_err("%s: audio ring alloc failed (%d)\n",
-		       dev->name, ret);
-		mz0380_dma_ring_free(dev, &dev->video_ring);
-		return ret;
-	}
-
-	pr_info("%s: video ring %u x %u B @ %pad, audio ring %u x %u B @ %pad\n",
-		dev->name,
-		dev->video_ring.nr_entries, dev->video_ring.entry_size,
-		&dev->video_ring.dma,
-		dev->audio_ring.nr_entries, dev->audio_ring.entry_size,
-		&dev->audio_ring.dma);
-
-	/* program addresses BEFORE enabling bus master to avoid IOMMU fault */
-	mz0380_program_ring(dev, &dev->video_ring);
-	mz0380_program_ring(dev, &dev->audio_ring);
-
-	/* unmask interesting IRQ sources (BAR0 per sc0710) */
-	mz_mmio_write(dev, MZ0380_REG_IRQ_MASK,
-		      MZ0380_IRQ_CMD_COMPLETE |
-		      MZ0380_IRQ_VIDEO_RING_READY |
-		      MZ0380_IRQ_AUDIO_RING_READY |
-		      MZ0380_IRQ_SIGNAL_CHANGE |
-		      MZ0380_IRQ_FW_READY |
-		      MZ0380_IRQ_ERROR);
+	pr_info("%s: %u stream buffers x %u KiB (buf0 @ %pad)\n",
+		dev->name, MZ0380_STREAM_NR_BUFS,
+		MZ0380_STREAM_BUF_SIZE >> 10, &dev->stream_bufs[0].dma);
 
 	pci_set_master(dev->pci);
 	dev->dma_armed = true;
@@ -255,60 +236,46 @@ void mz0380_dma_teardown(struct mz0380_dev *dev)
 {
 	if (dev->dma_armed) {
 		pci_clear_master(dev->pci);
-		mz_mmio_write(dev, MZ0380_REG_IRQ_MASK, 0);
 		dev->dma_armed = false;
 	}
-	mz0380_dma_ring_free(dev, &dev->audio_ring);
-	mz0380_dma_ring_free(dev, &dev->video_ring);
+	mz0380_stream_bufs_free(dev);
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_teardown);
 
 /*
- * Plan B start path: XDMA-style scatter-gather, modeled directly on
- * sc0710_dma_channel_start_prep() + sc0710_dma_channel_start().
- *
- * Used only if mz0380_dma_start() (mailbox path) fails to produce
- * any IRQ traffic, suggesting the card actually expects XDMA-shaped
- * programming via BAR0 instead of a custom mailbox ring.
+ * Start streaming: program the buffer physaddrs into the card, then arm the
+ * encoder with SET_VIC_PARAMS (the same op 0x29 path input-select uses). Per
+ * M17 the card's own userspace flips its internal enables in response, so no
+ * further host kick should be needed - a live run will confirm.
  */
-int mz0380_dma_start_xdma(struct mz0380_dev *dev, u32 base, dma_addr_t pt)
-{
-	if (!dev->dma_armed)
-		return -ENODEV;
-
-	/* Reset run bit */
-	mz_mmio_write(dev, base + MZ0380_XDMA_CTRL_W1C, MZ0380_XDMA_CTRL_RUN);
-
-	/* Program SG descriptor table base */
-	mz_mmio_write(dev, base + MZ0380_XDMA_SG_OFFSET + MZ0380_XDMA_SG_START_H,
-		      upper_32_bits(pt));
-	mz_mmio_write(dev, base + MZ0380_XDMA_SG_OFFSET + MZ0380_XDMA_SG_START_L,
-		      lower_32_bits(pt));
-	mz_mmio_write(dev, base + MZ0380_XDMA_SG_OFFSET + MZ0380_XDMA_SG_ADJ, 0);
-
-	/* Reset completed-descriptor-count */
-	mz_mmio_write(dev, base + MZ0380_XDMA_CDC, 1);
-
-	/* Set RUN */
-	mz_mmio_write(dev, base + MZ0380_XDMA_CTRL_W1S, MZ0380_XDMA_CTRL_RUN);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(mz0380_dma_start_xdma);
-
 int mz0380_dma_start(struct mz0380_dev *dev)
 {
-	u32 params[3];
+	u32 params[8] = { 0 };
+	u32 w = dev->capture.width, h = dev->capture.height;
+	u32 fps = dev->capture.timeperframe.denominator ?
+		  dev->capture.timeperframe.denominator : 60;
+	int ret;
 
 	if (!dev->dma_armed)
 		return -ENODEV;
 
-	params[0] = dev->capture.width;
-	params[1] = dev->capture.height;
-	params[2] = (dev->capture.timeperframe.denominator <<  0) |
-		    (dev->capture.timeperframe.numerator   << 16);
+	ret = mz0380_stream_program_bufs(dev);
+	if (ret) {
+		pr_warn("%s: SET_BUF failed (%d) - frames will not flow\n",
+			dev->name, ret);
+		return ret;
+	}
 
-	return mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
-				   params, 3, NULL, 2000);
+	/* SET_VIC_PARAMS packing matches mz0380_activate_hdmi_locked() */
+	params[0] = ((u32)MZ0380_INPUT_CODE_HDMI << 16) | ((fps & 0xff) << 8);
+	params[1] = ((h & 0xffff) << 16) | (w & 0xffff);
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
+				  ARRAY_SIZE(params), NULL, 2000);
+	pr_info("%s: stream start: SET_VIC(%ux%u@%u) ret=%d\n",
+		dev->name, w, h, fps, ret);
+	dev->stream_head = 0;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_start);
 
@@ -321,95 +288,76 @@ void mz0380_dma_stop(struct mz0380_dev *dev)
 EXPORT_SYMBOL_GPL(mz0380_dma_stop);
 
 /*
- * Pull all freshly produced entries out of the video ring and hand
- * payload bytes to whichever vb2 buffer is currently at the head of
- * dev->buf_list. Splits or coalesces ring entries to fit V4L2 buffer
- * sizes; sets payload byte count on each completed v4l2 buffer.
+ * Deliver completed frames. The EVENT told us a frame is ready; the token at
+ * BAR0+0x40 names the buffer (low 3 bits). FIRST CUT: we don't yet know the
+ * authoritative byte-length register, so we log the candidates + the head of
+ * the buffer (H.264 access units start with 00 00 00 01) and deliver using the
+ * best length candidate, clamped to the buffer size.
  */
 void mz0380_dma_drain_video(struct mz0380_dev *dev)
 {
-	struct mz0380_ring *r = &dev->video_ring;
 	struct mz0380_vb_buffer *vbuf;
 	unsigned long flags;
-	u32 tail;
+	u32 token, idx, cand0, cand1, cand2, encstat;
+	u8 *payload;
+	size_t len;
 
-	if (!r->buf)
+	token   = mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN);
+	cand0   = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1);   /* 0x44 */
+	cand1   = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2);   /* 0x48 */
+	cand2   = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3);   /* 0x4c */
+	encstat = mz_mmio_read(dev, MZ0380_MB_ENC_STATUS);     /* 0x50 */
+	idx     = token & 7;
+
+	if (idx >= MZ0380_STREAM_NR_BUFS) {
+		pr_info_ratelimited("%s: frame token=0x%08x idx=%u out of range (0x44=%08x 0x48=%08x 0x4c=%08x enc=%08x)\n",
+				    dev->name, token, idx, cand0, cand1, cand2,
+				    encstat);
 		return;
-
-	tail = mz_cfg_read(dev, r->tail_reg);
-
-	while (r->head != tail) {
-		void *slot = (u8 *)r->buf + (size_t)r->head * r->entry_size;
-		u32 flags_w = *(u32 *)(slot + MZ0380_DESC_FLAGS_OFFSET);
-		u32 nbytes  = *(u32 *)(slot + MZ0380_DESC_BYTECOUNT_OFFSET);
-		u32 pts_lo  = *(u32 *)(slot + MZ0380_DESC_PTS_LO_OFFSET);
-		u32 pts_hi  = *(u32 *)(slot + MZ0380_DESC_PTS_HI_OFFSET);
-		void *payload = (u8 *)slot + MZ0380_DESC_PAYLOAD_OFFSET;
-		size_t avail;
-
-		if (nbytes == 0 || nbytes > r->entry_size)
-			goto advance;
-
-		avail = (size_t)nbytes;
-
-		spin_lock_irqsave(&dev->buf_lock, flags);
-		vbuf = list_first_entry_or_null(&dev->buf_list,
-						struct mz0380_vb_buffer, list);
-		if (vbuf)
-			list_del(&vbuf->list);
-		spin_unlock_irqrestore(&dev->buf_lock, flags);
-
-		if (!vbuf) {
-			/* no consumer ready - drop this slot */
-			goto advance;
-		}
-
-		{
-			void *dst = vb2_plane_vaddr(&vbuf->vb.vb2_buf, 0);
-			size_t plane = vb2_plane_size(&vbuf->vb.vb2_buf, 0);
-			size_t cpy = min(avail, plane);
-
-			if (dst)
-				memcpy(dst, payload, cpy);
-			vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, cpy);
-		}
-
-		vbuf->vb.vb2_buf.timestamp =
-			((u64)pts_hi << 32) | pts_lo;
-		vbuf->vb.flags = (flags_w & MZ0380_DESC_FLAG_KEY_FRAME) ?
-				 V4L2_BUF_FLAG_KEYFRAME : V4L2_BUF_FLAG_PFRAME;
-		vb2_buffer_done(&vbuf->vb.vb2_buf,
-				(flags_w & MZ0380_DESC_FLAG_ERROR) ?
-					VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
-
-advance:
-		r->head = (r->head + 1) % r->nr_entries;
-		mz_cfg_write(dev, r->head_reg, r->head);
 	}
 
-	r->tail_seen = tail;
+	payload = dev->stream_bufs[idx].va;
+
+	/* length candidate: prefer a plausible non-zero payload word */
+	len = cand0 && cand0 <= MZ0380_STREAM_BUF_SIZE ? cand0 :
+	      cand1 && cand1 <= MZ0380_STREAM_BUF_SIZE ? cand1 :
+	      MZ0380_STREAM_BUF_SIZE;
+
+	pr_info_ratelimited("%s: frame token=0x%08x idx=%u len~%zu head=%02x %02x %02x %02x %02x %02x %02x %02x (0x44=%08x 0x48=%08x 0x4c=%08x enc=%08x)\n",
+			    dev->name, token, idx, len,
+			    payload[0], payload[1], payload[2], payload[3],
+			    payload[4], payload[5], payload[6], payload[7],
+			    cand0, cand1, cand2, encstat);
+
+	spin_lock_irqsave(&dev->buf_lock, flags);
+	vbuf = list_first_entry_or_null(&dev->buf_list,
+					struct mz0380_vb_buffer, list);
+	if (vbuf)
+		list_del(&vbuf->list);
+	spin_unlock_irqrestore(&dev->buf_lock, flags);
+
+	if (!vbuf)
+		return;   /* no consumer ready - drop */
+
+	{
+		void *dst = vb2_plane_vaddr(&vbuf->vb.vb2_buf, 0);
+		size_t plane = vb2_plane_size(&vbuf->vb.vb2_buf, 0);
+		size_t cpy = min(len, plane);
+
+		if (dst)
+			memcpy(dst, payload, cpy);
+		vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, cpy);
+	}
+
+	vbuf->vb.vb2_buf.timestamp = ktime_get_ns();
+	vbuf->vb.field = V4L2_FIELD_NONE;
+	vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_drain_video);
 
 void mz0380_dma_drain_audio(struct mz0380_dev *dev)
 {
-	struct mz0380_ring *r = &dev->audio_ring;
-	u32 tail;
-
-	if (!r->buf)
-		return;
-
-	tail = mz_cfg_read(dev, r->tail_reg);
-
-	/*
-	 * Audio drain is handled in mz0380-audio.c via the ALSA period
-	 * callback; here we just bookkeep the consumer index so the
-	 * card can keep producing.
-	 */
-	if (r->head != tail) {
-		r->head = tail;
-		mz_cfg_write(dev, r->head_reg, r->head);
-	}
+	/* audio DMA path is milestone-C follow-up; no-op for now */
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_drain_audio);
 
@@ -418,5 +366,4 @@ static void mz0380_drain_work_fn(struct work_struct *w)
 	struct mz0380_dev *dev = container_of(w, struct mz0380_dev, drain_work);
 
 	mz0380_dma_drain_video(dev);
-	mz0380_dma_drain_audio(dev);
 }
