@@ -59,16 +59,31 @@ of: SET_VIC struct fields mis-packed (bail branches -> tinyvenc mis/never
 launched), the hready host gate not asserted, or buffer physaddr not landing at
 BAR0+0x08. Frame LENGTH lives in tinyvenc (not ep.ko).
 
-NEXT for frames (pick one; static RE has diminishing returns here):
- A. LIVE Windows mailbox trace - WinDbg bp on SEND_COMMAND @0x140285074 during a
-    working capture, dump {opcode,args} in order. Resolves ALL unknowns at once:
-    buffer opcode+physaddr, exact SET_VIC 44-byte struct, hready, ordering.
- B. RE tinyvenc5/7 (extracted in scratchpad fw/yuan_demo_sdi/) for the channels[]
-    struct layout SET_VIC must fill + the frame-length output descriptor, and RE
-    the exact SET_VIC byte fields from video_capture_mgr op-41 (@0x8ea8, bails at
-    0x8eb4/0x8ec4). Then fix mz0380_dma_start packing + find the hready trigger.
-Full detail: RE_FINDINGS M17-M19. The drain already logs token/idx/candidate
-length regs/buffer head bytes, so once frames flow the length falls out.
+SET_VIC FIXED (M20): the 44-byte struct is now packed correctly (format byte6,
+width/height, input dims, bitstream_num=1). Confirmed on hw: "SET_VIC(1920x1080 p
+H.264, bitstreams=1) ret=0". BUT still NO host DMA - MSI flat at 3, 0-byte file.
+
+BLOCKER (M20/M21): tinyvenc5's host-DMA is gated by EncodingGroup::enable_dma
+(@0x7ed88), set from a config byte [r5+2] compared ==4 or ==9 (gate @0xe960).
+Our HDMI format is 2/3; the demo fw seems to enable host-DMA only for certain
+input types. The byte's source is a chain of literal-pool globals we did not
+fully resolve, and it may be a RUNTIME input-type (from the mmap'd VIC dev,
+/dev/vpl_vic) not settable via SET_VIC. This is the SDI-demo firmware
+(yuan_demo_sdi); the retail Windows driver DMAs HDMI frames with the same fw, so
+there IS a way - but it's a runtime value static RE can't cheaply pin.
+
+NEXT for frames - RECOMMENDED: LIVE Windows trace via the win11 KVM VM (passthrough
+already configured, managed='yes'; rmmod mz0380 first). Run the retail Elgato
+driver + DebugView (Capture Kernel), do a 1080p capture, and record the mailbox
+SET_VIC + buffer command bytes + any enable/input-select command. That shows
+exactly what turns on host-DMA (the enable_dma input-type source), the real
+buffer opcode/args, and confirms ordering - resolving the last gate definitively.
+Alt (harder): fully RE tinyvenc5 main @0xded0 - resolve [r5+2]'s source and the
+literal at 0xef04/0xedbc, trace whether an argv/SET_VIC field or the VIC device
+sets it; check if the retail path pushes different firmware.
+
+Full detail: RE_FINDINGS M17-M20. The drain logs token/idx/candidate length
+regs/buffer head bytes, so once frames flow the length (enc_stat+0x08) falls out.
 
 ## NEXT (after frames flow)
 1. Set the correct frame length from the resolved register; fix vb2 format
