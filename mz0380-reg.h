@@ -224,13 +224,19 @@
 #define MZ0380_INPUT_CODE_AUTO          7
 
 /*
- * UNVERIFIED streaming opcodes still referenced by mz0380-dma.c. The ep.ko
- * disasm (M6) found NO dedicated start-streaming opcode - the encoder/XDMA is
- * armed by cfg banks (op2/4/8) + SET_VIC_PARAMS, so 0x12/0x13 are very likely
- * bogus and the DMA start/stop path is milestone-C work to be rewired. Kept at
- * their historical values only so the streaming path compiles until then.
+ * START_STREAMING = mailbox opcode 0x06 (RE_FINDINGS M22, on-card RE).
+ * SET_VIC_PARAMS (0x29) alone does NOT start frames: it makes video_capture_mgr
+ * spawn tinyvenc5 (with the argv derived from the 44-byte SET_VIC command) and
+ * clears no_signal, but tinyvenc5 then blocks reading /sys/vpl_pciep/epint for a
+ * *separate* START_STREAMING command before it begins the per-frame host DMA
+ * (channel_done pwrite -> ep.ko MSI + outbound ATU). tinyvenc5's command
+ * dispatch (jump table indexed by cmd-6) maps command 6 to that start block;
+ * ep.ko's op6 ISR handler (@0x1854) sysfs_notify()s epint whenever no_signal==0,
+ * which is exactly the wake tinyvenc5 waits for. Op6 carries no payload.
+ * (M6's "op6 = enc-status+notify" saw the ISR side but not the tinyvenc5
+ * consumer, and so wrongly concluded no start opcode existed.)
  */
-#define MZ0380_CMD_START_STREAMING      0x12  /* bogus (absent from dispatcher) */
+#define MZ0380_CMD_START_STREAMING      0x06  /* tinyvenc5 START (epint cmd 6) */
 
 /* pattern-check: skip streaming register/opcode #define constants (M17) */
 /*

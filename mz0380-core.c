@@ -220,6 +220,34 @@ MODULE_PARM_DESC(enable_dma,
 		 "allocate ring buffers, request MSI, enable bus mastering; off by default");
 
 /*
+ * Gap between SET_VIC(0x29) and START_STREAMING(op 0x06). SET_VIC makes the
+ * card's video_capture_mgr system()-fork tinyvenc5; op6 only kicks that
+ * encoder once it has exec'd, opened /sys/vpl_pciep/epint and consumed the
+ * SET_VIC command first (M22). Fire op6 too early and it either misses
+ * tinyvenc5's poll or clobbers the SET_VIC it expects on its first read - the
+ * encoder then sits idle (symptom: IRQ 164 stuck at 3, 0-byte capture).
+ * Writable at runtime so the spawn window can be swept without a reload.
+ */
+unsigned int mz0380_start_delay_ms = 2000;
+module_param_named(start_delay_ms, mz0380_start_delay_ms, uint, 0644);
+MODULE_PARM_DESC(start_delay_ms,
+		 "ms to wait after SET_VIC before firing START_STREAMING(op 0x06) so the card can fork+exec tinyvenc5 and read SET_VIC first (def:2000; too short = encoder idle at 3 IRQs)");
+
+/*
+ * Diagnostic bisection lever. SET_VIC byte[31]=is_nosg: when set, the card's
+ * tinyvenc encoder spawns fake_frame_process, a black/color test-pattern
+ * generator that pwrites channel_done on a timer with NO capture/SSM/BT1120
+ * dependency (RE_FINDINGS.md M23). stream_nosg=1 => frames flowing proves the
+ * whole START -> channel_done -> MSI -> outbound-ATU -> host-DMA path; frames
+ * still absent then points downstream (channels[] host target unset). Off by
+ * default so real capture is used. Writable at runtime.
+ */
+bool mz0380_stream_nosg;
+module_param_named(stream_nosg, mz0380_stream_nosg, bool, 0644);
+MODULE_PARM_DESC(stream_nosg,
+		 "SET_VIC is_nosg flag: 1 = force the card's fake-frame (test-pattern) generator, bypassing real BT1120 capture; diagnostic bisection lever (def:0)");
+
+/*
  * M4 diagnostic: enable bus mastering + MSI/ISR BEFORE firmware load, but do
  * NOT program any (still-unverified) ring addresses. Safe because the card has
  * no host DMA target to write to; tests whether the post-boot mailbox doorbell

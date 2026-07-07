@@ -63,26 +63,32 @@ SET_VIC FIXED (M20): the 44-byte struct is now packed correctly (format byte6,
 width/height, input dims, bitstream_num=1). Confirmed on hw: "SET_VIC(1920x1080 p
 H.264, bitstreams=1) ret=0". BUT still NO host DMA - MSI flat at 3, 0-byte file.
 
-BLOCKER (M20/M21): tinyvenc5's host-DMA is gated by EncodingGroup::enable_dma
-(@0x7ed88), set from a config byte [r5+2] compared ==4 or ==9 (gate @0xe960).
-Our HDMI format is 2/3; the demo fw seems to enable host-DMA only for certain
-input types. The byte's source is a chain of literal-pool globals we did not
-fully resolve, and it may be a RUNTIME input-type (from the mmap'd VIC dev,
-/dev/vpl_vic) not settable via SET_VIC. This is the SDI-demo firmware
-(yuan_demo_sdi); the retail Windows driver DMAs HDMI frames with the same fw, so
-there IS a way - but it's a runtime value static RE can't cheaply pin.
+BLOCKER RESOLVED (M22): the "enable_dma input-type 4/9 gate" (M20) was a MISREAD
+- enable_dma (0x7ed88) is write-only in tinyvenc5 and never gates frames; the
+==4/9 compare just sets total_channel_num (already fed from argv). The real
+blocker: SET_VIC (op 0x29) only SPAWNS tinyvenc5 (via video_capture_mgr) - it
+does not start frames. tinyvenc5 then blocks on /sys/vpl_pciep/epint waiting for
+a SEPARATE START_STREAMING = mailbox op 0x06 before it DMAs anything. Our driver
+never sent op 0x06 (its START_STREAMING #define was a bogus 0x12, unused). Chain
+proven both-sides: tinyvenc5 cmd jump-table (cmd 6 -> start @0xe954) +
+video_capture_mgr (spawns on 41, ignores 6) + ep.ko op6 ISR @0x1854 (sysfs_notify
+epint when no_signal==0). Path A (Windows VM) abandoned - VM freezes the host.
 
-NEXT for frames - RECOMMENDED: LIVE Windows trace via the win11 KVM VM (passthrough
-already configured, managed='yes'; rmmod mz0380 first). Run the retail Elgato
-driver + DebugView (Capture Kernel), do a 1080p capture, and record the mailbox
-SET_VIC + buffer command bytes + any enable/input-select command. That shows
-exactly what turns on host-DMA (the enable_dma input-type source), the real
-buffer opcode/args, and confirms ordering - resolving the last gate definitively.
-Alt (harder): fully RE tinyvenc5 main @0xded0 - resolve [r5+2]'s source and the
-literal at 0xef04/0xedbc, trace whether an argv/SET_VIC field or the VIC device
-sets it; check if the retail path pushes different firmware.
+FIX IMPLEMENTED (this session, builds clean, NOT yet hw-tested):
+- mz0380-reg.h: MZ0380_CMD_START_STREAMING 0x12 -> 0x06.
+- mz0380-dma.c dma_start(): after SET_VIC ok, msleep(500) then send op 0x06
+  (no params). Delay lets tinyvenc5 finish forking/exec + eat its first-read
+  SET_VIC before op6 lands.
 
-Full detail: RE_FINDINGS M17-M20. The drain logs token/idx/candidate length
+NEXT = HARDWARE TEST (Path A/B both retired). Load driver, start capture on a
+live locked 1080p source. EXPECT: two acks in dmesg ("SET_VIC ... ret=0" then
+"START_STREAMING(op 0x06) ret=0"), then IRQ/token count RISES and the file is
+non-empty. If op6 acks but tokens stay flat: (a) bump the msleep (tinyvenc5 not
+up yet - the spawn/exec is slow on the SoC), or (b) verify no_signal==0 at op6
+time (needs the source truly locked and real WxH in SET_VIC, both already true
+on the M16 path). Full detail: RE_FINDINGS M22.
+
+Full detail: RE_FINDINGS M17-M22. The drain logs token/idx/candidate length
 regs/buffer head bytes, so once frames flow the length (enc_stat+0x08) falls out.
 
 ## NEXT (after frames flow)

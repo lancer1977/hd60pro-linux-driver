@@ -16,6 +16,8 @@
  *  live run can resolve them.
  */
 
+#include <linux/delay.h>	/* msleep() for the SET_VIC -> START_STREAMING gap */
+
 #include "mz0380.h"
 
 /* forward */
@@ -103,11 +105,23 @@ static int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 
 	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
 	params[1] = MZ0380_STREAM_BUF_STRIDE;
+	/*
+	 * ep.ko op2 copies cmd[0xc+8i]->channels[ch]+0 (iATU UPPER target reg 0x58 =
+	 * host addr HIGH) and cmd[0x10+8i]->+4 (iATU LOWER reg 0x54 = host addr LOW).
+	 * Pair order is {high32, low32} (RE_FINDINGS.md M23; polarity proven on hw -
+	 * the cmd[0xc] value surfaced in the fault's high dword 0xfff8_0000_00000000).
+	 * cmd[8] stride is ignored; ATU limit is a hardcoded 32 MB aperture. The card
+	 * cycles bufindex 1..N over 8-byte slots, so load all NR_BUFS. CRITICAL: this
+	 * op2 must reach channels[] AFTER SET_VIC spawns the encoder and BEFORE op6 -
+	 * START latches channels[] into the iATU (vpl_dmac StartTail); an op2 sent
+	 * before the spawn is clobbered by the encoder's channel init -> low latches
+	 * as reset 0 -> DMA to host ~0 + IOMMU fault.
+	 */
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
 		u64 phys = (u64)dev->stream_bufs[i].dma;
 
-		params[2 + 2 * i]     = upper_32_bits(phys);
-		params[2 + 2 * i + 1] = lower_32_bits(phys);
+		params[2 + 2 * i]     = upper_32_bits(phys);  /* cmd[0xc+8i] = host HIGH */
+		params[2 + 2 * i + 1] = lower_32_bits(phys);  /* cmd[0x10+8i]= host LOW  */
 	}
 
 	return mz0380_send_command(dev, MZ0380_CMD_SET_BUF_2, params,
@@ -259,6 +273,57 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	if (!dev->dma_armed)
 		return -ENODEV;
 
+	/*
+	 * SET_VIC_PARAMS 44-byte struct - byte offsets VERIFIED by disassembling
+	 * video_capture_mgr's op-41 handler (RE_FINDINGS.md M23). The mailbox puts
+	 * the opcode at struct[0..3]; our params[i] lands at struct[4+4i..7+4i]
+	 * (params[0]=struct[4..7]). Authoritative field map:
+	 *   [4]=ch  [5]=fps  [6]=fw/format(2 prog|3 interlaced)  [7]=interlace
+	 *   [8..9]=width  [10..11]=height  [12]=m  [16..19]=color_info
+	 *   [20..21]=x_start  [22..23]=y_start
+	 *   [24..25]=input_frame_width  [26..27]=input_frame_height
+	 *   [28]=bitstream_num(MUST be >=1)  [29]=osd_en  [30]=osd_size
+	 *   [31]=is_nosg  [35]=is_slave  [36..39]=nosg back/y/u/v
+	 * The old M20/M22 packing put input_w/input_h/bitstream_num two bytes early,
+	 * so the firmware read bitstream_num=0 (byte28 unset) and garbage input dims
+	 * -> tinyvenc5 spawned but silent. This is the corrected layout.
+	 * is_nosg=1 spawns the card's fake_frame_process (black-frame generator,
+	 * no capture/SSM dependency): a stream_nosg test lever that bisects the
+	 * encode+DMA path from the upstream BT1120 capture path.
+	 */
+	params[0] = fmt << 16;                             /* [6]  = fw/format      */
+	params[1] = ((h & 0xffff) << 16) | (w & 0xffff);   /* [8..9]=w [10..11]=h    */
+	params[5] = ((h & 0xffff) << 16) | (w & 0xffff);   /* [24..25]=in_w [26..27]=in_h */
+	params[6] = 1u | ((mz0380_stream_nosg ? 1u : 0u) << 24); /* [28]=bitstream_num=1, [31]=is_nosg */
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
+				  ARRAY_SIZE(params), NULL, 2000);
+	pr_info("%s: stream start: SET_VIC(%ux%u %s H.264, bitstreams=1) ret=%d\n",
+		dev->name, w, h, interlaced ? "i" : "p", ret);
+	if (ret)
+		return ret;
+
+	/*
+	 * SET_VIC only spawns the encoder (via video_capture_mgr) and clears
+	 * no_signal; tinyvenc5 then blocks on /sys/vpl_pciep/epint waiting for a
+	 * separate START_STREAMING (op 0x06) before it DMAs any frame (M22).
+	 * Give the freshly system()-forked tinyvenc5 time to exec, open epint and
+	 * consume the SET_VIC(0x29) it reads first, so our op6 lands as the next
+	 * distinct command rather than racing its start-up read. The delay is a
+	 * heuristic for the on-card process spawn; tune against hardware via the
+	 * start_delay_ms module param if the first frame is missed (symptom: no
+	 * rising IRQ/token count after op6, IRQ 164 stuck at the idle value 3).
+	 */
+	msleep(mz0380_start_delay_ms);
+
+	/*
+	 * NOW program the buffer physaddrs into channels[] - AFTER the SET_VIC spawn
+	 * settled and BEFORE op6. START(op6) makes vpl_dmac latch channels[] into
+	 * the outbound iATU; doing SET_BUF here (not before SET_VIC) guarantees our
+	 * addresses are the ones latched, so the iATU low target = our buffer, not 0
+	 * (RE_FINDINGS.md M23). op2 does not sysfs_notify, so it won't disturb the
+	 * tinyvenc5 that is blocked waiting for op6.
+	 */
 	ret = mz0380_stream_program_bufs(dev);
 	if (ret) {
 		pr_warn("%s: SET_BUF failed (%d) - frames will not flow\n",
@@ -267,22 +332,19 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	}
 
 	/*
-	 * SET_VIC_PARAMS 44-byte struct (RE_FINDINGS.md M20, from video_capture_mgr
-	 * op-41). Each param word is 4 struct bytes: params[0]=struct[4..7], etc.
-	 *   byte4 channel=0, byte6 format (2 prog / 3 interlaced, selects tinyvenc5)
-	 *   byte8..9 width, byte10..11 height, byte22..23 input_w, byte24..25
-	 *   input_h, byte26..27 bitstream_num (MUST be >=1, else the encoder emits
-	 *   nothing - this was the bug that produced a spawned-but-silent encoder).
+	 * op 0x06 is FIRE-AND-FORGET. Unlike INIT/SET_VIC, its ep.ko handler
+	 * (@0x1854, M22) only does sysfs_notify(epint) to wake tinyvenc5 - it
+	 * posts NO mailbox completion (no STATUS bit0, no EVENT bit11). Waiting
+	 * for one always burns the full timeout and returns a bogus -ETIMEDOUT
+	 * (proven on hw: SET_VIC->op6 gap == msleep + full 2000ms, zero EVENT
+	 * lines logged). So send with timeout_ms=0: fire the doorbell and return.
+	 * Frame arrival is confirmed downstream by the MSI/outbound-ATU path, not
+	 * by a command ack.
 	 */
-	params[0] = fmt << 16;                        /* struct[6] = format */
-	params[1] = ((h & 0xffff) << 16) | (w & 0xffff);
-	params[4] = (w & 0xffff) << 16;               /* struct[22..23] input_w */
-	params[5] = (1u << 16) | (h & 0xffff);        /* struct[26..27]=1, [24..25]=input_h */
-
-	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
-				  ARRAY_SIZE(params), NULL, 2000);
-	pr_info("%s: stream start: SET_VIC(%ux%u %s H.264, bitstreams=1) ret=%d\n",
-		dev->name, w, h, interlaced ? "i" : "p", ret);
+	ret = mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
+				  NULL, 0, NULL, 0);
+	pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
+		dev->name, ret);
 	dev->stream_head = 0;
 	return ret;
 }

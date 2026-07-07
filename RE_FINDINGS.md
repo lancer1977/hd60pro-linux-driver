@@ -1167,3 +1167,205 @@ tinyvenc's enable_dma input-type gate (M20: [cfg+2] must be 4/9; HDMI=2/3).
 Next session: don't re-chase hready. Resolve enable_dma via the live Windows
 trace (what the retail driver sends to turn on host-DMA for HDMI) or by fully
 tracing tinyvenc5 main @0xded0 ([r5+2] source, literals @0xef04/0xedbc).
+
+================================================================================
+M22 THE REAL BLOCKER: missing START_STREAMING (mailbox op 0x06). enable_dma gate
+    was a MISREAD. Fix implemented. (2026-07-06, full on-card static RE)
+================================================================================
+
+Path B (static RE of the on-card yuan_demo_sdi userspace) resolved the gate
+definitively. M20's "enable_dma input-type 4/9 gate" was WRONG - it conflated
+three different globals that happen to be tested near each other in tinyvenc5.
+
+GROUND TRUTH (symbols from the not-stripped tinyvenc5 ELF; all addrs its .text):
+  0x7ed88 = EncodingGroup::enable_dma        (byte)
+  0x7dd3c = EncodingGroup::total_channel_num (word)  <- "%d channels"
+  0x7dd40 = EncodingGroup::preview_settings  (struct; +2 = input-format byte)
+- enable_dma is WRITE-ONLY in tinyvenc5: set 0 @0xe350 (STOP path), set 1
+  UNCONDITIONALLY @0xe97c inside the START_STREAMING handler. Nothing in .text
+  reads it to gate frames. So it never blocked host DMA. (It is a status byte
+  other code/ep.ko may observe; not a host-controllable gate.)
+- The `==4 || ==9` compare @0xe968 (that M20 read as the enable_dma gate) really
+  sets total_channel_num=4 (SDI multi-channel override). total_channel_num is
+  otherwise loaded from argv via atoi @0xe2e0 in the getopt loop, so the
+  video_capture_mgr-spawned path already gets a valid channel count (>=1) from
+  the SET_VIC bitstream_num field. Not a blocker either.
+
+ACTUAL START PROTOCOL (tinyvenc5 + video_capture_mgr + ep.ko, all cross-checked):
+1. Both tinyvenc5 and video_capture_mgr read 44-byte commands from
+   /sys/vpl_pciep/epint (O_RDWR). ep.ko's epint_show copies the raw host mailbox
+   command (incl. opcode word) to readers; epint_show only passes the command
+   set {6,7,9,40,41,42,45,47,49,80,81,82,96,97,98,110}.
+2. Host SET_VIC_PARAMS (op 41 = 0x29): video_capture_mgr dispatches it (@0x8ea8),
+   builds the long argv (-a..-w = fps/res/interlace/input_w/h/bitstream_num/...)
+   and system()-spawns `./tinyvenc5 -D -a.. -w..`. ep.ko op41 also sets
+   no_signal=0 when WxH!=0. video_capture_mgr does NOT handle cmd 6 and does NOT
+   self-issue any start - it only spawns.
+3. tinyvenc5 boots, opens epint, its FIRST read expects SET_VIC(41) (acks with a
+   44-byte pwrite @0xf264), then enters a poll/pread loop.
+4. Host START_STREAMING (op 6): tinyvenc5's dispatch is a jump table indexed by
+   (cmd-6); table[0] (cmd 6) = the start block @0xe954, which spawns the encoder
+   channels and begins the per-frame path (TK_MMA + pwrite
+   /sys/class/vpl_pciep/channel_done -> ep.ko MSI + outbound ATU into host DRAM).
+   ep.ko op6 ISR handler (@0x1854): if no_signal==0, sysfs_notify(epint) -> wakes
+   tinyvenc5's poll. Op6 carries NO payload.
+=> Frames need op 0x29 THEN op 0x06. Our driver only ever sent 0x29 (+ SET_BUF
+   0x02). That is why IRQ count stayed at 3 with a 0-byte file, through every
+   SET_VIC field fix - the encoder was spawned and idle, never told to start.
+
+M6 RECONCILED: M6 read op6 from the ep.ko ISR only and labelled it
+"enc-status-bank+notify", concluding "START_STREAMING is NOT an ep.ko opcode."
+The ISR view was right (op6 = a gated sysfs_notify) but missed the tinyvenc5
+consumer for which that notify IS the start kick. No contradiction; M6 was
+half the picture.
+
+FIX (implemented this session):
+- mz0380-reg.h: MZ0380_CMD_START_STREAMING 0x12(bogus) -> 0x06.
+- mz0380-dma.c mz0380_dma_start(): after SET_VIC succeeds, msleep(500) then
+  send op 0x06 (no params). The delay lets the freshly system()-forked tinyvenc5
+  exec + consume its first-read SET_VIC before our op6 lands as the next command
+  (avoids racing tinyvenc5 start-up; tune on hw). Builds clean.
+- STOP path unchanged: op 0x2a = 42 is handled by video_capture_mgr (@0x9358,
+  killall tinyvenc) - correct as-is.
+
+NEXT (hardware test): load, start capture, expect two acks (SET_VIC then
+START_STREAMING) then a rising IRQ/token count + nonzero-length frames. If op6
+acks but tokens stay flat: (a) increase the msleep (tinyvenc5 not up yet), or
+(b) confirm no_signal==0 at op6 time (needs live locked source + real WxH in
+SET_VIC). Frame LENGTH still at enc_stat+0x08 (M20) - wire once frames flow.
+
+================================================================================
+M23 THE OFFSET BUG + is_nosg BISECTION. Encoder was spawned-but-silent from a
+    +2-byte SET_VIC packing error (M20/M22 were wrong); downstream DMA targets
+    host 0 because SET_BUF(op2) never lands our buffer addr in channels[]. Full
+    HD60 Pro fw-1.11 on-card RE via llvm-objdump. (2026-07-07)
+================================================================================
+
+FIRMWARE SOURCE: the HD60 Pro's own blob /lib/firmware .../MZ0380.HD.HEX
+(gzip + GNU tar, ~2.5 MB) extracts to yuan_demo_sdi/ - the SAME package M6/M20/
+M22 RE'd. So tinyvenc5 / video_capture_mgr / ep.ko ARE this card's fw-1.11
+runtime, not a foreign SDI SDK. Boot rc.local: yuan_ioctrl + audio_capture_mgr
++ video_capture_mgr (latter spawns tinyvenc on SET_VIC). Un-stripped (tinyvenc5
+~1162 syms). Disasm: llvm-objdump --triple=armv7-linux-gnueabi (system objdump
+has no ARM target). Tree: scratchpad/fw/yuan_demo_sdi/.
+
+no_signal (ep.ko, RE-CONFIRMED - kills the M20 "SoC signal-detect" idea):
+  written ONLY in the op41 handler, purely from W/H:
+    no_signal = (width==0 || height==0) ? 1 : 0   // width=ep_command[8],H=[0xA]
+  No hardware/BT1120 read touches it; host fully controls it via op41 W/H. Gate:
+  many opcodes incl. op6 hit `if(no_signal){printk("$$$ cmd(%d) => no signal");
+  MSI; return;}`. Our W/H@8/10 were always correct => gate was OPEN the whole
+  time; no_signal was never the blocker.
+
+op6 (START) is FIRE-AND-FORGET (ep.ko handler .text 0x1854): if no_signal==0 it
+  sysfs_notify(epint) [epint_1080p iff op41 byte[6]==7]. It posts NO mailbox
+  cmd-done -> host MUST send op6 with timeout_ms=0. Waiting for a completion =
+  the false -ETIMEDOUT(-110) we hit. epint_show returns the LIVE ep_command
+  mailbox (len = ep_cmds_size[opcode]); op6 relies on its command still sitting
+  in the mailbox, doesn't copy.
+
+tinyvenc5: opens /sys/vpl_pciep/epint O_RDWR, poll()s. FIRST blocking read must
+  be SET_VIC(0x29) (acks by pwrite'ing 44B back); later cmds dispatch via jump
+  table index (opcode-6). op6 -> on_start_thread -> EncodingGroup::Start ->
+  init_func: TKMF_VideoSrc_Init (fail => "Can't create video capture ->exit!!!")
+  + spawn encode_handler (always) + fake_frame_process (iff is_nosg!=0). NO
+  signal-lock check in tinyvenc: it pulls frames from an SSM shared-mem ring the
+  CAPTURE side fills from BT1120; empty ring => usleep(1000) loop, silent.
+
+SET_VIC 44-byte struct - byte offsets VERIFIED 3 ways in video_capture_mgr's
+op41 handler (THE FIX):
+  [4]ch [5]fps [6]fw/format(2 prog|3 int, ==7 alt) [7]interlace
+  [8:9]width [10:11]height [12]m [13]flip [14]mirror [16:19]color_info
+  [20:21]x_start [22:23]y_start [24:25]input_frame_width [26:27]input_frame_height
+  [28]bitstream_num(MUST>=1) [29]osd_en [30]osd_size [31]is_nosg
+  [35]is_slave [36:39]nosg back/y/u/v.  Spawn GATE: width<=127||height<=127 =>
+  "Wrong resolustion", no spawn (our W/H pass).
+  BUG: M20/M22 put input_w@22,input_h@24,bitstream_num@26 - all +2 short. FW
+  then read bitstream_num=0 (byte28 unset) + junk input dims => tinyvenc spawned
+  but emitted nothing. This (NOT timing, NOT no_signal) was the silence. Proof
+  it wasn't timing: start_delay sweep 2000/4000ms = flat 3 IRQ.
+  CORRECTED packing (params[i]->struct[4+4i]): params[0]=fmt<<16;
+  params[1]=params[5]=(h<<16)|w; params[6]=1|((is_nosg?1:0)<<24).
+
+is_nosg BISECTION (on-hw, decisive): stream_nosg=1 sets byte[31] -> card spawns
+  fake_frame_process (black-frame gen, memset buf, timer channel_done, NO
+  capture/SSM dep). Result: IRQ 164 3->7 AND a burst of IOMMU IO_PAGE_FAULTs at
+  host 0x0,0x80,0x100..0x480 (128B stride). => the encode -> channel_done -> MSI
+  -> outbound-ATU -> host-DMA path is ALIVE, but the ATU host target is ~0, not
+  our buf 0xfff80000. Per ep.ko pcie_set_outbound the target comes from
+  channels[] (window*24+field; ATU low@0x58/high@0x54), populated by op2/4/8
+  copying ep_command[0xc..0x28]. So SET_BUF(op2) isn't landing our physaddr
+  (likely hi/lo order or channel-entry offset; our buf hi=0 read as target-low
+  => DMA to host 0). ATU aperture base 0x90000000 is hardcoded card-side (=the
+  probe-time fault).
+
+TWO REMAINING BUGS, cleanly separated by is_nosg:
+  (1) DOWNSTREAM: SET_BUF(op2) channels[] host-addr layout wrong -> ATU hits
+      host 0. Fix = correct op2 command layout (exact offsets being RE'd).
+  (2) UPSTREAM: real BT1120->SSM capture not delivering -> real encoder idle
+      (TEST1 nosg=0 stayed at 3 IRQ, no faults). Needs VIC / MST3367 BT1120
+      output routing on the host-init side.
+
+HOST FIXES THIS SESSION (built, hw-tested): op6 fire-and-forget (send_command
+  timeout_ms=0); SET_VIC offsets corrected (bitstream_num@28=1, input dims@24/
+  26); module params start_delay_ms (timing - now known irrelevant) and
+  stream_nosg (is_nosg bisection lever, 0644). NEXT: fix SET_BUF layout, re-test
+  nosg=1 (expect frames into our buffer, no fault), then upstream BT1120.
+
+================================================================================
+M24 DMA TARGET: engine works, but host target low32 is stuck 0 - frames land at
+    (cmd[0xc] << 32) + aperture_offset. SET_BUF/channels[]/ELBI fully traced.
+    Open blocker (paused). (2026-07-08)
+================================================================================
+
+is_nosg=1 (fake_frame_process) proved the encode->channel_done->MSI->outbound-
+ATU->host-DMA chain is ALIVE: the card actively DMAs frames. The only defect is
+the DESTINATION address. Empirically nailed (three hw runs):
+  cmd[0xc]=0          -> IOMMU faults at host 0x0,0x80,0x100..0x480 (128B stride)
+  cmd[0xc]=0xfff80000 -> faults at 0xfff8000000000000,..80,..100
+  => host_target = (cmd[0xc] << 32) + aperture_offset;  LOW32 == 0 ALWAYS,
+     independent of cmd[0x10]. The 0x80 stride is the frame walking the aperture.
+
+CARD-SIDE TRACE (ep.ko + vpl_dmac.ko, llvm-objdump + capstone):
+- channels[] entry = 192 bytes = 24 x 8-byte {hi,lo} slots per channel (stride
+  192 = 0xC0 * channel). SIX buffer-load opcodes each memcpy ep_command[0xc..0x28]
+  (8 words) into a DIFFERENT window region, each skipping slot0:
+    handler@0x1458 -> entry+0x08 (also zeros entry+0), @0x14b8 -> +0x28 (sets
+    [0x61c]=opcode, the SET_BUF_EX kick), @0x1588 -> +0x48, @0x12b0 -> +0x68,
+    @0x1408 -> +0x88, @0x1518 -> +0xa8 (sets [0x620]=1). (The earlier "op2->+0x00"
+    was WRONG; our op2 buf0 hi/lo land at entry+0x08/+0x0c, i.e. slot1.)
+- pcie_set_outbound(window,ch,bufidx) (ep.ko @0x5a8) is the SOLE writer of the
+  ELBI outbound-target regs. entry = channels + 8*(24*ch + (bufidx-1) + wfield).
+  window0 wfield=0. It writes: ELBI[0x74]=0x90000000 (aperture base), [0x7c]=
+  0x91FFFFFF (limit, 32MB), [0x54]=entry+4 (intended LOW), [0x58]=entry+0
+  (HIGH, empirically effective), [0xd4]=0xf00000 (15MB). No ldrd; plain ldr/str.
+- ELBI is a Vatics-PROPRIETARY glue block (ioremap phys 0x82040000, size 256),
+  NOT DesignWare iATU (that's dbi_base 0x82000000). Init programs the INBOUND
+  window on the same block: base@0x30, limit@0x38, target-LOW@0x40, target-HIGH@
+  0x48 (spacing +8 from base+0x10). Init also ZEROES ELBI 0x54..0xCC at probe.
+- INFERENCE (unproven): by inbound's field spacing, the OUTBOUND effective low-
+  target is likely ELBI 0x84 (base 0x74 + 0x10), and pcie_set_outbound writes the
+  low to 0x54 - a register the HW ignores (init-zeroed, never re-read). That is
+  exactly "HIGH tracks channels+0, LOW always 0". So no op2/op4/op8 payload can
+  set low32 via this path (only pcie_set_outbound touches ELBI, and it targets
+  the wrong reg). vpl_dmac VPL_DMAC_StartTail/ISRTail copy profile[0x8..0x34] ->
+  DMA-engine MMR (the real per-frame dst descriptor); profile[0x38/39/3a/3b] =
+  window/channel/bufindex/outbound-enable, set at runtime by the card DMAC mgr.
+
+CAVEAT (why the "unreachable" read is probably incomplete): the HD60 Pro works
+normally with Elgato's driver on <4GB-RAM PCs, so low32 MUST be reachable by some
+host path. We are likely mis-driving the buffer setup (wrong opcode, or the DMAC
+manager builds profile[dst] from a channels[] slot we populate wrong), NOT hitting
+a true hw dead-end. Unresolved.
+
+PAUSED here (user choice). Two ways forward next session:
+  (1) RIGHT WAY: RE how the WORKING path gets the host address into the DMA
+      descriptor - trace vpl_dmac.ko profile[dst] source + the Windows driver's
+      frame-buffer setup (our op2 came from M17, may be the wrong command).
+  (2) WORKAROUND (guaranteed by the confirmed model): put the DMA buffer at a
+      4GB-aligned IOVA (low32=0) via an explicit iommu_map at IOVA 0x1_0000_0000,
+      set cmd[0xc]=high32(=1), cmd[0x10]=0 -> frames land in-buffer. Needs IOMMU
+      remap or a reserved-mem boot param; a hack, but works if (1) stalls.
+Fault flags: 0x20 (read-ish) vs 0x30 seen across runs. Disasm cached:
+scratchpad/disasm.txt (ep.ko), scratchpad/dmac.txt (vpl_dmac.ko); fw tree at
+scratchpad/fw/yuan_demo_sdi/.
