@@ -407,6 +407,17 @@ MODULE_PARM_DESC(probe_windows,
  * switches to HDMI output once it can read a valid EDID. So make the opcode
  * and the wait tunable and let a sweep find the combination that wakes it.
  */
+/*
+ * M51b. Data-bit polarity of GPIO_DIR (op 0x17): 0 = data bit 1 means
+ * OUTPUT (our reading), 1 = inverted. Unverified against the card, and a
+ * wrong guess makes every bit-banged line look stuck low, so it is a
+ * runtime switch rather than a constant.
+ */
+bool mz0380_gpio_dir_invert;
+module_param_named(gpio_dir_invert, mz0380_gpio_dir_invert, bool, 0644);
+MODULE_PARM_DESC(gpio_dir_invert,
+		 "M51: invert the GPIO_DIR (op 0x17) data-bit sense used by the bit-banged I2C (def:0 = 1 means output)");
+
 unsigned int mz0380_edid_opcode = MZ0380_CMD_I2C_COMBO;
 module_param_named(edid_opcode, mz0380_edid_opcode, uint, 0644);
 MODULE_PARM_DESC(edid_opcode,
@@ -3689,6 +3700,17 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 		mutex_lock(&devlist);
 		list_for_each_entry(dev, &mz0380_devlist, devlist)
 			mz0380_mst3367_reload_edid(dev);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M51b: "gpiodump" - idle level of every GPIO pin (pull-up hunt) */
+	if (!strcmp(cmd, "gpiodump")) {
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_gpio_dump(dev);
 		mutex_unlock(&devlist);
 		*ppos += count;
 		return count;

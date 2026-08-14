@@ -550,6 +550,7 @@ int mz0380_mst3367_hpd_pulse(struct mz0380_dev *dev, unsigned int count,
 			     unsigned int gap_ms);	/* M48 */
 int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			       struct v4l2_dv_timings *out);
+int mz0380_gpio_dump(struct mz0380_dev *dev);			/* M51b */
 int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl);	/* M51 */
 int mz0380_i2cbb_edid_burn(struct mz0380_dev *dev, u8 sda, u8 scl, u8 addr7);
 
@@ -577,6 +578,7 @@ extern unsigned long long mz0380_dma_iova_offset;
 extern unsigned int mz0380_set_buf_stride;
 extern unsigned int mz0380_card_frame_offset;
 extern bool mz0380_probe_windows;
+extern bool mz0380_gpio_dir_invert;
 extern unsigned int mz0380_edid_opcode;
 extern unsigned int mz0380_edid_timeout_ms;
 extern bool mz0380_buf_poison;

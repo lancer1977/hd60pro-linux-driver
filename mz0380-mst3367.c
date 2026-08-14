@@ -874,13 +874,72 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_read_signal);
  * so instead of reporting garbage.
  */
 
+/*
+ * M51b. op 0x17's data polarity is NOT verified: ep.ko has both
+ * gpio_direction_input and _output, but which data bit selects which is a
+ * guess. Getting it backwards swaps release/drive, and the bus then looks
+ * permanently stuck low - exactly the first hardware symptom. Runtime
+ * switch so both readings can be tried without a rebuild.
+ */
 static int mz0380_bb_dir(struct mz0380_dev *dev, u8 pin, bool output)
 {
-	u32 params[2] = { 1u << pin, output ? (1u << pin) : 0 };
+	bool bit = mz0380_gpio_dir_invert ? !output : output;
+	u32 params[2] = { 1u << pin, bit ? (1u << pin) : 0 };
 
 	return mz0380_send_command(dev, MZ0380_CMD_GPIO_DIR, params, 2,
 				   NULL, 500);
 }
+
+/*
+ * M51b. Which pins even exist, and which float high? An I2C pair sits on
+ * pull-ups, so it reads 1 when nobody drives it; a pin that is absent or
+ * grounded reads 0 forever. One masked read of the whole port, then a
+ * per-pin sweep (the firmware may only honour single-pin masks), gives the
+ * candidate list before any bit-banging is attempted.
+ */
+int mz0380_gpio_dump(struct mz0380_dev *dev)
+{
+	u32 params[1] = { 0xffffffffu };
+	u32 bitmap = 0;
+	unsigned int pin;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		pr_info("%s: gpiodump: firmware not READY (state %s)\n",
+			dev->name, mz0380_fw_state_name(dev->fw_state));
+		return -ENODEV;
+	}
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, params, 1,
+				  NULL, 500);
+	pr_info("%s: gpiodump full-mask read ret=%d PARAM0=%08x PARAM1=%08x PARAM2=%08x PARAM3=%08x\n",
+		dev->name, ret,
+		mz_mmio_read(dev, MZ0380_MB_PARAM(0)),
+		mz_mmio_read(dev, MZ0380_MB_PARAM(1)),
+		mz_mmio_read(dev, MZ0380_MB_PARAM(2)),
+		mz_mmio_read(dev, MZ0380_MB_PARAM(3)));
+
+	for (pin = 0; pin < 32; pin++) {
+		u32 one[1] = { 1u << pin };
+		u32 v;
+
+		if (mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, one, 1,
+					NULL, 500))
+			continue;
+		v = mz_mmio_read(dev, MZ0380_MB_PARAM(2));
+		if (v & (1u << pin))
+			bitmap |= 1u << pin;
+	}
+
+	pr_info("%s: gpiodump per-pin idle bitmap = 0x%08x (HIGH pins are pull-up candidates for an I2C pair)\n",
+		dev->name, bitmap);
+	for (pin = 0; pin < 32; pin++)
+		if (bitmap & (1u << pin))
+			pr_info("%s: gpiodump   pin %2u reads HIGH\n",
+				dev->name, pin);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_gpio_dump);
 
 /* release = input, pull-up floats the line high */
 static int mz0380_bb_release(struct mz0380_dev *dev, u8 pin)
@@ -1016,8 +1075,8 @@ int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl)
 		return ret;
 	}
 	if (!v) {
-		pr_info("%s: i2cbb scan sda=%u scl=%u: SDA reads LOW when released - wrong pin, wrong DIR polarity, or no pull-up; aborting\n",
-			dev->name, sda, scl);
+		pr_info("%s: i2cbb scan sda=%u scl=%u (dir_invert=%u): SDA reads LOW when released - wrong pin, wrong DIR polarity, or no pull-up; aborting. Run 'gpiodump' for the pins that float HIGH, and try gpio_dir_invert=1\n",
+			dev->name, sda, scl, mz0380_gpio_dir_invert);
 		return -EIO;
 	}
 
