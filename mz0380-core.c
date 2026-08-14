@@ -413,6 +413,17 @@ MODULE_PARM_DESC(probe_windows,
  * wrong guess makes every bit-banged line look stuck low, so it is a
  * runtime switch rather than a constant.
  */
+/*
+ * M53. Candidate registers per bank for the indirect-port hunt. Cost is
+ * quadratic (~20 ms per ordered pair over the mailbox), so 48 candidates is
+ * ~45 s per bank; raise it if the hunt comes back empty and the writable
+ * count printed per bank was clipped.
+ */
+unsigned int mz0380_edidhunt_max_regs = 48;
+module_param_named(edidhunt_max_regs, mz0380_edidhunt_max_regs, uint, 0644);
+MODULE_PARM_DESC(edidhunt_max_regs,
+		 "M53: max writable registers per bank used as indirect address/data candidates (def:48; cost is quadratic)");
+
 bool mz0380_gpio_dir_invert;
 module_param_named(gpio_dir_invert, mz0380_gpio_dir_invert, bool, 0644);
 MODULE_PARM_DESC(gpio_dir_invert,
@@ -3700,6 +3711,17 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 		mutex_lock(&devlist);
 		list_for_each_entry(dev, &mz0380_devlist, devlist)
 			mz0380_mst3367_reload_edid(dev);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M53: "edidhunt" - hunt an indirect address/data port into EDID RAM */
+	if (!strcmp(cmd, "edidhunt")) {
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_mst3367_edidhunt(dev);
 		mutex_unlock(&devlist);
 		*ppos += count;
 		return count;

@@ -1194,3 +1194,113 @@ int mz0380_i2cbb_edid_burn(struct mz0380_dev *dev, u8 sda, u8 scl, u8 addr7)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_i2cbb_edid_burn);
+
+/* --- M53: hunt an INDIRECT address/data port into the EDID RAM ----------- */
+
+/*
+ * M49b closed the DIRECT search: no bank holds an EDID-sized writable window
+ * (longest contiguous run anywhere is 33 bytes). But that scan could never
+ * have found the other way receivers expose EDID RAM - an INDIRECT port: one
+ * register holds an address, a second reads/writes the byte at that address,
+ * and the RAM behind them is invisible to a register sweep. Two ordinary
+ * config registers, indistinguishable from the rest.
+ *
+ * They are separable by BEHAVIOUR, though, and cheaply. Storage indexed by an
+ * address register remembers a different byte per address; a plain register
+ * remembers only the last byte written to it:
+ *
+ *     A=0x10, D=0xa5 ; A=0x20, D=0x5a ; then A=0x10 -> D reads 0xa5?
+ *                                            A=0x20 -> D reads 0x5a?
+ *
+ * A plain register returns 0x5a both times and is rejected. Both values
+ * surviving means the pair (A,D) is a window onto address-indexed storage -
+ * the EDID RAM, if it exists at all. Every register touched is restored.
+ */
+static bool mst_indirect_pair_is_ram(struct mz0380_dev *dev, u8 areg, u8 dreg)
+{
+	u8 v1 = 0, v2 = 0;
+
+	if (mst_wr(dev, areg, 0x10) || mst_wr(dev, dreg, 0xa5) ||
+	    mst_wr(dev, areg, 0x20) || mst_wr(dev, dreg, 0x5a) ||
+	    mst_wr(dev, areg, 0x10) || mst_rd(dev, dreg, &v1) ||
+	    mst_wr(dev, areg, 0x20) || mst_rd(dev, dreg, &v2))
+		return false;
+
+	return v1 == 0xa5 && v2 == 0x5a;
+}
+
+int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
+{
+	unsigned int bank, hits = 0;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		pr_info("%s: edidhunt: firmware not READY (state %s)\n",
+			dev->name, mz0380_fw_state_name(dev->fw_state));
+		return -ENODEV;
+	}
+
+	pr_info("%s: edidhunt: looking for an indirect address/data port (up to %u candidates per bank)\n",
+		dev->name, mz0380_edidhunt_max_regs);
+
+	for (bank = 0; bank <= 3; bank++) {
+		u8 cand[256];
+		u8 orig[256];
+		unsigned int n = 0, i, j, tried = 0;
+		unsigned int reg;
+
+		if (mst_bank(dev, bank))
+			continue;
+
+		/* candidates = registers that hold an arbitrary byte */
+		for (reg = 1; reg <= 0xff && n < mz0380_edidhunt_max_regs; reg++) {
+			u8 was = 0, rb = 0;
+
+			if (mst_rd(dev, reg, &was))
+				continue;
+			if (mst_wr(dev, reg, 0x5a) || mst_rd(dev, reg, &rb)) {
+				mst_wr(dev, reg, was);
+				continue;
+			}
+			mst_wr(dev, reg, was);
+			if (rb == 0x5a) {
+				orig[n] = was;
+				cand[n++] = reg;
+			}
+			cond_resched();
+		}
+
+		pr_info("%s: edidhunt bank%u: %u writable candidates -> %u ordered pairs\n",
+			dev->name, bank, n, n * (n ? n - 1 : 0));
+
+		for (i = 0; i < n; i++) {
+			for (j = 0; j < n; j++) {
+				if (i == j)
+					continue;
+				tried++;
+				if (mst_indirect_pair_is_ram(dev, cand[i],
+							     cand[j])) {
+					pr_info("%s: edidhunt HIT bank%u: addr=0x%02x data=0x%02x behaves as address-indexed RAM - EDID window candidate\n",
+						dev->name, bank, cand[i],
+						cand[j]);
+					hits++;
+				}
+				/* put both registers back as we go */
+				mst_wr(dev, cand[i], orig[i]);
+				mst_wr(dev, cand[j], orig[j]);
+				cond_resched();
+				if (!(tried % 500))
+					pr_info("%s: edidhunt bank%u: %u pairs tested\n",
+						dev->name, bank, tried);
+			}
+		}
+	}
+
+	if (hits)
+		pr_info("%s: edidhunt done: %u candidate port(s) - write the EDID through one and re-pulse HPD\n",
+			dev->name, hits);
+	else
+		pr_info("%s: edidhunt done: NO indirect port found. The receiver holds no host-writable EDID storage, so the EDID must come from elsewhere on the DDC lines (card-side bus) - static RE is exhausted, a live Windows trace is the remaining route\n",
+			dev->name);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_edidhunt);
