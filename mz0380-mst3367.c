@@ -47,6 +47,27 @@ static int mst_bank(struct mz0380_dev *dev, u8 bank)
 	return mst_wr(dev, MST3367_REG_BANK_SELECT, bank);
 }
 
+/*
+ * Is the receiver answering at all? The firmware turns an I2C NAK into a
+ * 0x00 result byte, so "every register reads zero" is indistinguishable
+ * from a chip that is powered down, held in reset, or absent - and quite
+ * distinguishable from a live one, which always has some non-zero config.
+ * Sampled across bank0 so one zeroed register cannot decide it.
+ */
+static bool mst_bus_alive(struct mz0380_dev *dev)
+{
+	unsigned int reg;
+
+	mst_bank(dev, MST3367_BANK0);
+	for (reg = 0x01; reg <= 0xf1; reg += 0x10) {
+		u8 v = 0;
+
+		if (!mst_rd(dev, reg, &v) && v)
+			return true;
+	}
+	return false;
+}
+
 /* --- GPIO (op 0x15, single-pin mask+data; see reg.h GPIO pin map) --------- */
 
 static int mz0380_gpio_set(struct mz0380_dev *dev, unsigned int pin, int level)
@@ -58,12 +79,43 @@ static int mz0380_gpio_set(struct mz0380_dev *dev, unsigned int pin, int level)
 }
 
 /*
+ * Force a pin back to OUTPUT (op 0x17). The card powers up with these pins
+ * already outputs, so bring-up historically only ever wrote DATA - but the
+ * M51 bit-bang probe deliberately switched pins to input to emulate
+ * open-drain, and left them that way. A GPIO_SET on an input pin changes
+ * nothing, so the reset line (pin9) could no longer be driven and the
+ * receiver stayed in reset with a dead I2C bus, surviving every rmmod.
+ *
+ * @invert selects the data-bit sense, which is still unproven; bring-up
+ * tries both and keeps whichever revives the bus.
+ */
+static int mz0380_gpio_force_output(struct mz0380_dev *dev, unsigned int pin,
+				    bool invert)
+{
+	u32 params[2] = { 1u << pin, invert ? 0 : (1u << pin) };
+
+	return mz0380_send_command(dev, MZ0380_CMD_GPIO_DIR, params, 2,
+				   NULL, 500);
+}
+
+/*
  * Release the MST3367 from reset. The card holds pin9 (active-low reset) low at
  * power-up; Windows pulses pin9 1->0->1 with pin3 (RX enable) high and pin8
  * (companion strap) alongside. Until this runs, the receiver I2C bus is dead.
  */
 static void mz0380_mst3367_reset(struct mz0380_dev *dev)
 {
+	static const u8 driven[] = {
+		MZ0380_GPIO_HPD, MZ0380_GPIO_RX_ENABLE,
+		MZ0380_GPIO_RX_STRAP, MZ0380_GPIO_RX_RESET,
+	};
+	unsigned int i;
+
+	/* every pin we are about to drive must actually be an output */
+	for (i = 0; i < ARRAY_SIZE(driven); i++)
+		mz0380_gpio_force_output(dev, driven[i],
+					 mz0380_gpio_dir_invert);
+
 	mz0380_gpio_set(dev, MZ0380_GPIO_RX_ENABLE, 1);   /* RX / mux enable  */
 	mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 1);    /* released baseline */
 	usleep_range(2000, 3000);
@@ -367,6 +419,30 @@ int mz0380_mst3367_bringup(struct mz0380_dev *dev)
 
 	mz0380_mst3367_select_input(dev);
 	mz0380_mst3367_reset(dev);
+
+	/*
+	 * The reset above forces the driven pins to outputs, but the DIR data
+	 * polarity is a guess. If it was the wrong one we have just made them
+	 * inputs, reset stays asserted and the bus is dead - which is exactly
+	 * the state the M51 bit-bang probe left the card in. Detect that and
+	 * retry with the opposite sense, then remember which one worked.
+	 */
+	if (!mst_bus_alive(dev)) {
+		pr_info("%s: MST3367 silent after reset (dir_invert=%u) - retrying with the opposite GPIO_DIR sense\n",
+			dev->name, mz0380_gpio_dir_invert);
+		mz0380_gpio_dir_invert = !mz0380_gpio_dir_invert;
+		mz0380_mst3367_reset(dev);
+
+		if (mst_bus_alive(dev)) {
+			pr_info("%s: MST3367 answering with dir_invert=%u - GPIO direction polarity now known\n",
+				dev->name, mz0380_gpio_dir_invert);
+		} else {
+			mz0380_gpio_dir_invert = !mz0380_gpio_dir_invert;
+			pr_warn("%s: MST3367 still silent under both GPIO_DIR senses - receiver held in reset or unpowered; a mains-off cold boot restores the card's own pin config\n",
+				dev->name);
+		}
+	}
+
 	mz0380_mst3367_init_regs(dev);
 
 	/*
@@ -1097,6 +1173,16 @@ int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl)
 				dev->name, addr, addr << 1);
 		}
 	}
+
+	/*
+	 * Hand the pins back as OUTPUTS. Leaving them as inputs is not
+	 * cosmetic: pin9 is the receiver's reset and pin1 is HPD, so a probe
+	 * that walks away mid-emulation leaves the receiver held in reset with
+	 * a dead I2C bus, and no rmmod/insmod can undo it (only a cold boot).
+	 */
+	mz0380_bb_dir(dev, sda, true);
+	mz0380_bb_dir(dev, scl, true);
+	dev->mst3367_ready = false;   /* force a fresh bring-up after this */
 
 	if (acks > 16)
 		pr_info("%s: i2cbb scan: %u ACKs - that is a stuck bus, not real devices (check pins/polarity)\n",
