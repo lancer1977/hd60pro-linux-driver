@@ -1231,7 +1231,8 @@ static bool mst_indirect_pair_is_ram(struct mz0380_dev *dev, u8 areg, u8 dreg)
 
 int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 {
-	unsigned int bank, hits = 0;
+	unsigned int bank, hits = 0, probe;
+	bool answered = false;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
 		pr_info("%s: edidhunt: firmware not READY (state %s)\n",
@@ -1239,7 +1240,35 @@ int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 		return -ENODEV;
 	}
 
-	pr_info("%s: edidhunt: looking for an indirect address/data port (up to %u candidates per bank)\n",
+	/*
+	 * The receiver powers up held in reset (pin9, active-low) and NAKs
+	 * every access until released - and the firmware turns a NAK into a
+	 * 0x00 result byte, so an un-brought-up bus looks exactly like a chip
+	 * whose registers are all read-only. Bring it up first.
+	 */
+	if (!dev->mst3367_ready)
+		mz0380_mst3367_bringup(dev);
+
+	/*
+	 * Then prove the bus is alive before believing any negative: read a
+	 * spread of bank0 registers and require at least one non-zero. All
+	 * zeros means nobody is answering, which is a broken probe, not the
+	 * absence of an EDID window.
+	 */
+	mst_bank(dev, MST3367_BANK0);
+	for (probe = 0x01; probe <= 0xf1; probe += 0x10) {
+		u8 v = 0;
+
+		if (!mst_rd(dev, probe, &v) && v)
+			answered = true;
+	}
+	if (!answered) {
+		pr_info("%s: edidhunt ABORTED: every register reads 0x00 - the receiver is not answering I2C (NAK), so this run would prove nothing. Check the bring-up (reset pin9) first\n",
+			dev->name);
+		return -ENXIO;
+	}
+
+	pr_info("%s: edidhunt: receiver answering; looking for an indirect address/data port (up to %u candidates per bank)\n",
 		dev->name, mz0380_edidhunt_max_regs);
 
 	for (bank = 0; bank <= 3; bank++) {
@@ -1271,6 +1300,10 @@ int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 
 		pr_info("%s: edidhunt bank%u: %u writable candidates -> %u ordered pairs\n",
 			dev->name, bank, n, n * (n ? n - 1 : 0));
+
+		if (!n)
+			pr_info("%s: edidhunt bank%u: no register accepted a write - M49 found writable runs here, so treat this as a dead bus, not a result\n",
+				dev->name, bank);
 
 		for (i = 0; i < n; i++) {
 			for (j = 0; j < n; j++) {
