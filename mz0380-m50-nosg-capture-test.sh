@@ -3,25 +3,31 @@
 # to userspace end-to-end?
 #
 # New machinery under test (mz0380-dma.c mz0380_nosg_thread): with
-# stream_nosg=1 the V4L2 node switches to NV12 1920x1080 and streamon runs a
+# stream_nosg=1 the V4L2 node switches to NV12 720x1080 and streamon runs a
 # kthread that per frame: poisons buf0, spawns the encoder (SET_VIC ->
 # SET_BUF -> op6), polls the tail of the 0x30a5c0-byte raw burst, copies the
-# leading 0x2f7600 NV12 bytes into the queued vb2 buffer, sends op7, and
+# leading 0x11cc40 NV12 bytes into the queued vb2 buffer, sends op7, and
 # respawns (M39: one frame per fresh spawn). Expected cadence ~1 frame per
-# (start_delay_ms + 450 ms + stop).
+# (start_delay_ms + 450 ms + stop); 500 ms delay verified good on hw.
+#
+# First hw run (2026-08-14): 4/4 frames both at delay 2000 and 500, 0 faults
+# during capture (one boot-time 0x90000000 fault before streaming = the
+# known pre-READY artifact, mz0380.h). The frame decoded to the card's OWN
+# "NO SIGNAL" splash (spinner + text) - the fake-frame renderer draws it at
+# 720 wide with neutral 0x80 chroma regardless of SET_VIC width, hence the
+# NV12 720x1080 payload (M50 layout note in mz0380-reg.h).
 #
 # Decision table:
-#   - capture file size == N * 3110400 and 'nosg polling capture stopped
-#     after N frames' with N >= 2   -> WORKING repeated capture; milestone
-#     "pragmatic capture" done. Inspect /tmp/cap-m50.nv12 with:
-#       ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 /tmp/cap-m50.nv12
-#     (fake frame = uniform 0x11-ish fill; a solid dark frame is CORRECT)
+#   - capture file size == N * 1166400 and 'nosg polling capture stopped
+#     after N frames' with N >= 2   -> WORKING repeated capture. Inspect:
+#       ffplay -f rawvideo -pixel_format nv12 -video_size 720x1080 /tmp/cap-m50.nv12
+#     (expect the grayscale NO SIGNAL splash: spinner + text on black)
 #   - exactly 1 frame then 'did not land' warnings -> respawn regression:
 #     compare against mz0380-m39-respawn-test.sh (which proved 2 spawns work)
 #   - 0 frames, v4l2-ctl times out -> tail-detect never fired: check dmesg
 #     for 'nosg spawn failed' (mailbox error) vs silence (frame truly absent;
 #     re-verify with buf_poison=1 extent lines)
-#   - file size a multiple of something OTHER than 3110400 -> vb2 plane /
+#   - file size a multiple of something OTHER than 1166400 -> vb2 plane /
 #     payload mismatch, check queue_setup sizes in dmesg
 set -u
 cd "$(dirname "$0")"
