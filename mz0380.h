@@ -550,6 +550,8 @@ int mz0380_mst3367_hpd_pulse(struct mz0380_dev *dev, unsigned int count,
 			     unsigned int gap_ms);	/* M48 */
 int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			       struct v4l2_dv_timings *out);
+int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl);	/* M51 */
+int mz0380_i2cbb_edid_burn(struct mz0380_dev *dev, u8 sda, u8 scl, u8 addr7);
 
 /* ALSA audio (mz0380-audio.c) */
 #if IS_ENABLED(CONFIG_SND)

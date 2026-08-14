@@ -847,3 +847,285 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_read_signal);
+
+/* --- M51: bit-banged I2C on the card's spare GPIO pins -------------------- */
+
+/*
+ * The GPL hdcapm driver (same MST3367, sibling Elgato product) revealed the
+ * EDID architecture these cards use: a plain I2C EEPROM wired to the HDMI
+ * connector's DDC pins, sitting on a SECOND I2C bus ("bus#1, it has the
+ * eeprom on it", dev 0xa2/0xa0) - NOT on the receiver's bus. The source
+ * reads the EDID straight out of that chip; no software EDID serving at all.
+ *
+ * Our mailbox I2C proxy (op 0x1a/0x1b) only reaches the receiver bus (M43:
+ * 0x9c + 0x98, nothing else), which would explain every negative EDID sweep:
+ * wrong bus. But the card also has host-controllable GPIO (op 0x14/0x15/0x17
+ * = read/set/direction), and NEXT_SESSION notes GPIO12/13 as the internal
+ * I2C pair. So: bit-bang I2C on those pins from the host, one mailbox
+ * command per line transition. Slow (~2 ms per command) but an ACK scan is
+ * seconds and a full 256-byte EDID burn is minutes - and the EEPROM keeps
+ * the data across power cycles, so the burn is one-time.
+ *
+ * Open-drain emulation: a line is released high by switching the pin to
+ * INPUT (external pull-ups float it up) and driven low by data=0 + OUTPUT.
+ * GPIO_DIR (op 0x17) is assumed {mask, data} with data bit 1 = output -
+ * unverified on hardware; if a scan finds EVERY address ACKing or the bus
+ * reads stuck low, the polarity or pin numbers are wrong, and the scan says
+ * so instead of reporting garbage.
+ */
+
+static int mz0380_bb_dir(struct mz0380_dev *dev, u8 pin, bool output)
+{
+	u32 params[2] = { 1u << pin, output ? (1u << pin) : 0 };
+
+	return mz0380_send_command(dev, MZ0380_CMD_GPIO_DIR, params, 2,
+				   NULL, 500);
+}
+
+/* release = input, pull-up floats the line high */
+static int mz0380_bb_release(struct mz0380_dev *dev, u8 pin)
+{
+	return mz0380_bb_dir(dev, pin, false);
+}
+
+static int mz0380_bb_drive_low(struct mz0380_dev *dev, u8 pin)
+{
+	u32 params[2] = { 1u << pin, 0 };
+	int ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_SET, params, 2,
+				      NULL, 500);
+
+	if (ret)
+		return ret;
+	return mz0380_bb_dir(dev, pin, true);
+}
+
+static int mz0380_bb_read(struct mz0380_dev *dev, u8 pin, u8 *val)
+{
+	u32 params[1] = { 1u << pin };
+	int ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, params, 1,
+				      NULL, 500);
+
+	if (ret)
+		return ret;
+	*val = !!(mz_mmio_read(dev, MZ0380_MB_PARAM(2)) & (1u << pin));
+	return 0;
+}
+
+struct mz0380_bb_bus {
+	struct mz0380_dev *dev;
+	u8 sda;
+	u8 scl;
+};
+
+static int mz0380_bb_start(struct mz0380_bb_bus *b)
+{
+	int ret;
+
+	/* both released -> SDA low -> SCL low */
+	ret = mz0380_bb_release(b->dev, b->sda);
+	ret = ret ?: mz0380_bb_release(b->dev, b->scl);
+	ret = ret ?: mz0380_bb_drive_low(b->dev, b->sda);
+	ret = ret ?: mz0380_bb_drive_low(b->dev, b->scl);
+	return ret;
+}
+
+static int mz0380_bb_stop(struct mz0380_bb_bus *b)
+{
+	int ret;
+
+	ret = mz0380_bb_drive_low(b->dev, b->sda);
+	ret = ret ?: mz0380_bb_release(b->dev, b->scl);
+	ret = ret ?: mz0380_bb_release(b->dev, b->sda);
+	return ret;
+}
+
+static int mz0380_bb_write_bit(struct mz0380_bb_bus *b, bool bit)
+{
+	int ret;
+
+	ret = bit ? mz0380_bb_release(b->dev, b->sda)
+		  : mz0380_bb_drive_low(b->dev, b->sda);
+	ret = ret ?: mz0380_bb_release(b->dev, b->scl);   /* clock high */
+	ret = ret ?: mz0380_bb_drive_low(b->dev, b->scl); /* clock low  */
+	return ret;
+}
+
+static int mz0380_bb_read_bit(struct mz0380_bb_bus *b, u8 *bit)
+{
+	int ret;
+
+	ret = mz0380_bb_release(b->dev, b->sda);
+	ret = ret ?: mz0380_bb_release(b->dev, b->scl);
+	ret = ret ?: mz0380_bb_read(b->dev, b->sda, bit);
+	ret = ret ?: mz0380_bb_drive_low(b->dev, b->scl);
+	return ret;
+}
+
+/* returns 0 on ACK, 1 on NAK, negative on mailbox error */
+static int mz0380_bb_write_byte(struct mz0380_bb_bus *b, u8 byte)
+{
+	u8 ack;
+	int i, ret;
+
+	for (i = 7; i >= 0; i--) {
+		ret = mz0380_bb_write_bit(b, (byte >> i) & 1);
+		if (ret)
+			return ret;
+	}
+	ret = mz0380_bb_read_bit(b, &ack);
+	if (ret)
+		return ret;
+	return ack;   /* SDA low during 9th clock = ACK(0) */
+}
+
+static int mz0380_bb_read_byte(struct mz0380_bb_bus *b, u8 *byte, bool ack)
+{
+	u8 bit;
+	int i, ret;
+
+	*byte = 0;
+	for (i = 7; i >= 0; i--) {
+		ret = mz0380_bb_read_bit(b, &bit);
+		if (ret)
+			return ret;
+		*byte |= (u8)bit << i;
+	}
+	return mz0380_bb_write_bit(b, !ack);   /* ACK = drive low */
+}
+
+int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl)
+{
+	struct mz0380_bb_bus b = { .dev = dev, .sda = sda, .scl = scl };
+	unsigned int addr, acks = 0;
+	u8 v;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+
+	/* idle-state sanity: both lines must float high or there is no bus */
+	ret = mz0380_bb_release(dev, sda);
+	ret = ret ?: mz0380_bb_release(dev, scl);
+	ret = ret ?: mz0380_bb_read(dev, sda, &v);
+	if (ret) {
+		pr_info("%s: i2cbb scan sda=%u scl=%u: mailbox error %d\n",
+			dev->name, sda, scl, ret);
+		return ret;
+	}
+	if (!v) {
+		pr_info("%s: i2cbb scan sda=%u scl=%u: SDA reads LOW when released - wrong pin, wrong DIR polarity, or no pull-up; aborting\n",
+			dev->name, sda, scl);
+		return -EIO;
+	}
+
+	pr_info("%s: i2cbb scan start (sda=%u scl=%u)\n", dev->name, sda, scl);
+	for (addr = 0x08; addr < 0x78; addr++) {
+		ret = mz0380_bb_start(&b);
+		ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, addr << 1);
+		if (ret >= 0)
+			mz0380_bb_stop(&b);
+		if (ret < 0) {
+			pr_info("%s: i2cbb scan aborted at 0x%02x (%d)\n",
+				dev->name, addr, ret);
+			return ret;
+		}
+		if (ret == 0) {
+			acks++;
+			pr_info("%s: i2cbb ACK at 0x%02x (8-bit 0x%02x)\n",
+				dev->name, addr, addr << 1);
+		}
+	}
+
+	if (acks > 16)
+		pr_info("%s: i2cbb scan: %u ACKs - that is a stuck bus, not real devices (check pins/polarity)\n",
+			dev->name, acks);
+	else
+		pr_info("%s: i2cbb scan done: %u device(s)\n", dev->name, acks);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_i2cbb_scan);
+
+/*
+ * Burn the validated EDID into the DDC EEPROM found by the scan, 8-byte
+ * pages (safe for 24C02..24C16 parts), ack-poll between pages, then read
+ * everything back and compare. One-time operation: the EEPROM is
+ * non-volatile, so a verified burn permanently un-blocks the source's EDID
+ * read - no Windows trace needed.
+ */
+int mz0380_i2cbb_edid_burn(struct mz0380_dev *dev, u8 sda, u8 scl, u8 addr7)
+{
+	struct mz0380_bb_bus b = { .dev = dev, .sda = sda, .scl = scl };
+	unsigned int off, i, poll;
+	u8 rd;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+
+	pr_info("%s: i2cbb EDID burn -> dev 0x%02x (sda=%u scl=%u), %u bytes\n",
+		dev->name, addr7, sda, scl, MZ0380_EDID_SIZE);
+
+	for (off = 0; off < MZ0380_EDID_SIZE; off += 8) {
+		ret = mz0380_bb_start(&b);
+		ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, addr7 << 1);
+		if (ret > 0) {
+			pr_info("%s: i2cbb burn: NAK on address at off %u\n",
+				dev->name, off);
+			mz0380_bb_stop(&b);
+			return -ENXIO;
+		}
+		ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, off);
+		for (i = 0; !ret && i < 8; i++)
+			ret = mz0380_bb_write_byte(&b,
+						   mz0380_edid_default[off + i]);
+		if (ret >= 0)
+			mz0380_bb_stop(&b);
+		if (ret) {
+			pr_info("%s: i2cbb burn failed at off %u (%d)\n",
+				dev->name, off, ret);
+			return ret < 0 ? ret : -EIO;
+		}
+
+		/* ack-poll until the internal page write completes */
+		for (poll = 0; poll < 20; poll++) {
+			ret = mz0380_bb_start(&b);
+			ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, addr7 << 1);
+			if (ret >= 0)
+				mz0380_bb_stop(&b);
+			if (ret <= 0)
+				break;
+		}
+		if (ret)
+			pr_info("%s: i2cbb burn: ack-poll never ACKed after page %u\n",
+				dev->name, off / 8);
+	}
+
+	/* verify: sequential read of the whole array */
+	ret = mz0380_bb_start(&b);
+	ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, addr7 << 1);
+	ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, 0);
+	ret = ret < 0 ? ret : mz0380_bb_start(&b);   /* repeated start */
+	ret = ret < 0 ? ret : mz0380_bb_write_byte(&b, (addr7 << 1) | 1);
+	if (ret) {
+		pr_info("%s: i2cbb verify setup failed (%d)\n", dev->name, ret);
+		return ret < 0 ? ret : -EIO;
+	}
+	for (off = 0; off < MZ0380_EDID_SIZE; off++) {
+		ret = mz0380_bb_read_byte(&b, &rd,
+					  off != MZ0380_EDID_SIZE - 1);
+		if (ret < 0)
+			return ret;
+		if (rd != mz0380_edid_default[off]) {
+			pr_info("%s: i2cbb VERIFY MISMATCH at %u: wrote 0x%02x read 0x%02x\n",
+				dev->name, off, mz0380_edid_default[off], rd);
+			mz0380_bb_stop(&b);
+			return -EIO;
+		}
+	}
+	mz0380_bb_stop(&b);
+
+	pr_info("%s: i2cbb EDID burn VERIFIED - %u bytes match; pulse HPD and the source should now read a valid EDID\n",
+		dev->name, MZ0380_EDID_SIZE);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_i2cbb_edid_burn);

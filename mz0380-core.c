@@ -3694,6 +3694,38 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 		return count;
 	}
 
+	/* M51: "i2cscan [sda] [scl]" bit-bang scan of a spare-GPIO I2C bus */
+	if (!strncmp(cmd, "i2cscan", 7)) {
+		unsigned int sda = 13, scl = 12;
+
+		sscanf(cmd, "i2cscan %u %u", &sda, &scl);
+		kfree(cmd);
+		if (sda > 31 || scl > 31 || sda == scl)
+			return -EINVAL;
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_i2cbb_scan(dev, sda, scl);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M51: "edidburn [sda] [scl] [addr7]" burn+verify EDID into the EEPROM */
+	if (!strncmp(cmd, "edidburn", 8)) {
+		unsigned int sda = 13, scl = 12, addr = 0x50;
+
+		sscanf(cmd, "edidburn %u %u %x", &sda, &scl, &addr);
+		kfree(cmd);
+		if (sda > 31 || scl > 31 || sda == scl || addr > 0x7f)
+			return -EINVAL;
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_i2cbb_edid_burn(dev, sda, scl, addr);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
 	/* M45: "watch [secs]" logs the detect block live to dmesg */
 	if (!strncmp(cmd, "watch", 5)) {
 		unsigned int secs = 20;
