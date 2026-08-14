@@ -15,3 +15,6 @@ windowsDriver/
 sc0710-*.c
 sc0710-*.h
 sc0710.h
+# RE-derived vendor disasm/dumps - kept local
+re-dump/
+ep-disasm.txt

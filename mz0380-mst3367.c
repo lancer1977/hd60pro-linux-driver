@@ -20,6 +20,7 @@
 
 #include "mz0380.h"
 #include "mz0380-reg.h"
+#include "mz0380-edid.h"
 
 /* --- low-level MST3367 register access over the mailbox proxy ------------- */
 
@@ -112,6 +113,250 @@ static void mz0380_mst3367_init_regs(struct mz0380_dev *dev)
 	usleep_range(2000, 3000);
 }
 
+/*
+ * Load the EDID into the receiver's DDC EEPROM (I2C 0xA0) with the bulk-write
+ * opcode, 32 bytes per command (M10: PARAM1 = (len<<16)|(block<<8)|dev8, then
+ * the bytes little-endian). This is the half of "look like a sink" that the
+ * driver has been missing: an HDMI source that cannot read an EDID keeps its
+ * transmitter off, so the receiver never locks no matter what else we do.
+ */
+static int mz0380_mst3367_load_edid(struct mz0380_dev *dev)
+{
+	unsigned int off;
+	int ret;
+
+	for (off = 0; off < MZ0380_EDID_SIZE; off += MZ0380_EDID_CHUNK) {
+		/* payload = offset byte + the chunk, padded to whole words */
+		u8 buf[1 + MZ0380_EDID_CHUNK] = { 0 };
+		u32 params[1 + (sizeof(buf) + 3) / 4] = { 0 };
+		unsigned int i;
+
+		buf[0] = off;                            /* EEPROM byte offset */
+		memcpy(&buf[1], &mz0380_edid_default[off], MZ0380_EDID_CHUNK);
+
+		params[0] = MZ0380_EDID_I2C_DEV |
+			    ((u32)MZ0380_I2C_COMBO_WRITE << 8) |
+			    ((u32)sizeof(buf) << 16);
+		for (i = 0; i < sizeof(buf); i++)
+			params[1 + i / 4] |= (u32)buf[i] << (8 * (i % 4));
+
+		/*
+		 * M47: default timeout 0 = fire-and-forget. The card posts no
+		 * completion for this opcode (it returned -110 while the very
+		 * next command worked), exactly like START_STREAMING.
+		 */
+		ret = mz0380_send_command(dev, mz0380_edid_opcode, params,
+					  ARRAY_SIZE(params), NULL,
+					  mz0380_edid_timeout_ms);
+		if (ret && mz0380_edid_timeout_ms) {
+			pr_warn("%s: EDID write failed at offset %u (%d)\n",
+				dev->name, off, ret);
+			return ret;
+		}
+		msleep(20);   /* bit-banged I2C + EEPROM page-write cycle */
+	}
+
+	pr_info("%s: EDID pushed (%u bytes, opcode 0x%02x, wait %ums) - the source is the oracle: a camera switches to HDMI out once it can read one\n",
+		dev->name, MZ0380_EDID_SIZE, mz0380_edid_opcode,
+		mz0380_edid_timeout_ms);
+	return 0;
+}
+
+/*
+ * Assert hot-plug detect. Two levers, both needed: the board-level HPD pin
+ * (GPIO pin1) that the source physically senses, and the receiver's own HPD
+ * enable (BANK0 0xb7 bit1, cleared to 0 by the init sequence above). Order
+ * matters - HPD must rise only AFTER the EDID is readable, or the source will
+ * read a garbage/absent EDID once and not retry.
+ */
+static void mz0380_mst3367_hpd(struct mz0380_dev *dev, bool on)
+{
+	mst_bank(dev, MST3367_BANK0);
+	mst_wr(dev, MST3367_B0_HPD, on ? MST3367_B0_HPD_ON : MST3367_B0_HPD_OFF);
+	mz0380_gpio_set(dev, MZ0380_GPIO_HPD, on);
+	pr_info("%s: HPD %s\n", dev->name, on ? "asserted" : "deasserted");
+}
+
+/*
+ * M46. Declare the input BEFORE touching the receiver. The Windows bring-up
+ * order is AUTO.INPUT (input select) -> EDID -> HPD -> detect, and our
+ * RE notes flag input-select as the prime suspect for the "receiver domain is
+ * gated until Windows does something first" behaviour. Everything we have
+ * done so far skipped straight to the receiver, so the card was never told
+ * which front-end to route - which fits a receiver that answers I2C happily
+ * but never sees a signal, and a detect block frozen at its idle values.
+ */
+static void mz0380_mst3367_select_input(struct mz0380_dev *dev)
+{
+	u32 params[8] = { 0 };
+	int ret;
+
+	/* cmd[6] = input code (HDMI), cmd[5] = fps, cmd[8..11] = geometry */
+	params[0] = ((u32)MZ0380_INPUT_CODE_HDMI << 16) | (60u << 8);
+	params[1] = (1080u << 16) | 1920u;
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
+				  ARRAY_SIZE(params), NULL, 500);
+	pr_info("%s: input select: SET_VIC(input=HDMI 1920x1080@60) ret=%d\n",
+		dev->name, ret);
+}
+
+/*
+ * M47: re-push the EDID and re-pulse HPD without reloading the module, so a
+ * sweep over edid_opcode / edid_timeout_ms can be watched against the source
+ * live. HPD has to fall and rise again: a source only re-reads the EDID on a
+ * hotplug edge.
+ */
+/*
+ * M48. Isolate HPD. Every test so far changed several things at once (input
+ * select, receiver init, EDID push, HPD), and the source reacted exactly once
+ * - which is as consistent with a coincidence (camera idle-timeout) as with
+ * our hotplug edge. A source's response to HPD is the one thing we can test
+ * with a single variable: pulse it, change nothing else, and see whether the
+ * camera reacts every time.
+ *
+ * If it does, the board-level hotplug line really is ours to drive and the
+ * EDID is being served by something we do not control (the factory-programmed
+ * EDID MCU the RE docs mention) - which would make the remaining fault the
+ * receiver's own configuration. If it never reacts, our HPD is not reaching
+ * the connector at all and no amount of EDID work will ever matter.
+ */
+/*
+ * M49. HPD is now PROVEN to reach the connector: the camera reacts to the
+ * hotplug edge, then falls back to its LCD instead of staying in HDMI output
+ * - which is exactly what a source does when it sees a sink appear, tries to
+ * read the EDID over DDC, and gets nothing. So the EDID is the single
+ * remaining fault, and it must be served out of the receiver (nothing else
+ * exists on the bus to serve it).
+ *
+ * Find the EDID RAM by writability. A config register mostly has reserved or
+ * hardwired bits and will not return an arbitrary byte; a RAM cell returns
+ * exactly what was written. Sweep every bank, read the original, write a test
+ * value, read back, and put the original back immediately. A contiguous run
+ * of registers that hold arbitrary values is the EDID window.
+ *
+ * Original values are restored register-by-register, so the chip is left as
+ * it was found; the receiver is re-initialised on every bring-up anyway.
+ */
+int mz0380_mst3367_wscan(struct mz0380_dev *dev)
+{
+	static const u8 test1 = 0x5a, test2 = 0xa5;
+	unsigned int bank;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+
+	pr_info("%s: writability scan (finding RAM windows; '#' = holds an arbitrary byte)\n",
+		dev->name);
+
+	for (bank = 0; bank <= 3; bank++) {
+		bool ram[256] = { false };
+		unsigned int reg, run_start = 0;
+		unsigned int hits = 0, best = 0, best_start = 0;
+
+		if (mst_bank(dev, bank))
+			continue;
+
+		/*
+		 * Scan the WHOLE file, 0x01..0xff. The first pass stopped at
+		 * 0x80 and bank3's writable run was still going at the edge -
+		 * if it continues to 0xff that is a 128-byte window, exactly
+		 * one EDID block. Reg 0x00 is the bank select: never written.
+		 */
+		for (reg = 1; reg <= 0xff; reg++) {
+			u8 orig = 0, rb1 = 0, rb2 = 0;
+
+			if (mst_rd(dev, reg, &orig))
+				continue;
+			if (mst_wr(dev, reg, test1) ||
+			    mst_rd(dev, reg, &rb1) ||
+			    mst_wr(dev, reg, test2) ||
+			    mst_rd(dev, reg, &rb2)) {
+				mst_wr(dev, reg, orig);
+				continue;
+			}
+			mst_wr(dev, reg, orig);      /* restore immediately */
+
+			if (rb1 == test1 && rb2 == test2) {
+				ram[reg] = true;
+				hits++;
+			}
+		}
+
+		/* report contiguous runs - a RAM window is one long run */
+		for (reg = 1; reg <= 0x100; reg++) {
+			bool is_ram = (reg <= 0xff) && ram[reg];
+
+			if (is_ram && !run_start) {
+				run_start = reg;
+			} else if (!is_ram && run_start) {
+				unsigned int len = reg - run_start;
+
+				if (len >= 8)
+					pr_info("%s: bank%u run 0x%02x-0x%02x (%u bytes)\n",
+						dev->name, bank, run_start,
+						reg - 1, len);
+				if (len > best) {
+					best = len;
+					best_start = run_start;
+				}
+				run_start = 0;
+			}
+		}
+		pr_info("%s: bank%u: %u writable, longest run %u bytes at 0x%02x%s\n",
+			dev->name, bank, hits, best, best_start,
+			best >= 128 ? "  <- EDID-SIZED WINDOW" : "");
+	}
+
+	mst_bank(dev, MST3367_BANK0);
+	pr_info("%s: writability scan done - a long run of '#' is the EDID RAM candidate\n",
+		dev->name);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_wscan);
+
+int mz0380_mst3367_hpd_pulse(struct mz0380_dev *dev, unsigned int count,
+			     unsigned int gap_ms)
+{
+	unsigned int i;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+
+	for (i = 0; i < count; i++) {
+		pr_info("%s: HPD pulse %u/%u: deassert\n",
+			dev->name, i + 1, count);
+		mz0380_mst3367_hpd(dev, false);
+		msleep(gap_ms);
+		pr_info("%s: HPD pulse %u/%u: assert - watch the source now\n",
+			dev->name, i + 1, count);
+		mz0380_mst3367_hpd(dev, true);
+		msleep(gap_ms);
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_hpd_pulse);
+
+int mz0380_mst3367_reload_edid(struct mz0380_dev *dev)
+{
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+	if (!dev->mst3367_ready) {
+		ret = mz0380_mst3367_bringup(dev);
+		return ret;
+	}
+
+	mz0380_mst3367_hpd(dev, false);
+	msleep(200);
+	ret = mz0380_mst3367_load_edid(dev);
+	msleep(100);
+	mz0380_mst3367_hpd(dev, true);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_reload_edid);
+
 int mz0380_mst3367_bringup(struct mz0380_dev *dev)
 {
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
@@ -120,14 +365,356 @@ int mz0380_mst3367_bringup(struct mz0380_dev *dev)
 		return -ENODEV;
 	}
 
+	mz0380_mst3367_select_input(dev);
 	mz0380_mst3367_reset(dev);
 	mz0380_mst3367_init_regs(dev);
+
+	/*
+	 * Present the card as a sink: EDID first, then HPD. Toggle HPD low
+	 * across the load so a source that was already attached re-reads the
+	 * EDID instead of keeping whatever it saw before.
+	 */
+	mz0380_mst3367_hpd(dev, false);
+	if (mz0380_mst3367_load_edid(dev) == 0) {
+		msleep(100);            /* let the source settle before the edge */
+		mz0380_mst3367_hpd(dev, true);
+	} else {
+		pr_warn("%s: continuing without EDID - the source will stay dark\n",
+			dev->name);
+	}
+
 	dev->mst3367_ready = true;
 	pr_info("%s: MST3367 receiver brought up (reset released, init applied)\n",
 		dev->name);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_bringup);
+
+/* --- sink-chain diagnostics ----------------------------------------------- */
+
+/*
+ * M43. "EDID loaded" only means the mailbox accepted the command: the card's
+ * firmware forces the I2C result byte to 0 on a NAK, so a write that never
+ * reached a chip is indistinguishable from a good one at the command layer.
+ * Everything in the sink chain therefore has to be read BACK.
+ *
+ * The EDID read-back is the sharpest probe available: bytes 1..6 of a valid
+ * EDID are 0xff, a value the firmware cannot manufacture on failure (it
+ * forces 0x00). So "header reads ff" proves the DDC EEPROM really holds our
+ * blob; "all zero" proves the writes went nowhere.
+ */
+static int mz0380_gpio_get(struct mz0380_dev *dev, unsigned int pin, u32 *out)
+{
+	u32 params[1] = { 1u << pin };
+	int ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, params, 1,
+				      NULL, 500);
+
+	if (ret)
+		return ret;
+	/* op 0x14 returns the sampled bitmap in PARAM2 (BAR0+0x0c) */
+	*out = !!(mz_mmio_read(dev, MZ0380_MB_PARAM(2)) & (1u << pin));
+	return 0;
+}
+
+/*
+ * M44. Is BANK3 writable RAM (i.e. the EDID store) or just an empty register
+ * shadow? The bank sweep showed banks 0/1/2 full of live config while bank 3
+ * reads all zeros except reg 0x00, which is the bank-select echo - exactly
+ * what an EDID RAM that nobody has loaded would look like.
+ *
+ * Write a walking pattern into a few bank-3 registers, read it back, then put
+ * the zeros back. Registers that return the pattern are RAM; registers that
+ * read back 0 are unimplemented. Reg 0x00 is never touched - it is the bank
+ * select on every bank.
+ */
+int mz0380_mst3367_ramtest(struct mz0380_dev *dev)
+{
+	static const u8 pattern[] = { 0xa5, 0x5a, 0x00, 0xff, 0x12, 0x34,
+				      0x56, 0x78 };
+	unsigned int i;
+	unsigned int hits = 0;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+
+	ret = mst_bank(dev, MST3367_BANK3);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(pattern); i++)
+		mst_wr(dev, 0x10 + i, pattern[i]);
+
+	pr_info("%s: BANK3 RAM test, wrote a5 5a 00 ff 12 34 56 78 at 0x10:\n",
+		dev->name);
+	for (i = 0; i < ARRAY_SIZE(pattern); i++) {
+		u8 v = 0;
+
+		if (mst_rd(dev, 0x10 + i, &v)) {
+			pr_info("%s:   reg 0x%02x: read failed\n",
+				dev->name, 0x10 + i);
+			continue;
+		}
+		pr_info("%s:   reg 0x%02x: wrote %02x read %02x%s\n",
+			dev->name, 0x10 + i, pattern[i], v,
+			v == pattern[i] ? "  <- RAM" : "");
+		if (v == pattern[i] && pattern[i])
+			hits++;
+	}
+
+	/* restore */
+	for (i = 0; i < ARRAY_SIZE(pattern); i++)
+		mst_wr(dev, 0x10 + i, 0x00);
+	mst_bank(dev, MST3367_BANK0);
+
+	pr_info("%s: BANK3 RAM test: %u/%u registers held their value - %s\n",
+		dev->name, hits, (unsigned int)ARRAY_SIZE(pattern) - 1,
+		hits ? "writable, this is a RAM window (EDID candidate)"
+		     : "not writable, bank3 is not the EDID store");
+	return hits ? 0 : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_ramtest);
+
+/*
+ * M45. The connected camera visibly reacts to running the bring-up (its live
+ * preview stops), which is what a camera does when it detects an HDMI sink
+ * and switches its output over. So the source IS responding to our HPD - the
+ * question is whether it then transmits, and if it does, why the receiver
+ * never reports lock.
+ *
+ * Watch the detect block live so a plug/unplug or camera power-cycle can be
+ * correlated with what the chip sees. reg 0x55 is the status byte: bit2..5
+ * (mask 0x3c) are the lock bits the GPL driver gates on, and we consistently
+ * read 0x03 - bits the driver does not use, most plausibly 5V/clock presence.
+ * If those low bits track the cable while the timing counters stay idle, the
+ * source is attached but not transmitting; if the counters come alive, the
+ * receiver is seeing TMDS and the fault is in its configuration.
+ */
+int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
+{
+	unsigned long end;
+	u8 last[8];
+	bool first = true;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY)
+		return -ENODEV;
+	if (!dev->mst3367_ready)
+		mz0380_mst3367_bringup(dev);
+
+	pr_info("%s: watching MST3367 detect for %us - plug/unplug or power-cycle the source now\n",
+		dev->name, secs);
+	end = jiffies + secs * HZ;
+
+	while (time_before(jiffies, end)) {
+		static const u8 regs[] = { 0x55, 0x5f, 0x57, 0x58, 0x59,
+					   0x5a, 0x6a, 0x6b };
+		u8 now[ARRAY_SIZE(regs)];
+		unsigned int i;
+		bool changed = false;
+
+		if (mst_bank(dev, MST3367_BANK0))
+			break;
+		for (i = 0; i < ARRAY_SIZE(regs); i++) {
+			now[i] = 0;
+			mst_rd(dev, regs[i], &now[i]);
+			if (first || now[i] != last[i])
+				changed = true;
+		}
+
+		if (changed) {
+			pr_info("%s: detect 55=%02x %s | 5f=%02x hper=%02x%02x vper=%02x%02x htot=%02x%02x\n",
+				dev->name, now[0],
+				(now[0] & MST3367_B0_DETECT_LOCK_MASK) ?
+					"LOCKED" : "no-lock",
+				now[1], now[2], now[3], now[4], now[5],
+				now[6], now[7]);
+			memcpy(last, now, sizeof(last));
+			first = false;
+		}
+		msleep(250);
+	}
+
+	pr_info("%s: watch done\n", dev->name);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_watch);
+
+void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m)
+{
+	static const struct { const char *name; unsigned int pin; } pins[] = {
+		{ "hpd      ", MZ0380_GPIO_HPD },
+		{ "rx_enable", MZ0380_GPIO_RX_ENABLE },
+		{ "rx_strap ", MZ0380_GPIO_RX_STRAP },
+		{ "rx_reset ", MZ0380_GPIO_RX_RESET },
+	};
+	unsigned int i;
+	u8 v;
+
+	seq_printf(m, "%s: fw %s, receiver %s\n", dev->name,
+		   mz0380_fw_state_name(dev->fw_state),
+		   dev->mst3367_ready ? "brought up" : "NOT brought up");
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		seq_puts(m, "  (firmware not ready - nothing else can be probed)\n");
+		return;
+	}
+
+	seq_puts(m, "  GPIO read-back (op 0x14):\n");
+	for (i = 0; i < ARRAY_SIZE(pins); i++) {
+		u32 level = 0;
+		int ret = mz0380_gpio_get(dev, pins[i].pin, &level);
+
+		if (ret)
+			seq_printf(m, "    %s pin%-2u : read failed (%d)\n",
+				   pins[i].name, pins[i].pin, ret);
+		else
+			seq_printf(m, "    %s pin%-2u : %u\n",
+				   pins[i].name, pins[i].pin, level);
+	}
+
+	seq_puts(m, "  EDID read-back from DDC 0xA0 (bytes 1..6 must be ff):\n    ");
+	for (i = 0; i < 8; i++) {
+		u32 b = 0;
+
+		if (mz0380_periph_read(dev, MZ0380_EDID_I2C_DEV, i, &b))
+			seq_puts(m, "?? ");
+		else
+			seq_printf(m, "%02x ", b & 0xff);
+	}
+	seq_puts(m, "\n");
+
+	/*
+	 * M43: the receiver answers at 0x9c but 0xA0 read back all zeros, so
+	 * either nothing lives at the EDID address on this bus or the EEPROM
+	 * is gated behind the receiver's DDC. Probe the addresses the Windows
+	 * driver knows about: a non-zero byte proves a device is there,
+	 * because the firmware forces 0x00 when nobody ACKs.
+	 */
+	/*
+	 * Reading a single register is not enough to call an address dead:
+	 * reg 0x00 on the main bank is the bank-select and legitimately reads
+	 * back 0. Sample a few registers per address and treat "any non-zero"
+	 * as present (the firmware forces 0x00 when nobody ACKs).
+	 */
+	seq_puts(m, "  I2C presence scan (regs 00/01/02/7f; any non-zero = present):\n");
+	{
+		/*
+		 * 0xaa: the board also carries a small Nuvoton "EDID MCU" -
+		 * the doc calls it "the EEPROM the HDMI source reads" - and
+		 * our own RE noted an MCU passthrough slave at 0xaa. If the
+		 * EDID lives there, that is what has to be programmed.
+		 */
+		static const u8 addrs[] = { 0x9c, 0xa0, 0xa2, 0xa4, 0xa6,
+					    0xa8, 0xaa, 0x88, 0x98, 0x60,
+					    0x90, 0x94, 0x74, 0xb0 };
+		static const u8 probe[] = { 0x00, 0x01, 0x02, 0x7f };
+
+		for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+			unsigned int j;
+			bool any = false;
+
+			seq_printf(m, "    %02x:", addrs[i]);
+			for (j = 0; j < ARRAY_SIZE(probe); j++) {
+				u32 b = 0;
+
+				if (mz0380_periph_read(dev, addrs[i], probe[j],
+						       &b)) {
+					seq_puts(m, " ??");
+					continue;
+				}
+				seq_printf(m, " %02x", b & 0xff);
+				any |= !!(b & 0xff);
+			}
+			seq_puts(m, any ? "   <- present\n" : "\n");
+		}
+	}
+
+	/*
+	 * Hunt for the EDID. It is not at the DDC EEPROM address on this bus,
+	 * so it is most likely served out of the receiver's internal EDID RAM.
+	 * Dump the first 8 bytes from every address that answered: whichever
+	 * window shows the EDID signature 00 ff ff ff ff ff ff 00 is the one
+	 * to write the blob into.
+	 */
+	seq_puts(m, "  EDID signature hunt (looking for 00 ff ff ff ff ff ff 00):\n");
+	{
+		static const u8 addrs[] = { 0x98, 0xaa, 0xa8, 0xa2, 0x88,
+					    0x90, 0x94, 0x60 };
+		unsigned int j;
+
+		for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+			seq_printf(m, "    %02x:", addrs[i]);
+			for (j = 0; j < 8; j++) {
+				u32 b = 0;
+
+				if (mz0380_periph_read(dev, addrs[i], j, &b))
+					seq_puts(m, " ??");
+				else
+					seq_printf(m, " %02x", b & 0xff);
+			}
+			seq_puts(m, "\n");
+		}
+	}
+
+	/*
+	 * The bus holds only 0x9c and 0x98 - no EEPROM, no MCU - so the EDID
+	 * must live inside the receiver. The GPL reference says the chip has
+	 * FOUR banks (0..3) with a 256-byte shadow each, and we have only ever
+	 * used 0/1/2: bank 3 is unexplored and is the natural home for EDID
+	 * RAM. Dump the head of every bank on both slaves and look for the
+	 * signature.
+	 */
+	seq_puts(m, "  bank sweep, first 16 bytes of each bank (EDID RAM hunt):\n");
+	{
+		static const u8 slaves[] = { MST3367_I2C_DEV, 0x98 };
+		unsigned int s, bank, j;
+
+		for (s = 0; s < ARRAY_SIZE(slaves); s++) {
+			for (bank = 0; bank <= 3; bank++) {
+				if (mz0380_periph_write(dev, slaves[s],
+							MST3367_REG_BANK_SELECT,
+							bank))
+					continue;
+				seq_printf(m, "    %02x bank%u:", slaves[s],
+					   bank);
+				for (j = 0; j < 16; j++) {
+					u32 b = 0;
+
+					if (mz0380_periph_read(dev, slaves[s],
+							       j, &b))
+						seq_puts(m, " ??");
+					else
+						seq_printf(m, " %02x",
+							   b & 0xff);
+				}
+				seq_puts(m, "\n");
+			}
+		}
+		mst_bank(dev, MST3367_BANK0);   /* leave the chip on bank 0 */
+	}
+
+	seq_puts(m, "  MST3367 BANK0 regs (all-zero column = bus NAK, not real values):\n");
+	if (mst_bank(dev, MST3367_BANK0)) {
+		seq_puts(m, "    bank select failed - receiver I2C is dead\n");
+		return;
+	}
+	{
+		static const u8 regs[] = { 0x55, 0x5f, 0x6a, 0x6b, 0x59, 0x5a,
+					   0xb0, 0xb7, 0xb8, 0x51 };
+
+		seq_puts(m, "    ");
+		for (i = 0; i < ARRAY_SIZE(regs); i++) {
+			if (mst_rd(dev, regs[i], &v))
+				seq_printf(m, "%02x=?? ", regs[i]);
+			else
+				seq_printf(m, "%02x=%02x ", regs[i], v);
+		}
+		seq_puts(m, "\n");
+	}
+	seq_puts(m, "  reg 0x55 & 0x3c == 0x3c means locked; 0x00 across the row means\n"
+		    "  the receiver is not answering at all (check reset/power, not EDID).\n");
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_diag);
 
 /* --- signal detect -------------------------------------------------------- */
 

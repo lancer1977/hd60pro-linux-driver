@@ -193,11 +193,51 @@
  * space is banked: write reg 0x00 = bank before touching a banked register.
  * Register roles + detect math: RE_FINDINGS.md M15 + docs/re-2026-07-05/.
  */
+/*
+ * Multi-byte ("combo") I2C transfer - the opcode the Windows driver uses for
+ * EDID (i2c_combo_cmd_x). Frame, from docs/re-2026-07-05/HD60-PRO-LINUX-
+ * DRIVER.md §3d item 3 (both-sides disassembly):
+ *   cmd[4] = dev8, cmd[5] = rw, cmd[6..7] = len, cmd[8..] = payload
+ * i.e. PARAM1 = dev8 | (rw << 8) | (len << 16), PARAM2.. = payload bytes
+ * packed little-endian. The card chunks the transfer into 16-byte pieces
+ * internally.
+ *
+ * M43: the earlier code used 0x1f here. That opcode is read_s/write_s, whose
+ * bus assignment our two RE sources disagree on, and it left the EDID EEPROM
+ * untouched (read-back was all zeros on hardware). 0x20 is the one both
+ * sources agree on.
+ *
+ * A write to an I2C EEPROM carries its target offset as the first payload
+ * byte, so a 32-byte chunk is a 33-byte transfer.
+ */
+#define MZ0380_CMD_I2C_COMBO            0x20
+#define MZ0380_I2C_COMBO_WRITE          0
+#define MZ0380_I2C_COMBO_READ           1
+#define MZ0380_EDID_I2C_DEV             0xa0
+#define MZ0380_EDID_CHUNK               32
+#define MZ0380_EDID_SIZE                256
+
 #define MST3367_I2C_DEV                 0x9c
 #define MST3367_REG_BANK_SELECT         0x00
 #define MST3367_BANK0                   0x00
 #define MST3367_BANK1                   0x01
 #define MST3367_BANK2                   0x02
+/*
+ * BANK3 exists per the GPL driver ("256-byte register shadow per bank",
+ * BANK0..BANK3) but neither that driver nor our RE ever writes it. On
+ * hardware it reads all zeros apart from the bank-select echo at reg 0x00,
+ * while banks 0-2 are full of live config - the shape of an EDID RAM that
+ * has never been loaded (M44).
+ */
+#define MST3367_BANK3                   0x03
+/*
+ * BANK0 0xb7 is the receiver's HPD/link enable (hdcapm: bit1 clear = HPD on).
+ * The init sequence parks it at 0x02 (off) while configuring; the driver
+ * raises HPD only after the EDID is in place.
+ */
+#define MST3367_B0_HPD                  0xb7
+#define MST3367_B0_HPD_ON               0x00
+#define MST3367_B0_HPD_OFF              0x02
 /* BANK0 mode-detect block */
 #define MST3367_B0_DETECT               0x55  /* signal present if (v & 0x3c)  */
 #define MST3367_B0_DETECT_LOCK_MASK     0x3c
@@ -253,16 +293,64 @@
 #define MZ0380_CMD_SET_BUF_4            0x04
 #define MZ0380_CMD_SET_BUF_5            0x05
 #define MZ0380_CMD_SET_BUF_8            0x08
-#define MZ0380_CMD_STOP_STREAMING       0x2a  /* STOP_STREAMING(fw) - M17      */
+/*
+ * M33, from video_capture_mgr's own dispatch (it preads the 44-byte command and
+ * switches on word 0):
+ *     cmp #7  -> STOP_STREAMING     cmp #41 (0x29) -> SET_VIC
+ *     cmp #42 -> SET_AIC_PARAMS
+ * So STOP is op 7 - right next to START (op 6) - and 0x2a, which M17 guessed
+ * was STOP, is actually the audio-parameter command. We had been sending
+ * SET_AIC with an all-zero payload (i.e. "audio off") at every streamoff, and
+ * never issuing a stop at all.
+ */
+#define MZ0380_CMD_STOP_STREAMING       0x07  /* was 0x2a (wrong) - M33        */
+
+/*
+ * SET_AIC_PARAMS. Field offsets recovered from video_capture_mgr's printf
+ * ("Set AIC PARAMS-> bits, channel_num, mono, freq, frame_num_of_period,
+ * period_num_of_buffer, on") by following the ARM vararg registers/stack, and
+ * cross-checked against the Windows driver's "ai=%d, chs=%d, bits=%d, freq=%d,
+ * period=%d.%d, is_aic_on=%d, aic_int_mode=%d". Offsets are into the card's
+ * command buffer, where cmd+N == BAR0 + 4 + N == our PARAM((N/4)):
+ *     cmd+4  u8  channel_num       cmd+5  u8  mono
+ *     cmd+6  u16 bits              cmd+8  u32 freq
+ *     cmd+12 u16 frame_num_of_period
+ *     cmd+14 u16 period_num_of_buffer
+ *     cmd+16 u8  on                cmd+17 u8  aic_int_mode (ep.ko G[0x63c])
+ * on=1 makes video_capture_mgr run "echo '1' > /sys/audio_status/audio_ready",
+ * which is what tinyvenc5's is_nosg path blocks on before it will ACK
+ * START_STREAMING and start completing frames (M33).
+ */
+#define MZ0380_CMD_SET_AIC_PARAMS       0x2a  /* 42: audio params + on flag    */
 
 /* BAR0 frame-completion status window (M17). EVENT is MZ0380_MB_EVENT (0x30). */
 #define MZ0380_MB_FRAME_TOKEN           0x40  /* (token & 7) = buffer index    */
 #define MZ0380_MB_ENC_STATUS            0x50  /* +N = per-channel status byte  */
+/*
+ * M40: that byte is the card's /sys/vpl_pciep/enc_stat<idx> (idx = ch*2 +
+ * stream), and it is a HANDSHAKE, not a status report. Per frame the encoder
+ * preads it: 0 = "host has consumed the last bitstream, encode another",
+ * 1 = busy (retries 10x then skips the frame), 2 = skip. After DMAing a
+ * bitstream the CARD writes 1 - and nothing card-side ever writes it back to
+ * 0. Only the host can (ep.ko's encode_status_storeN backs this same byte),
+ * so the host must clear it to acknowledge each consumed frame or the encoder
+ * stops producing after one.
+ */
+#define MZ0380_MB_ENC_STAT_IDX(ch, stream)  ((ch) * 2 + (stream))
+#define MZ0380_MB_ENC_STAT_FREE         0     /* host ack: buffer consumed     */
 
 /* First-cut streaming geometry (video channel 0). Tunable once frames flow. */
 #define MZ0380_STREAM_VIDEO_CHANNEL     0
 #define MZ0380_STREAM_NR_BUFS           4     /* 4 phys pairs per SET_BUF cmd  */
-#define MZ0380_STREAM_BUF_SIZE          0x80000  /* 512 KiB per H.264 frame    */
+/*
+ * M29: 512 KiB was too small - the card streamed straight past the end of the
+ * buffer and the overrun was what produced every IOMMU fault from M26 on (the
+ * writes INSIDE the buffer had been succeeding silently all along). 4 MiB is
+ * one alloc_pages order-10 block, and comfortably over an uncompressed
+ * 1920x1080 NV12 frame (~3.1 MiB) as well as any sane H.264 access unit. The
+ * card's outbound aperture is 32 MiB total, so 4 x 4 MiB still fits.
+ */
+#define MZ0380_STREAM_BUF_SIZE          0x400000 /* 4 MiB per frame buffer     */
 #define MZ0380_STREAM_BUF_STRIDE        MZ0380_STREAM_BUF_SIZE
 
 /*

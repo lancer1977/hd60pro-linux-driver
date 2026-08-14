@@ -637,6 +637,25 @@ static int mz0380_start_streaming(struct vb2_queue *vq, unsigned int count)
 		return -ENODEV;
 	}
 
+	/*
+	 * Real capture is driven by whatever the receiver is actually locked
+	 * to, so re-detect here: SET_VIC carries the geometry AND the frame
+	 * rate down to the card, and a stale timing would arm the encoder for
+	 * the wrong cadence. The fake-frame generator ignores the input, so a
+	 * lock failure is only fatal for the real path.
+	 */
+	if (!mz0380_stream_nosg) {
+		struct v4l2_dv_timings live;
+
+		ret = mz0380_query_signal(dev, &live);
+		if (ret) {
+			dev_warn(&dev->pci->dev,
+				 "no HDMI signal locked (%d) - check the source, HPD and EDID load\n",
+				 ret);
+			return ret;
+		}
+	}
+
 	ret = mz0380_dma_start(dev);
 	if (ret) {
 		dev_err(&dev->pci->dev,

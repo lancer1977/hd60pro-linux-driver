@@ -293,12 +293,31 @@ struct mz0380_dev {
 	 * frames into these host buffers via its iATU outbound window; we hand
 	 * their physaddrs over with the buffer-setter mailbox opcodes. The
 	 * completion EVENT carries the finished buffer index in (token & 7).
+	 *
+	 * M26: the card can only be told the HIGH 32 bits of that address
+	 * (ELBI 0x54, the low half, is ignored by the hardware - proven on hw),
+	 * so each buffer is placed at its own 4 GiB-aligned IOVA by an explicit
+	 * iommu_map. @pages is the backing allocation for that path (NULL when
+	 * the buffer came from dma_alloc_coherent instead).
 	 */
 	struct mz0380_stream_buf {
 		void *va;
 		dma_addr_t dma;
+		struct page *pages;
 	} stream_bufs[MZ0380_STREAM_NR_BUFS];
 	u32 stream_head;	/* next buffer index we expect from the card */
+
+	// pattern-check: skip plain diagnostic fields on an existing struct
+	/*
+	 * M36 write-extent watch. The buffers are poisoned with 0xAA at stream
+	 * start so that card-written ZEROS become visible (the fake frame's
+	 * trailing padding is zeros, which the old non-zero sampling could not
+	 * see). A kthread then tracks, per buffer, the byte offset up to which
+	 * the poison has been overwritten - giving the true transfer extent
+	 * and its progress over time (crawl vs stall, exact stop offset).
+	 */
+	struct task_struct *extent_task;
+	size_t extent_last[MZ0380_STREAM_NR_BUFS];
 
 	/* vb2 video streaming */
 	struct vb2_queue vb_queue;
@@ -495,6 +514,7 @@ int mz0380_dma_setup(struct mz0380_dev *dev);
 void mz0380_dma_teardown(struct mz0380_dev *dev);
 int mz0380_dma_start(struct mz0380_dev *dev);
 void mz0380_dma_stop(struct mz0380_dev *dev);
+void mz0380_extent_repoison(struct mz0380_dev *dev);	/* M38 */
 int mz0380_dma_ring_alloc(struct mz0380_dev *dev, struct mz0380_ring *r,
 			  u32 nr_entries, u32 entry_size);
 void mz0380_dma_ring_free(struct mz0380_dev *dev, struct mz0380_ring *r);
@@ -509,6 +529,13 @@ void mz0380_signal_event(struct mz0380_dev *dev);
 // pattern-check: skip two function prototypes, procedural module, no abstraction
 /* MST3367 receiver bring-up + signal detect (mz0380-mst3367.c) */
 int mz0380_mst3367_bringup(struct mz0380_dev *dev);
+void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m);
+int mz0380_mst3367_ramtest(struct mz0380_dev *dev);	/* M44 */
+int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs);	/* M45 */
+int mz0380_mst3367_reload_edid(struct mz0380_dev *dev);	/* M47 */
+int mz0380_mst3367_wscan(struct mz0380_dev *dev);	/* M49 */
+int mz0380_mst3367_hpd_pulse(struct mz0380_dev *dev, unsigned int count,
+			     unsigned int gap_ms);	/* M48 */
 int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			       struct v4l2_dv_timings *out);
 
@@ -528,6 +555,23 @@ extern bool mz0380_firmware_upload_enabled;
 extern bool mz0380_enable_dma;
 extern unsigned int mz0380_start_delay_ms;
 extern bool mz0380_stream_nosg;
+extern bool mz0380_buf_pair_swap;
+extern bool mz0380_dma_iova_remap;
+extern unsigned long long mz0380_dma_iova_base;
+extern unsigned long long mz0380_dma_iova_offset;
+extern unsigned int mz0380_set_buf_stride;
+extern unsigned int mz0380_card_frame_offset;
+extern bool mz0380_probe_windows;
+extern unsigned int mz0380_edid_opcode;
+extern unsigned int mz0380_edid_timeout_ms;
+extern bool mz0380_buf_poison;
+extern unsigned int mz0380_poison_byte;
+extern bool mz0380_aic_on;
+extern unsigned int mz0380_aic_channels;
+extern unsigned int mz0380_aic_bits;
+extern unsigned int mz0380_aic_freq;
+extern unsigned int mz0380_aic_period_frames;
+extern unsigned int mz0380_aic_periods;
 extern bool mz0380_dma_handshake;
 extern bool mz0380_enable_audio;
 extern unsigned int mz0380_video_ring_entries;

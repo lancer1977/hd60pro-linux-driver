@@ -81,6 +81,25 @@ module_param(event_auto_ack, bool, 0644);
 MODULE_PARM_DESC(event_auto_ack,
 		 "/proc/mz0380-events watcher: ack each recorded event (rearm the card for the next edge). Turn off to capture a single sticky event without acking. Default true");
 
+/*
+ * M35. store_channel_done writes the token words (BAR0+0x40/44/48/4c, and the
+ * encoder status at 0x50) UNGATED, while EVENT[0x30]+MSI sit behind the
+ * one-shot msi_enable credit that only our ack doorbell re-arms. So the token
+ * words are the honest witness of card-side frame completion: the watcher
+ * thread logs every change it sees in them (only meaningful while the watcher
+ * runs - "echo start > /proc/mz0380-events").
+ *
+ * credit_kick_ms > 0 additionally fires the full ack sequence (BAR5[0xdc]=2,
+ * EVENT=0, doorbell 0x400 -> card pciep_isr_clrint -> msi_enable=1) on that
+ * period, re-arming the credit even when no MSI ever arrives. If frame tokens
+ * only start moving (or MSIs appear) once this is on, the blocker was a dead
+ * credit, not a parked encoder.
+ */
+static unsigned int credit_kick_ms;
+module_param(credit_kick_ms, uint, 0644);
+MODULE_PARM_DESC(credit_kick_ms,
+		 "M35 watcher: period in ms for unconditional ack/credit-re-arm kicks (BAR5[0xdc]=2, EVENT=0, doorbell 0x400); 0 = off (default). Live-tunable via /sys/module/mz0380/parameters/");
+
 static bool allow_experimental_writes;
 module_param(allow_experimental_writes, bool, 0644);
 MODULE_PARM_DESC(allow_experimental_writes,
@@ -246,6 +265,198 @@ bool mz0380_stream_nosg;
 module_param_named(stream_nosg, mz0380_stream_nosg, bool, 0644);
 MODULE_PARM_DESC(stream_nosg,
 		 "SET_VIC is_nosg flag: 1 = force the card's fake-frame (test-pattern) generator, bypassing real BT1120 capture; diagnostic bisection lever (def:0)");
+
+/*
+ * M25 probe. op2 hands the card 8-byte channels[] slots; pcie_set_outbound
+ * (ep.ko 0x5a8) then does ELBI[0x58] = slot word0, ELBI[0x54] = slot word1.
+ * Default packing is {word0=high32, word1=low32}, which is what the firmware
+ * intends (0x58=high, 0x54=low). M24 showed the resulting DMA target is
+ * (word0 << 32) + aperture_offset with the low half always 0, i.e. word1 never
+ * reaches the hardware. Setting this swaps the pair to {word0=low32,
+ * word1=high32} so the fault address tells us which reading is true:
+ *   fault at (low32 << 32)  -> only word0 lands; ELBI 0x54 is ignored by the
+ *                              HW (the real outbound low target is elsewhere,
+ *                              likely 0x84) -> take the 4GB-aligned-IOVA route.
+ *   fault at the correct 64-bit address, or frames land -> both words land and
+ *                              the earlier low32 loss was ours.
+ * Diagnostic only; leave off for normal operation. Writable at runtime.
+ */
+bool mz0380_buf_pair_swap;
+module_param_named(buf_pair_swap, mz0380_buf_pair_swap, bool, 0644);
+MODULE_PARM_DESC(buf_pair_swap,
+		 "M25 probe: swap the op2 channels[] slot word order to {low32, high32} (def:0 = {high32, low32})");
+
+/*
+ * M26. The M25 probe proved the card's outbound window takes only the HIGH
+ * 32 bits of the host target: host_addr == (slot word0 << 32) + aperture
+ * offset, with the low half (ELBI 0x54) dropped on the floor by the hardware.
+ * The only way to make that address land in one of our buffers is to put the
+ * buffer at an IOVA whose low 32 bits are zero, i.e. 4 GiB-aligned. So we
+ * allocate the stream buffers as plain pages and iommu_map() each one at
+ * dma_iova_base + (i << 32), then hand the card word0 = IOVA >> 32, word1 = 0.
+ *
+ * Requires a translating IOMMU domain (AMD-Vi/Intel VT-d in DMA mode - not
+ * iommu=pt / iommu=off). Base must be 4 GiB-aligned; it is chosen low and far
+ * from where the DMA-API's IOVA allocator hands out addresses (near the top of
+ * the domain aperture), and every mapping is checked for a collision first.
+ */
+bool mz0380_dma_iova_remap = true;
+module_param_named(dma_iova_remap, mz0380_dma_iova_remap, bool, 0644);
+MODULE_PARM_DESC(dma_iova_remap,
+		 "M26: place each stream buffer at its own 4GiB-aligned IOVA via iommu_map, so the card's high32-only outbound target lands in it (def:1)");
+
+unsigned long long mz0380_dma_iova_base = 0x100000000ULL;
+module_param_named(dma_iova_base, mz0380_dma_iova_base, ullong, 0644);
+MODULE_PARM_DESC(dma_iova_base,
+		 "M26: base IOVA for the remapped stream buffers, must be 4GiB-aligned; buffer i lands at base + (i << 32) (def:0x100000000)");
+
+/*
+ * M27. With the 4GiB-aligned IOVA in place the card's writes landed at
+ * (word0 << 32) + 0x80000 - one SET_BUF stride past the window base, i.e.
+ * host_addr = (word0 << 32) + bufindex * stride, with the card starting at
+ * bufindex 2. Two runtime knobs to pin that down without a rebuild:
+ *   set_buf_stride  - the stride word in SET_BUF (cmd[0x8]). If the offset is
+ *                     bufindex*stride, 0 here should drag the writes down onto
+ *                     the buffer base.
+ *   dma_iova_offset - shifts every mapping up by this much, so the buffer sits
+ *                     exactly where the card writes instead. Set it to the
+ *                     observed offset (0x80000) if the stride knob does not
+ *                     move the writes.
+ * Exactly one of the two should be needed. Both are diagnostics until the hw
+ * says which; the winner becomes the default.
+ */
+unsigned long long mz0380_dma_iova_offset;
+module_param_named(dma_iova_offset, mz0380_dma_iova_offset, ullong, 0644);
+MODULE_PARM_DESC(dma_iova_offset,
+		 "M27: shift each remapped stream buffer up by this many bytes within its 4GiB slot, to meet the card's aperture offset (def:0)");
+
+unsigned int mz0380_set_buf_stride = MZ0380_STREAM_BUF_STRIDE;
+module_param_named(set_buf_stride, mz0380_set_buf_stride, uint, 0644);
+MODULE_PARM_DESC(set_buf_stride,
+		 "M27: the stride word sent in SET_BUF cmd[0x8]; the card appears to place buffer n at aperture offset n*stride (def:0x80000)");
+
+/*
+ * M29. Final model, and every hw data point fits it:
+ *
+ *     host_addr = ((word0 << 32) | word1) + aperture_offset
+ *
+ * where aperture_offset starts at 0 and the low half adds MOD 2^32 (no carry
+ * into word0). The "0x80000 offset" chased in M27/M28 was not an offset at
+ * all: it was the card running off the END of a 512 KiB buffer. Writes inside
+ * the mapping succeed silently, so the first fault appears one buffer-size in,
+ * which looked exactly like a constant offset. M28 advertised base while
+ * mapping base+0x80000, left the advertised address unmapped, and faulted at
+ * offset 0 - which is what exposed the mistake.
+ *
+ * So: advertise the buffer base as-is (offset 0), and make the buffers big
+ * enough for whatever the card streams. This knob stays as a runtime escape
+ * hatch, defaulting to 0.
+ */
+unsigned int mz0380_card_frame_offset;
+module_param_named(card_frame_offset, mz0380_card_frame_offset, uint, 0644);
+MODULE_PARM_DESC(card_frame_offset,
+		 "M29: bytes the card adds to the advertised target before writing a frame; buffers are mapped this far above the address sent in SET_BUF. Measured 0 on hw (def:0)");
+
+/*
+ * M32. A raw frame lands in window0 buf0, but the card never signals
+ * channel_done. ep.ko's delivery path is not the gate: command-done and
+ * frame-done share one re-arm token (msi.constprop.1 / store_channel_done both
+ * bail when it is 0, and pciep_isr_clrint sets it), and our command MSIs prove
+ * that token cycles correctly. So the card's userspace is not declaring a
+ * finished frame - most likely the encoder's bitstream destination is one of
+ * the outbound windows we have never programmed (op2 only fills window0).
+ * This sends the other windows' buffer-setter opcodes too, pointed at the three
+ * buffers the card is currently ignoring, to find which window wakes up.
+ */
+bool mz0380_probe_windows;
+module_param_named(probe_windows, mz0380_probe_windows, bool, 0644);
+MODULE_PARM_DESC(probe_windows,
+		 "M32 probe: also program outbound windows 1-3 (op 0x04/0x05/0x03) pointing at stream bufs 1/2/3, to find where the encoder writes its bitstream (def:0)");
+
+/*
+ * M36. The fake frame's payload is a constant 0x11 fill followed by ZERO
+ * padding, and the old buffer sampling only looked for non-zero bytes - so
+ * neither repeated frames nor the true end of the card's write burst were
+ * visible. Poisoning the buffers with 0xAA before START makes every
+ * card-written byte (including zeros) detectable; a kthread in mz0380-dma.c
+ * then tracks the write extent per buffer over time (crawl vs stall, exact
+ * stop offset - M35 measured the visible stop at 0x30a000 = 1556 x 0x800
+ * DMAC chunks, but zeros beyond it were invisible).
+ */
+/*
+ * M47. The EDID push with the combo opcode returned -110 (our own timeout)
+ * while every following command still worked, so the mailbox was not wedged -
+ * the card simply never posted a completion for it. That is the same
+ * fire-and-forget shape as START_STREAMING (op 6, M22), where waiting for a
+ * cmd-done that the firmware never sends produced a bogus -ETIMEDOUT.
+ *
+ * Since we cannot verify the EDID by read-back (nothing answers at the DDC
+ * address on this bus), the real oracle is the source itself: a camera
+ * switches to HDMI output once it can read a valid EDID. So make the opcode
+ * and the wait tunable and let a sweep find the combination that wakes it.
+ */
+unsigned int mz0380_edid_opcode = MZ0380_CMD_I2C_COMBO;
+module_param_named(edid_opcode, mz0380_edid_opcode, uint, 0644);
+MODULE_PARM_DESC(edid_opcode,
+		 "M47: mailbox opcode used to push the EDID (def 0x20 combo; try 0x1f/0x1e write_s variants)");
+
+unsigned int mz0380_edid_timeout_ms;
+module_param_named(edid_timeout_ms, mz0380_edid_timeout_ms, uint, 0644);
+MODULE_PARM_DESC(edid_timeout_ms,
+		 "M47: ms to wait for an EDID chunk to complete; 0 = fire-and-forget (default, the card posts no completion for this op)");
+
+bool mz0380_buf_poison = true;
+module_param_named(buf_poison, mz0380_buf_poison, bool, 0644);
+MODULE_PARM_DESC(buf_poison,
+		 "M36: fill stream buffers with a poison byte before START and track the card's write extent over time (def:1)");
+
+/*
+ * M37 follow-up: the hole map found EXACTLY one 4-byte hole at 0x6d384,
+ * reproducible at the same offset across runs. A deterministic single-dword
+ * hole is at least as likely to be the frame DATA containing the poison
+ * word (collision) as a lost write. Running twice with two different poison
+ * bytes discriminates: a real un-written hole stays put; a collision moves
+ * or disappears.
+ */
+unsigned int mz0380_poison_byte = 0xaa;
+module_param_named(poison_byte, mz0380_poison_byte, uint, 0644);
+MODULE_PARM_DESC(poison_byte,
+		 "M37: poison byte value for buf_poison (def 0xaa; re-run with e.g. 0x55 to tell a real write hole from a data-equals-poison collision)");
+
+/*
+ * M33. The card's encoder will not complete a frame until audio is declared
+ * ready. tinyvenc5's is_nosg path waits on /sys/audio_status/audio_ready, and
+ * the only writer of that file is video_capture_mgr's SET_AIC_PARAMS (op 0x2a)
+ * handler, which runs "echo '1' > /sys/audio_status/audio_ready" when the
+ * command's on byte is set. So we send SET_AIC(on=1) just before START.
+ * The rest of the fields are ordinary PCM geometry; they are parameters rather
+ * than constants because nothing yet tells us the card validates them, and a
+ * mismatch with the real I2S setup is a plausible future suspect.
+ */
+bool mz0380_aic_on = true;
+module_param_named(aic_on, mz0380_aic_on, bool, 0644);
+MODULE_PARM_DESC(aic_on,
+		 "M33: send SET_AIC_PARAMS(on=1) before START, releasing the encoder's audio_ready gate (def:1)");
+
+unsigned int mz0380_aic_channels = 2;
+module_param_named(aic_channels, mz0380_aic_channels, uint, 0644);
+MODULE_PARM_DESC(aic_channels, "M33: SET_AIC channel_num (def:2)");
+
+unsigned int mz0380_aic_bits = 16;
+module_param_named(aic_bits, mz0380_aic_bits, uint, 0644);
+MODULE_PARM_DESC(aic_bits, "M33: SET_AIC bits per sample (def:16)");
+
+unsigned int mz0380_aic_freq = 48000;
+module_param_named(aic_freq, mz0380_aic_freq, uint, 0644);
+MODULE_PARM_DESC(aic_freq, "M33: SET_AIC sample rate (def:48000)");
+
+unsigned int mz0380_aic_period_frames = 1024;
+module_param_named(aic_period_frames, mz0380_aic_period_frames, uint, 0644);
+MODULE_PARM_DESC(aic_period_frames, "M33: SET_AIC frame_num_of_period (def:1024)");
+
+unsigned int mz0380_aic_periods = 4;
+module_param_named(aic_periods, mz0380_aic_periods, uint, 0644);
+MODULE_PARM_DESC(aic_periods, "M33: SET_AIC period_num_of_buffer (def:4)");
 
 /*
  * M4 diagnostic: enable bus mastering + MSI/ISR BEFORE firmware load, but do
@@ -3134,11 +3345,49 @@ static void mz0380_event_record(struct mz0380_dev *dev, u32 event)
 
 static int mz0380_event_thread(void *data)
 {
+	static const u16 tok_reg[5] = { 0x40, 0x44, 0x48, 0x4c, 0x50 };
 	struct mz0380_dev *dev = data;
+	u64 tok_changes[5] = { 0 };
+	u32 tok_last[5];
+	bool tok_valid = false;
+	unsigned long next_print = jiffies;
+	unsigned long next_kick = jiffies;
+	unsigned int kicks = 0;
 	u32 last = 0;
+	unsigned int i;
 
 	while (!kthread_should_stop()) {
+		u32 tok[5];
+		bool tok_diff = false;
 		u32 event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+
+		/* M35: token words are written ungated by store_channel_done */
+		for (i = 0; i < ARRAY_SIZE(tok_reg); i++) {
+			tok[i] = mz_mmio_read(dev, tok_reg[i]);
+			if (tok_valid && tok[i] != tok_last[i]) {
+				tok_diff = true;
+				tok_changes[i]++;
+			}
+			tok_last[i] = tok[i];
+		}
+		if (tok_diff && time_after_eq(jiffies, next_print)) {
+			pr_info("%s: live token EVENT=%08x tok40=%08x 44=%08x 48=%08x 4c=%08x enc50=%08x\n",
+				dev->name, event, tok[0], tok[1], tok[2],
+				tok[3], tok[4]);
+			next_print = jiffies + HZ / 20;
+		}
+		tok_valid = true;
+
+		if (credit_kick_ms &&
+		    time_after_eq(jiffies, next_kick)) {
+			mutex_lock(&dev->cmd_lock);
+			mz0380_mb_ack_event(dev);
+			mutex_unlock(&dev->cmd_lock);
+			kicks++;
+			pr_info("%s: credit kick #%u (ack sequence fired)\n",
+				dev->name, kicks);
+			next_kick = jiffies + msecs_to_jiffies(credit_kick_ms);
+		}
 
 		if (event && event != last) {
 			/*
@@ -3160,6 +3409,9 @@ static int mz0380_event_thread(void *data)
 		}
 		usleep_range(event_sample_us, event_sample_us + 50);
 	}
+	pr_info("%s: token watch summary: changes tok40=%llu 44=%llu 48=%llu 4c=%llu enc50=%llu, kicks=%u\n",
+		dev->name, tok_changes[0], tok_changes[1], tok_changes[2],
+		tok_changes[3], tok_changes[4], kicks);
 	return 0;
 }
 
@@ -3295,6 +3547,10 @@ static ssize_t mz0380_proc_events_write(struct file *file,
 		} else if (!strcmp(cmd, "clear")) {
 			mz0380_event_ring_clear(dev);
 			ret = count;
+		} else if (!strcmp(cmd, "repoison")) {
+			/* M38: re-fill the stream bufs with poison mid-stream */
+			mz0380_extent_repoison(dev);
+			ret = count;
 		}
 	}
 	mutex_unlock(&devlist);
@@ -3350,10 +3606,11 @@ static int mz0380_proc_hdmi_show(struct seq_file *m, void *v)
 	seq_puts(m, "  defaults: 2 1920 1080 60   input codes: HDMI=2 DVI=3 COMPONENT=4 SDI=6 AUTO=7\n");
 	seq_puts(m, "  fires SET_VIC_PARAMS (op41): host declares input + standard so the\n");
 	seq_puts(m, "  card asserts HPD/EDID and the HDMI source wakes. Watch dmesg + OUT port.\n");
+	seq_puts(m, "\nsink chain read-back (M43: write returns prove nothing - the\n"
+		    "firmware forces the I2C result to 0 on a NAK, so verify by reading):\n");
 	mutex_lock(&devlist);
 	list_for_each_entry(dev, &mz0380_devlist, devlist)
-		seq_printf(m, "%s: fw %s\n", dev->name,
-			   mz0380_fw_state_name(dev->fw_state));
+		mz0380_mst3367_diag(dev, m);
 	mutex_unlock(&devlist);
 	return 0;
 }
@@ -3375,6 +3632,71 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 	if (IS_ERR(cmd))
 		return PTR_ERR(cmd);
 	strim(cmd);
+
+	/* M44: "ramtest" probes whether MST3367 BANK3 is writable RAM */
+	if (!strcmp(cmd, "ramtest")) {
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_mst3367_ramtest(dev);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M49: "wscan" hunts writable RAM windows (EDID store) */
+	if (!strcmp(cmd, "wscan")) {
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_mst3367_wscan(dev);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M48: "hpd [count] [gap_ms]" pulses HPD only, nothing else */
+	if (!strncmp(cmd, "hpd", 3)) {
+		unsigned int n = 5, gap = 4000;
+
+		sscanf(cmd, "hpd %u %u", &n, &gap);
+		n = clamp(n, 1u, 20u);
+		gap = clamp(gap, 200u, 10000u);
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_mst3367_hpd_pulse(dev, n, gap);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M47: "edid" re-pushes the EDID and re-pulses HPD */
+	if (!strcmp(cmd, "edid")) {
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_mst3367_reload_edid(dev);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
+	/* M45: "watch [secs]" logs the detect block live to dmesg */
+	if (!strncmp(cmd, "watch", 5)) {
+		unsigned int secs = 20;
+
+		sscanf(cmd, "watch %u", &secs);
+		secs = clamp(secs, 1u, 120u);
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist)
+			mz0380_mst3367_watch(dev, secs);
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
+
 	sscanf(cmd, "%u %u %u %u", &input, &width, &height, &fps);
 	kfree(cmd);
 
