@@ -2731,3 +2731,40 @@ The defect is therefore in the thread's own continuation/exit logic after
 frame 1 - not in the DMA engine, ring, aperture, host addressing, IRQ
 delivery, credits, or any host-visible machinery. All of those are now
 proven good end-to-end.
+
+================================================================================
+M50: nosg POLLING CAPTURE - FIRST WORKING V4L2 DELIVERY, AND THE FAKE FRAME
+     IS THE CARD'S OWN "NO SIGNAL" SPLASH AT 720x1080
+     (2026-08-14, driver work + hardware VERIFIED)
+================================================================================
+
+Exploited three proven facts (no new RE needed): the raw burst is fully
+contiguous (M37), so "tail dwords != poison" == frame complete; each fresh
+spawn yields exactly one frame (M39); STOP=op7 ends a spawn cleanly. New
+mz0380_nosg_thread (mz0380-dma.c): per frame - poison buf0, dma_start
+(spawn), poll burst tail, copy NV12 payload to vb2, quiet op7, respawn.
+stream_nosg=1 switches the V4L2 node to NV12.
+
+HW RESULT: 4/4 frames delivered to userspace via v4l2-ctl --stream-mmap,
+exact payload sizes, one SET_VIC per frame, 0 faults during capture (the
+single logged IO_PAGE_FAULT at 0x90000000 predates streaming = the known
+pre-READY boot artifact). start_delay_ms=500 works: ~1.9 s/frame. This is
+the first end-to-end Linux capture from this card.
+
+FRAME CONTENT (decoded offline from the delivered capture): the fake frame
+is NOT a flat fill - it is the card's own rendered "NO SIGNAL" splash
+(spinner icon + "NO SIGNAL" text). Layout inside the 0x30a5c0 burst:
+  - Y plane   720x1080 @0x0      (0x11 background, splash graphics)
+  - UV plane  720x540  @0xbdd80  (all 0x80 = neutral chroma, grayscale)
+  - 0xff junk fill (uninitialised card memory, sparse noise) to burst end
+So the renderer draws at 720 WIDE regardless of SET_VIC width=1920, while
+the DMA length stays 1920x1107x1.5. First extraction assumed NV12 1920x1080
+=> junk read as chroma (all-pink frame, 720-stride rows wrapped 8/3 times).
+Driver now delivers NV12 720x1080 (0x11cc40 bytes).
+
+Notable implications:
+  1. The card HAS an on-board splash/OSD renderer the fake path exercises -
+     the encode pipeline input is a real rendered picture, not a stub.
+  2. The 0x11 "fill" of M30-M38 was this splash's background all along.
+  3. Open question (cosmetic): whether the 720-wide render is fake_frame's
+     hardcoded canvas or tracks some other config (OSD size? input dims?).
