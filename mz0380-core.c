@@ -267,6 +267,18 @@ MODULE_PARM_DESC(stream_nosg,
 		 "SET_VIC is_nosg flag: 1 = force the card's fake-frame (test-pattern) generator, bypassing real BT1120 capture; diagnostic bisection lever (def:0)");
 
 /*
+ * How long the stream_nosg polling capture waits for the raw frame's
+ * contiguous burst to finish landing in buf0 before it gives up on this
+ * spawn and respawns. Hardware lands the whole 0x30a5c0-byte frame within
+ * 450 ms of START (M36), so 3 s is generous slack, not a tuned value.
+ */
+unsigned int mz0380_nosg_frame_timeout_ms = 3000;
+module_param_named(nosg_frame_timeout_ms, mz0380_nosg_frame_timeout_ms,
+		   uint, 0644);
+MODULE_PARM_DESC(nosg_frame_timeout_ms,
+		 "stream_nosg: ms to wait for the raw fake frame to land in buf0 before respawning the encoder (def:3000; hw lands in ~450)");
+
+/*
  * M25 probe. op2 hands the card 8-byte channels[] slots; pcie_set_outbound
  * (ep.ko 0x5a8) then does ELBI[0x58] = slot word0, ELBI[0x54] = slot word1.
  * Default packing is {word0=high32, word1=low32}, which is what the firmware
@@ -4859,6 +4871,7 @@ static void mz0380_finidev(struct pci_dev *pci_dev)
 	/* stop the event watcher before any MMIO mapping is torn down */
 	mz0380_event_watch_stop(dev);
 
+	mz0380_nosg_capture_stop(dev);	/* join before the bufs it polls die */
 	mz0380_dma_stop(dev);
 	mz0380_dev_unregister(dev);
 	mz0380_dma_teardown(dev);

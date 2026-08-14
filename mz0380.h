@@ -327,6 +327,16 @@ struct mz0380_dev {
 	struct work_struct drain_work;
 	bool streaming;
 
+	// pattern-check: skip two plain fields on the existing device struct
+	/*
+	 * Fake-frame (stream_nosg) polling capture. No completion IRQ ever
+	 * arrives on this path (M41: card-internal), so a kthread poisons buf0,
+	 * spawns the encoder, polls for the frame's contiguous burst to land,
+	 * delivers it as NV12 and respawns (M39: one frame per fresh spawn).
+	 */
+	struct task_struct *nosg_task;
+	u32 nosg_sequence;
+
 	/* HDMI signal */
 	// pattern-check: skip adding one bool state flag to existing struct
 	struct v4l2_dv_timings detected_timings;
@@ -514,6 +524,8 @@ int mz0380_dma_setup(struct mz0380_dev *dev);
 void mz0380_dma_teardown(struct mz0380_dev *dev);
 int mz0380_dma_start(struct mz0380_dev *dev);
 void mz0380_dma_stop(struct mz0380_dev *dev);
+int mz0380_nosg_capture_start(struct mz0380_dev *dev);
+void mz0380_nosg_capture_stop(struct mz0380_dev *dev);
 void mz0380_extent_repoison(struct mz0380_dev *dev);	/* M38 */
 int mz0380_dma_ring_alloc(struct mz0380_dev *dev, struct mz0380_ring *r,
 			  u32 nr_entries, u32 entry_size);
@@ -555,6 +567,7 @@ extern bool mz0380_firmware_upload_enabled;
 extern bool mz0380_enable_dma;
 extern unsigned int mz0380_start_delay_ms;
 extern bool mz0380_stream_nosg;
+extern unsigned int mz0380_nosg_frame_timeout_ms;
 extern bool mz0380_buf_pair_swap;
 extern bool mz0380_dma_iova_remap;
 extern unsigned long long mz0380_dma_iova_base;

@@ -354,6 +354,23 @@
 #define MZ0380_STREAM_BUF_STRIDE        MZ0380_STREAM_BUF_SIZE
 
 /*
+ * M36/M37 (proven on hw): the fake-frame path lands ONE fully contiguous raw
+ * burst of exactly 1920 x 1107 x 1.5 bytes (0x30a5c0) in buf0 within 450 ms
+ * of START, then the card's encoder loop parks (M39: a fresh spawn yields
+ * exactly one more frame). 1107 = 1080 active + 27 lines of card-side
+ * padding; the leading 1920x1080 NV12 payload (0x2f7600) is what we hand to
+ * userspace.
+ */
+#define MZ0380_STREAM_RAW_WIDTH         1920
+#define MZ0380_STREAM_RAW_HEIGHT        1107
+#define MZ0380_STREAM_RAW_FRAME_SIZE \
+	(MZ0380_STREAM_RAW_WIDTH * MZ0380_STREAM_RAW_HEIGHT * 3 / 2)
+#define MZ0380_NOSG_NV12_WIDTH          1920
+#define MZ0380_NOSG_NV12_HEIGHT         1080
+#define MZ0380_NOSG_NV12_SIZEIMAGE \
+	(MZ0380_NOSG_NV12_WIDTH * MZ0380_NOSG_NV12_HEIGHT * 3 / 2)
+
+/*
  * Disproven guesses (absent from the ep.ko dispatcher): SET_AIC=0x11,
  * QUERY_SIGNAL=0x20. There is no card->host signal query.
  */

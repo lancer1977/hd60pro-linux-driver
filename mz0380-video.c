@@ -261,17 +261,37 @@ static u32 mz0380_sizeimage(const struct mz0380_capture_state *capture)
 	return sizeimage;
 }
 
+/*
+ * With stream_nosg the card's fake-frame generator delivers raw NV12 (M36:
+ * one 1920x1107x1.5 contiguous burst; the leading 1920x1080 is the picture),
+ * captured by the polling loop in mz0380-dma.c - not H.264. The node
+ * advertises whichever format the current mode actually produces.
+ */
+static u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
+{
+	if (mz0380_stream_nosg)
+		return MZ0380_NOSG_NV12_SIZEIMAGE;
+	return mz0380_sizeimage(&dev->capture);
+}
+
 static void mz0380_fill_pix_format(struct mz0380_dev *dev,
 				   struct v4l2_pix_format *pix)
 {
 	memset(pix, 0, sizeof(*pix));
 
-	pix->width = dev->capture.width;
-	pix->height = dev->capture.height;
-	pix->pixelformat = V4L2_PIX_FMT_H264;
+	if (mz0380_stream_nosg) {
+		pix->width = MZ0380_NOSG_NV12_WIDTH;
+		pix->height = MZ0380_NOSG_NV12_HEIGHT;
+		pix->pixelformat = V4L2_PIX_FMT_NV12;
+		pix->bytesperline = MZ0380_NOSG_NV12_WIDTH;
+	} else {
+		pix->width = dev->capture.width;
+		pix->height = dev->capture.height;
+		pix->pixelformat = V4L2_PIX_FMT_H264;
+		pix->bytesperline = 0;
+	}
 	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = 0;
-	pix->sizeimage = mz0380_sizeimage(&dev->capture);
+	pix->sizeimage = mz0380_current_sizeimage(dev);
 	pix->colorspace = V4L2_COLORSPACE_REC709;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
 	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
@@ -315,9 +335,17 @@ static int mz0380_enum_fmt_vid_cap(struct file *file, void *priv,
 	if (f->index != 0)
 		return -EINVAL;
 
-	f->pixelformat = V4L2_PIX_FMT_H264;
-	f->flags = V4L2_FMT_FLAG_COMPRESSED;
-	strscpy(f->description, "H.264 bytestream", sizeof(f->description));
+	if (mz0380_stream_nosg) {
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+		f->flags = 0;
+		strscpy(f->description, "NV12 raw (fake-frame path)",
+			sizeof(f->description));
+	} else {
+		f->pixelformat = V4L2_PIX_FMT_H264;
+		f->flags = V4L2_FMT_FLAG_COMPRESSED;
+		strscpy(f->description, "H.264 bytestream",
+			sizeof(f->description));
+	}
 
 	return 0;
 }
@@ -343,6 +371,12 @@ static int mz0380_try_fmt_vid_cap(struct file *file, void *priv,
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
+	if (mz0380_stream_nosg) {
+		/* fake-frame path: one fixed raw mode */
+		mz0380_fill_pix_format(dev, &f->fmt.pix);
+		return 0;
+	}
+
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
 
@@ -362,6 +396,12 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
+	if (mz0380_stream_nosg) {
+		/* fake-frame path: one fixed raw mode */
+		mz0380_fill_pix_format(dev, &f->fmt.pix);
+		return 0;
+	}
+
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
 
@@ -380,6 +420,16 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 static int mz0380_enum_framesizes(struct file *file, void *priv,
 				  struct v4l2_frmsizeenum *fsize)
 {
+	if (mz0380_stream_nosg) {
+		if (fsize->pixel_format != V4L2_PIX_FMT_NV12 ||
+		    fsize->index != 0)
+			return -EINVAL;
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = MZ0380_NOSG_NV12_WIDTH;
+		fsize->discrete.height = MZ0380_NOSG_NV12_HEIGHT;
+		return 0;
+	}
+
 	if (fsize->pixel_format != V4L2_PIX_FMT_H264)
 		return -EINVAL;
 
@@ -583,7 +633,7 @@ static int mz0380_queue_setup(struct vb2_queue *vq,
 			      unsigned int sizes[], struct device *alloc_devs[])
 {
 	struct mz0380_dev *dev = vb2_get_drv_priv(vq);
-	unsigned int size = mz0380_sizeimage(&dev->capture);
+	unsigned int size = mz0380_current_sizeimage(dev);
 
 	if (*nplanes) {
 		if (sizes[0] < size)
@@ -601,7 +651,7 @@ static int mz0380_queue_setup(struct vb2_queue *vq,
 static int mz0380_buf_prepare(struct vb2_buffer *vb)
 {
 	struct mz0380_dev *dev = vb2_get_drv_priv(vb->vb2_queue);
-	unsigned int size = mz0380_sizeimage(&dev->capture);
+	unsigned int size = mz0380_current_sizeimage(dev);
 
 	if (vb2_plane_size(vb, 0) < size) {
 		dev_err(&dev->pci->dev,
@@ -656,10 +706,21 @@ static int mz0380_start_streaming(struct vb2_queue *vq, unsigned int count)
 		}
 	}
 
-	ret = mz0380_dma_start(dev);
+	/*
+	 * Fake-frame path: no completion IRQ exists (M41), so streaming is a
+	 * polling kthread that spawns the encoder itself, once per frame
+	 * (M39). The real path arms the encoder here and delivers from the
+	 * MSI-driven drain.
+	 */
+	if (mz0380_stream_nosg)
+		ret = mz0380_nosg_capture_start(dev);
+	else
+		ret = mz0380_dma_start(dev);
 	if (ret) {
 		dev_err(&dev->pci->dev,
-			"dma_start failed (%d)\n", ret);
+			"%s failed (%d)\n",
+			mz0380_stream_nosg ? "nosg_capture_start" : "dma_start",
+			ret);
 		goto error;
 	}
 
@@ -687,6 +748,12 @@ static void mz0380_stop_streaming(struct vb2_queue *vq)
 	struct mz0380_vb_buffer *buf, *tmp;
 	unsigned long flags;
 
+	/*
+	 * nosg: the capture thread owns the start/stop cycle; its last
+	 * iteration already sent STOP, so only the thread needs joining. The
+	 * verbose dma_stop still runs for its end-of-stream diagnostics dump.
+	 */
+	mz0380_nosg_capture_stop(dev);
 	mz0380_dma_stop(dev);
 	dev->streaming = false;
 

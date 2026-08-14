@@ -822,32 +822,40 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_start);
 
-void mz0380_dma_stop(struct mz0380_dev *dev)
+static void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 {
-	/* M36: freeze + report the write extents before dumping/stopping */
-	mz0380_extent_watch_stop(dev);
+	if (verbose) {
+		/* M36: freeze + report the write extents before stopping */
+		mz0380_extent_watch_stop(dev);
 
-	/*
-	 * M30: dump the buffers BEFORE telling the card to stop, and the card's
-	 * status words with them. This is the only view we have left now that
-	 * the DMA no longer faults - successful writes are invisible to the
-	 * IOMMU, so the buffer contents are the evidence.
-	 */
-	pr_info("%s: stream stop: EVENT[0x30]=%08x token[0x40]=%08x 0x44=%08x 0x48=%08x 0x4c=%08x enc[0x50]=%08x irqs=%d/%d\n",
-		dev->name,
-		mz_mmio_read(dev, MZ0380_MB_EVENT),
-		mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN),
-		mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1),
-		mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2),
-		mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3),
-		mz_mmio_read(dev, MZ0380_MB_ENC_STATUS),
-		atomic_read(&dev->irq_count),
-		atomic_read(&dev->irq_video_count));
-	mz0380_stream_bufs_dump(dev, "stop");
+		/*
+		 * M30: dump the buffers BEFORE telling the card to stop, and
+		 * the card's status words with them. This is the only view we
+		 * have left now that the DMA no longer faults - successful
+		 * writes are invisible to the IOMMU, so the buffer contents
+		 * are the evidence.
+		 */
+		pr_info("%s: stream stop: EVENT[0x30]=%08x token[0x40]=%08x 0x44=%08x 0x48=%08x 0x4c=%08x enc[0x50]=%08x irqs=%d/%d\n",
+			dev->name,
+			mz_mmio_read(dev, MZ0380_MB_EVENT),
+			mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3),
+			mz_mmio_read(dev, MZ0380_MB_ENC_STATUS),
+			atomic_read(&dev->irq_count),
+			atomic_read(&dev->irq_video_count));
+		mz0380_stream_bufs_dump(dev, "stop");
+	}
 
 	if (dev->dma_armed)
 		mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
 				    NULL, 0, NULL, 2000);
+}
+
+void mz0380_dma_stop(struct mz0380_dev *dev)
+{
+	__mz0380_dma_stop(dev, true);
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_stop);
 
@@ -939,3 +947,153 @@ static void mz0380_drain_work_fn(struct work_struct *w)
 
 	mz0380_dma_drain_video(dev);
 }
+
+/* --- stream_nosg polling capture ----------------------------------------- */
+
+/*
+ * The fake-frame path has no host-visible completion: the card DMAs one
+ * contiguous 0x30a5c0-byte burst into buf0 and then its encoder loop parks
+ * forever, IRQ-less, for a card-internal reason no host action can fix (M41).
+ * But the burst itself is proven contiguous front-to-back (M37), so "the
+ * final dwords are no longer poison" == "the whole frame has landed". And a
+ * fresh encoder spawn reliably yields exactly one more frame (M39). Those
+ * two facts make a polling capture loop: poison buf0, spawn, poll the tail,
+ * deliver as NV12, stop, respawn.
+ */
+
+static bool mz0380_nosg_frame_landed(struct mz0380_dev *dev)
+{
+	const u32 *p = dev->stream_bufs[0].va;
+	size_t end = MZ0380_STREAM_RAW_FRAME_SIZE / 4;
+
+	/*
+	 * Two independent tail dwords must have been overwritten: one could
+	 * collide with frame data that happens to equal the poison word (the
+	 * M37 poison_byte experiment saw exactly such collisions mid-frame),
+	 * two adjacent collisions at the fixed frame tail are not credible.
+	 */
+	return p[end - 1] != mz0380_poison_w() &&
+	       p[end - 2] != mz0380_poison_w();
+}
+
+static void mz0380_nosg_deliver(struct mz0380_dev *dev)
+{
+	struct mz0380_vb_buffer *vbuf;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->buf_lock, flags);
+	vbuf = list_first_entry_or_null(&dev->buf_list,
+					struct mz0380_vb_buffer, list);
+	if (vbuf)
+		list_del(&vbuf->list);
+	spin_unlock_irqrestore(&dev->buf_lock, flags);
+
+	if (!vbuf) {
+		pr_info_ratelimited("%s: nosg frame %u landed but no buffer queued - dropped\n",
+				    dev->name, dev->nosg_sequence);
+		return;
+	}
+
+	{
+		void *dst = vb2_plane_vaddr(&vbuf->vb.vb2_buf, 0);
+		size_t plane = vb2_plane_size(&vbuf->vb.vb2_buf, 0);
+		size_t cpy = min_t(size_t, MZ0380_NOSG_NV12_SIZEIMAGE, plane);
+
+		if (dst)
+			memcpy(dst, dev->stream_bufs[0].va, cpy);
+		vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, cpy);
+	}
+
+	vbuf->vb.vb2_buf.timestamp = ktime_get_ns();
+	vbuf->vb.field = V4L2_FIELD_NONE;
+	vbuf->vb.sequence = dev->nosg_sequence++;
+	vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+}
+
+static int mz0380_nosg_thread(void *data)
+{
+	struct mz0380_dev *dev = data;
+
+	while (!kthread_should_stop()) {
+		unsigned long deadline;
+		bool landed = false;
+		int ret;
+
+		/*
+		 * Poison the landing zone ourselves so frame arrival is
+		 * detectable regardless of the buf_poison diagnostic knob
+		 * (dma_start re-poisons the whole set when that is on; a
+		 * second memset is harmless).
+		 */
+		memset(dev->stream_bufs[0].va, mz0380_poison_b(),
+		       MZ0380_STREAM_RAW_FRAME_SIZE);
+		wmb();
+
+		ret = mz0380_dma_start(dev);
+		if (ret) {
+			pr_warn("%s: nosg spawn failed (%d) - retrying in 500 ms\n",
+				dev->name, ret);
+			if (!kthread_should_stop())
+				msleep(500);
+			continue;
+		}
+
+		deadline = jiffies +
+			   msecs_to_jiffies(mz0380_nosg_frame_timeout_ms);
+		while (!kthread_should_stop() &&
+		       time_before(jiffies, deadline)) {
+			if (mz0380_nosg_frame_landed(dev)) {
+				landed = true;
+				break;
+			}
+			msleep(10);
+		}
+
+		if (landed)
+			mz0380_nosg_deliver(dev);
+		else if (!kthread_should_stop())
+			pr_warn("%s: nosg frame did not land within %u ms - respawning\n",
+				dev->name, mz0380_nosg_frame_timeout_ms);
+
+		/*
+		 * Quiet stop: op7 ends this spawn so the next SET_VIC forks a
+		 * fresh tinyvenc5 whose VPL_DMAC_Open clears the parked state
+		 * (M39/M41) - that reset is what makes the next frame possible.
+		 * The verbose stop's dumps would spam dmesg once per frame.
+		 */
+		__mz0380_dma_stop(dev, false);
+	}
+	return 0;
+}
+
+int mz0380_nosg_capture_start(struct mz0380_dev *dev)
+{
+	struct task_struct *task;
+
+	if (!dev->dma_armed || !dev->stream_bufs[0].va)
+		return -ENODEV;
+	if (dev->nosg_task)
+		return 0;
+
+	dev->nosg_sequence = 0;
+	task = kthread_run(mz0380_nosg_thread, dev, "mz0380-nosg/%u", dev->nr);
+	if (IS_ERR(task))
+		return PTR_ERR(task);
+	dev->nosg_task = task;
+
+	pr_info("%s: nosg polling capture started (NV12 %ux%u; cadence ~= start_delay_ms + 450 ms per frame - lower start_delay_ms for more fps)\n",
+		dev->name, MZ0380_NOSG_NV12_WIDTH, MZ0380_NOSG_NV12_HEIGHT);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_nosg_capture_start);
+
+void mz0380_nosg_capture_stop(struct mz0380_dev *dev)
+{
+	if (!dev->nosg_task)
+		return;
+	kthread_stop(dev->nosg_task);
+	dev->nosg_task = NULL;
+	pr_info("%s: nosg polling capture stopped after %u frames\n",
+		dev->name, dev->nosg_sequence);
+}
+EXPORT_SYMBOL_GPL(mz0380_nosg_capture_stop);
