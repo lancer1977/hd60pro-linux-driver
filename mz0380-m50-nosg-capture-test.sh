@@ -27,6 +27,13 @@
 #   - 0 frames, v4l2-ctl times out -> tail-detect never fired: check dmesg
 #     for 'nosg spawn failed' (mailbox error) vs silence (frame truly absent;
 #     re-verify with buf_poison=1 extent lines)
+#   - 0 frames + repeated 'nosg spawn failed (-110)' -> the card's mailbox
+#     stopped answering SET_VIC: suspected card-side exhaustion from
+#     accumulated parked tinyvenc5 processes (each spawn leaks one, M41;
+#     rmmod/insmod + fw re-upload does NOT reboot the card). Remedy: FULL
+#     cold boot (mains off; a warm reboot may keep PCIe aux power). If a
+#     cold boot fixes it, the per-boot capture budget is finite until a
+#     real card reset opcode is found (op 0xFF untested candidate).
 #   - file size a multiple of something OTHER than 1166400 -> vb2 plane /
 #     payload mismatch, check queue_setup sizes in dmesg
 set -u
@@ -50,7 +57,7 @@ insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
 	|| { echo "insmod failed"; exit 1; }
 sleep 3
 
-echo "=== format the node advertises (must be NV12 1920x1080) ==="
+echo "=== format the node advertises (must be NV12 720x1080) ==="
 v4l2-ctl -d /dev/video0 --get-fmt-video
 
 # generous timeout: FRAMES * (start_delay + land + stop) + firmware slack
