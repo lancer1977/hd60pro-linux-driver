@@ -3785,6 +3785,21 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 		return count;
 	}
 
+	/*
+	 * Anything left must be the numeric "input width height fps" form. A
+	 * word that matched no command above is a typo - or, more usefully, a
+	 * command this module is too old to know, which is what a stale
+	 * insmod looks like. Falling through would silently run an HDMI
+	 * activation with default geometry and log nothing about the real
+	 * request, so reject it and name the vocabulary instead.
+	 */
+	if (*cmd && !(*cmd >= '0' && *cmd <= '9')) {
+		pr_info("mz0380: unknown /proc/mz0380-hdmi command '%s' - known: ramtest, wscan, edidhunt, gpiodump, i2cscan, edidburn, hpd, edid, watch, or '<input> <w> <h> <fps>' (a rejected command you expected to work means the loaded module predates it - rmmod and insmod the fresh build)\n",
+			cmd);
+		kfree(cmd);
+		return -EINVAL;
+	}
+
 	sscanf(cmd, "%u %u %u %u", &input, &width, &height, &fps);
 	kfree(cmd);
 

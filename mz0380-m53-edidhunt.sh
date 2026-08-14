@@ -30,15 +30,20 @@ cd "$(dirname "$0")"
 MAXREGS=${1:-48}
 make >/dev/null || { echo "build failed"; exit 1; }
 
-if ! lsmod | grep -q '^mz0380'; then
-	modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
-	insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
-		enable_video=1 procfs_verbosity=2 dma_iova_remap=1 \
-		edidhunt_max_regs="$MAXREGS" || { echo "insmod failed"; exit 1; }
-	sleep 25
-fi
+# ALWAYS reload: a module left over from an earlier run is an older build
+# that does not know this command, and the proc handler would have had to
+# guess what we meant. (It now rejects unknown commands and says so.)
+fuser -k /dev/video0 2>/dev/null
+rmmod mz0380 2>/dev/null
+sleep 1
+modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
+insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
+	enable_video=1 procfs_verbosity=2 dma_iova_remap=1 \
+	edidhunt_max_regs="$MAXREGS" || { echo "insmod failed"; exit 1; }
+echo "waiting for firmware upload + boot..."
+sleep 25
 
 dmesg -C
 echo "=== edidhunt (this takes a few minutes; 4 banks x quadratic pairs) ==="
-echo "edidhunt" > /proc/mz0380-hdmi
-dmesg | grep -E "edidhunt"
+echo "edidhunt" > /proc/mz0380-hdmi || { echo "proc write rejected"; dmesg | tail -3; exit 1; }
+dmesg | grep -E "edidhunt" || { echo "no edidhunt output - see dmesg"; dmesg | tail -5; exit 1; }
