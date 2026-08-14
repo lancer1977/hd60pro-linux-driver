@@ -1000,8 +1000,11 @@ int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl)
 	u8 v;
 	int ret;
 
-	if (dev->fw_state != MZ0380_FW_STATE_READY)
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		pr_info("%s: i2cbb scan: firmware not READY (state %s) - mailbox dead, cold boot needed?\n",
+			dev->name, mz0380_fw_state_name(dev->fw_state));
 		return -ENODEV;
+	}
 
 	/* idle-state sanity: both lines must float high or there is no bus */
 	ret = mz0380_bb_release(dev, sda);
@@ -1059,8 +1062,11 @@ int mz0380_i2cbb_edid_burn(struct mz0380_dev *dev, u8 sda, u8 scl, u8 addr7)
 	u8 rd;
 	int ret;
 
-	if (dev->fw_state != MZ0380_FW_STATE_READY)
+	if (dev->fw_state != MZ0380_FW_STATE_READY) {
+		pr_info("%s: i2cbb burn: firmware not READY (state %s) - mailbox dead, cold boot needed?\n",
+			dev->name, mz0380_fw_state_name(dev->fw_state));
 		return -ENODEV;
+	}
 
 	pr_info("%s: i2cbb EDID burn -> dev 0x%02x (sda=%u scl=%u), %u bytes\n",
 		dev->name, addr7, sda, scl, MZ0380_EDID_SIZE);
