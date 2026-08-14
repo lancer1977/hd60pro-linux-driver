@@ -115,12 +115,19 @@ New this session, all in-tree:
   and `/proc/mz0380-hdmi` commands: `ramtest`, `wscan`, `watch [secs]`,
   `edid`, `hpd [count] [gap_ms]`.
 
+- **M50 (2026-08-14, compile-verified, hw run pending): nosg polling
+  capture.** `stream_nosg=1` now switches the node to NV12 1920×1080 and
+  streamon runs `mz0380_nosg_thread`: per frame poison buf0 → spawn encoder →
+  poll the raw burst's tail dwords → copy the 0x2f7600 NV12 payload to vb2 →
+  quiet STOP → respawn (one frame per spawn, M39). Cadence ≈ start_delay_ms
+  + 450 ms per frame. Run `mz0380-m50-nosg-capture-test.sh` (needs root).
+
 ## Test scripts (each has a decision table in its header)
 
 `m35` live tokens · `m36` write extent + hole map · `m38` repoison ·
 `m39` respawn · `m42` real-signal capture · `m43` sink read-back ·
 `m45` detect watch · `m47` EDID opcode sweep · `m48` HPD isolation ·
-`m49` writability scan.
+`m49` writability scan · `m50` nosg NV12 polling capture.
 
 ## Note on the working tree
 
