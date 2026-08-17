@@ -221,12 +221,34 @@ static int mz0380_mst3367_load_edid(struct mz0380_dev *dev)
  * matters - HPD must rise only AFTER the EDID is readable, or the source will
  * read a garbage/absent EDID once and not retry.
  */
+static int mz0380_gpio_get(struct mz0380_dev *dev, unsigned int pin, u32 *out);
+
 static void mz0380_mst3367_hpd(struct mz0380_dev *dev, bool on)
 {
+	u32 level = 0;
+	u8 b7 = 0;
+
 	mst_bank(dev, MST3367_BANK0);
 	mst_wr(dev, MST3367_B0_HPD, on ? MST3367_B0_HPD_ON : MST3367_B0_HPD_OFF);
+
+	/*
+	 * Drive the board pin - and make sure it IS driven. A GPIO_SET on a
+	 * pin left as an input silently does nothing (the M51 probe did
+	 * exactly that to pin1), so the driver would claim HPD while the
+	 * source saw no edge at all. Force the direction, then read the pin
+	 * and the receiver's own HPD bit back and report what actually stuck.
+	 */
+	mz0380_gpio_force_output(dev, MZ0380_GPIO_HPD, mz0380_gpio_dir_invert);
 	mz0380_gpio_set(dev, MZ0380_GPIO_HPD, on);
-	pr_info("%s: HPD %s\n", dev->name, on ? "asserted" : "deasserted");
+
+	mz0380_gpio_get(dev, MZ0380_GPIO_HPD, &level);
+	mst_rd(dev, MST3367_B0_HPD, &b7);
+
+	pr_info("%s: HPD %s -> pin%u reads %u, BANK0[0x%02x]=0x%02x%s\n",
+		dev->name, on ? "asserted" : "deasserted", MZ0380_GPIO_HPD,
+		level, MST3367_B0_HPD, b7,
+		(!!level == !!on) ? "" :
+		"  <- PIN DID NOT FOLLOW: the source is seeing nothing");
 }
 
 /*
