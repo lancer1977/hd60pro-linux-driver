@@ -1,6 +1,6 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-07. Full history in **RE_FINDINGS.md** (M0..M49b);
+_Last updated 2026-08-15. Full history in **RE_FINDINGS.md** (M0..M56);
 this file is only the handoff. Everything below was verified on hardware
 unless it says otherwise._
 
@@ -8,149 +8,144 @@ unless it says otherwise._
 
 ## The one-paragraph state of the project
 
-The host side of this driver works. The card takes firmware, answers the
-mailbox, accepts commands, and DMAs a complete 1080p frame into host memory
-within 450 ms of every stream start — contiguous, zero loss, zero IOMMU
-faults, zero PCIe errors. Two things block real capture, and both are on the
-card/analog side. **(1)** The fake-frame test path stalls inside the card
-after exactly one frame, for a card-internal reason no host action can fix.
-**(2)** The real capture path never starts because the HDMI source refuses to
-transmit: it sees our hotplug signal, tries to read an EDID, finds none, and
-gives up. Getting an EDID into the card is the single remaining blocker, and
-static reverse engineering has run out of ways to find how.
+Capture works. `stream_nosg=1` delivers real NV12 frames to userspace through
+V4L2 (M50, verified: 4/4 frames, 0 faults) - the first working Linux capture
+from this card. A source has finally been seen on the wire: a digital
+microscope transmits and the MST3367 reached lock (M54), which retired the
+old "nothing ever gets to the receiver" era. The remaining work is on the
+real capture path: the receiver sees the source's clock but does not hold
+frame lock, and the last change (a full port of hdcapm's init sequence)
+is the untested fix for exactly that.
 
 ---
 
-## What is PROVEN — do not re-litigate these
+## What is PROVEN - do not re-litigate
 
-1. **The whole host DMA/streaming stack is correct.** Addressing, 4 GiB-aligned
-   IOVA remap, outbound aperture, per-chunk completion, interrupt credits,
-   MSI, event ring. One complete `1920×1107×1.5` frame lands per stream start,
-   contiguous end-to-end. (M35–M39)
-2. **The fake path (`stream_nosg=1`) is a host-side dead end.** (M41) The
-   card's DMA submit ioctl kicks the engine synchronously, so the frame
-   landing proves the *engine* works and says nothing about its completion
-   IRQ. That IRQ never arrives: the card's thread parks forever in an
-   un-timed wait, a busy flag stays set so every later submit enqueues
-   unkicked. `VPL_DMAC_Open` clears that state, which is exactly why each
-   fresh spawn yields one more frame. Those fields are written **only** by the
-   card's own ISR — no opcode, BAR write or doorbell reaches them.
-3. **The MST3367 receiver is healthy.** Powered, out of reset, configured,
-   answering I2C with our own written values read back. Only two devices exist
-   on that bus (`0x9c`, `0x98`) — no EEPROM, no EDID MCU. (M43)
-4. **Input select is not the gate.** `SET_VIC` now runs before receiver
-   bring-up; detect stayed frozen. (M46)
-5. **HPD WORKS.** (M48 — the most useful result of the session) The camera
-   reacts to our hotplug edge and then falls back to its LCD: it sees the sink
-   appear, fails to read an EDID, and reverts. So GPIO pin1 + `BANK0 0xb7` is
-   genuinely the hotplug line and the source honours it.
-6. **The receiver's per-mode config is NOT the current blocker.** The source
-   isn't transmitting at all, so there is nothing yet to misconfigure.
+1. **Host DMA/streaming stack is correct.** One complete frame per stream
+   start, contiguous, zero loss, zero IOMMU faults. (M35-M39)
+2. **Working capture, fake path.** `stream_nosg=1` -> NV12 **720x1080**
+   polled capture (`mz0380_nosg_thread`). The frame is the card's own
+   rendered "NO SIGNAL" splash: Y 720x1080 @0, UV 720x540 @0xbdd80 (all
+   0x80), 0xff junk after. Renderer draws 720 wide regardless of SET_VIC.
+   `start_delay_ms=500` works (~1.9 s/frame). (M50)
+3. **HPD is genuinely driven.** pin1 read-back follows every assert/deassert,
+   and the receiver's own 0xb7 bit follows. (M54)
+4. **A source can lock.** Digital microscope: `detect 0x55=0xa3 LOCKED`,
+   htot=0x898. It needs no EDID from us. **Use it as the standard test
+   source.** The DSLR stays dark (htot=0000) - that is the EDID blocker
+   and is source-specific, NOT a driver blocker. (M54)
+5. **The receiver's detect map** is hdcapm's, now used verbatim: match on
+   htotal/vtotal/hperiod/vperiod ranges + interlace (NOT hactive), with
+   hperiod=1600000/raw, vperiod=1250000/raw, field masks applied. (M56)
 
-## What is DISPROVEN (dead ends — don't retry)
+## What is DISPROVEN - dead ends, do not retry
 
-- "The hardware discards the low half of the DMA target" → was a buffer
-  overrun plus a mod-2³² wrap (M29).
-- "There's a constant aperture offset" (M27/M28), "the encoder needs another
-  outbound window" (M32), "the encoder waits on audio_ready" (M33), "the
-  interrupt credit is dead" (M35), "the DMAC IRQ plumbing is broken" (M37 —
-  the transfer completes at its intended size), "the thread exits after frame
-  1" (M40 — it has exactly one exit and errors loop back).
-- **EDID delivery**: 5 opcodes (`0x20/0x1f/0x1e/0x1b/0x1d`) × fire-and-forget ×
-  HPD re-pulse — all negative (M47). No EEPROM on the bus (M43). **No
-  EDID-sized RAM window in any bank** (M49b: longest contiguous writable run
-  anywhere is 33 bytes; bank3's apparent long run was an artifact of the old
-  0x80 scan ceiling).
+- **Bit-banged I2C over host GPIO (M51/M51b).** Pins reading HIGH at idle are
+  driven high as OUTPUTS by our own bring-up; switched to input they drop
+  low, so no pull-ups, not I2C lines. Pairs that toggled cleanly scanned
+  0x08..0x77 with ZERO ACKs under both DIR polarities.
+- **No host-reachable second I2C bus.** `ep.ko` (the mailbox server) contains
+  no I2C code at all - only GPIO and streaming ops. The I2C helpers live in
+  card userspace (fd-parameterised); the card opens `/dev/i2c-0` AND
+  `/dev/i2c-1`, so bus 1 (the EEPROM bus per hdcapm) is card-side only.
+- **EDID delivery, host side, is exhausted**: 5 opcodes negative (M47), no
+  EEPROM on the receiver bus (M43), no EDID-sized writable window (M49b),
+  no indirect address/data port (M53 - though see the caveat below).
+- Older dead ends unchanged: low-32-DMA-loss (M29), aperture offset (M27/28),
+  extra outbound window (M32), audio_ready gate (M33), dead credit (M35).
 
 ---
 
-## THE BLOCKER: how does the host get an EDID into this card?
+## Two known hardware gotchas that will waste a session if forgotten
 
-Everything else is either working or provably not the current fault. The EDID
-is also the one link no read-back can verify, because nothing answers at the
-DDC address on this bus.
-
-**This needs a live trace, not more static RE.** The opcode space is swept,
-the bus is enumerated, every bank is dumped and writability-mapped — eight
-consecutive negatives with no unexplored surface left. A capture of the
-Windows driver doing `UpdateEDID` would show the opcode, frame layout, target
-address and any unlock sequence in one go — and the same capture yields the
-~175 per-mode receiver config writes (M10 step 2) needed immediately after.
-
-**How to get it, in preference order:**
-- **(a)** Boot Windows with the Elgato driver, run its capture app until a
-  source locks, and capture the driver's mailbox traffic — DbgView/WPP on
-  `e60MZ0380.X64.SYS` (it logs `[UPDATE.EDID]`, `send EDID data`,
-  `[HOTPLUG %d]`), or an ETW/kernel trace of its BAR0 writes.
-- **(b)** Probe the card's internal I2C (GPIO12/13) with a logic analyser
-  while Windows brings it up — reads the wire directly, needs no software
-  cooperation.
-- **(c)** If neither is possible: treat the sink side as blocked and pivot —
-  either to the other inputs, or to consuming the single raw frame the fake
-  path does deliver.
+1. **The card wedges after ~8-18 encoder spawns.** The mailbox stops ACKing
+   everything - `CMD_INIT -110`, `BEGIN_FW_DL -110`, so firmware cannot even
+   re-upload. `rmmod`/`insmod` does NOT recover it. **Only a mains-off cold
+   boot does** (full shutdown, PSU switch off / cable out ~10 s; a warm
+   reboot keeps PCIe aux power). Check `uptime` before believing any
+   "everything fails" result. `mz0380-m52-card-recovery.sh` tries the PCI
+   pm/bus/rescan resets first - it has never been run to completion.
+2. **The scripts must always rmmod/insmod the fresh build.** A stale module
+   silently lacks new /proc commands. The handler now rejects unknown
+   commands and says so, instead of falling through to the numeric parser.
 
 ---
 
-## Driver state (all compile-verified)
+## THE CURRENT BLOCKER: the receiver will not hold frame lock
 
-New this session, all in-tree:
+With the microscope attached, hardware showed:
 
-- `mz0380-edid.h` — the recovered 256-byte EDID, generated from
-  `mz0380-edid-hd60pro.txt` with header + checksum validation.
-- **EDID writer** — combo opcode, offset-led payload, fire-and-forget;
-  opcode and timeout are live module params (`edid_opcode`,
-  `edid_timeout_ms`) so variants can be swept without rebuilds.
-- **Sink bring-up order** — input select → reset → init → EDID → HPD, matching
-  the Windows sequence.
-- **`enc_stat` handshake** (`BAR0+0x50+idx`) — the card sets it to 1 after
-  each bitstream DMA and never clears it; the host must write 0 to ack or
-  encoding stops after one frame. Acked at stream start and per delivered
-  frame.
-- **SET_VIC fps** — was always 0 (card forced 60 with an error); now sent from
-  the detected timing.
-- **streamon** re-detects live timing when `stream_nosg=0` and refuses to
-  start without lock.
-- **Diagnostics** — poison/extent watcher + hole map (`buf_poison`,
-  `poison_byte`), live token watch + credit kick (`credit_kick_ms`),
-  and `/proc/mz0380-hdmi` commands: `ramtest`, `wscan`, `watch [secs]`,
-  `edid`, `hpd [count] [gap_ms]`.
+    detect 55=81 no-lock | 5f=42 hper=1289 vper=1fff htot=0898
 
-- **M50 (2026-08-14, compile-verified, hw run pending): nosg polling
-  capture.** `stream_nosg=1` now switches the node to NV12 1920×1080 and
-  streamon runs `mz0380_nosg_thread`: per frame poison buf0 → spawn encoder →
-  poll the raw burst's tail dwords → copy the 0x2f7600 NV12 payload to vb2 →
-  quiet STOP → respawn (one frame per spawn, M39). Cadence ≈ start_delay_ms
-  + 450 ms per frame. Run `mz0380-m50-nosg-capture-test.sh` (needs root).
+Read that as: bit 0x80 set = the receiver **sees the source's clock**;
+hperiod scales to 337, which is exactly hdcapm's **1080p30** range; but the
+lock bits (`0x55 & 0x3c`) stay clear and the vertical-period counter is
+saturated at 0x1fff, i.e. **vsync never completes**. Lock has been achieved
+exactly once, transiently, right at a power-cycle.
+
+**The untested fix is already committed (7b69e64).** Our MST3367 init turned
+out to be a small subset of hdcapm's `mst3367_init_setup`, missing exactly
+the blocks that would explain this: `RxTmdsInit` (the TMDS equaliser/PLL -
+BANK1 0x17/0x18/0x19/0x1a, 0x2a, BANK2 0x08), `RxVideoInit` (low-pass filter
+0xad, 0xb2/0xb3/0xb4), the audio block, the patch tail (0xe2 auto-position
+off, 0x1e/0x1f/0x73/0xb5) and the CSC table. All ported in hdcapm's order.
+
+### Start here
+
+```bash
+sudo ./mz0380-m55-real-capture.sh        # power-cycle the microscope when prompted
+```
+
+- `detect ... LOCKED` **and** `-> htot=.. vtot=.. => MATCHED` -> detection
+  works; the capture that follows is the real path. This is the goal.
+- `=> no table entry` -> it locked but its mode is not in hdcapm's table.
+  The line carries every field needed; add the entry to `mst3367_modes[]`.
+- Still no lock -> next suspect is the **per-mode timing/PLL programming**
+  Windows computes at runtime (~69 writes, `sub_14024dc28`, RE_FINDINGS
+  "INIT (CAVEAT)"): addresses/order/commit-reg are recovered, the VALUES are
+  dynamic. With a live locking source we can now iterate against hardware
+  instead of needing a Windows trace.
+
+Note the source only transmits around a plug/power event - the detect window
+must be OPEN while it is cycled. `signal_poll_ms` (def 2000) bounds the poll;
+detect is sampled, not read once, because lock walks 0x83->0xa3->0x83->0x03
+within a second while a source settles.
+
+---
+
+## Driver state (all compile-verified, zero warnings)
+
+- **nosg polling capture** - `mz0380_nosg_thread`, NV12 720x1080, one
+  encoder spawn per frame, quiet op7 between frames.
+- **Full hdcapm MST3367 init** (7b69e64) - UNTESTED on hardware.
+- **hdcapm detect map + mode table** - `mst3367_measure()` /
+  `mst3367_match_mode()`; `watch` prints the scaled fields and whether the
+  table matched on every locked sample.
+- **GPIO direction repair** - the reset sequence forces HPD/RX_ENABLE/
+  RX_STRAP/RX_RESET to outputs first (the M51 probe left them as inputs and
+  wedged the receiver through rmmod); bring-up verifies the bus afterwards
+  and retries with the opposite `GPIO_DIR` polarity, which is still unproven.
+- **HPD read-back** - reports `PIN DID NOT FOLLOW` if a write did not stick.
+- Params added this session: `nosg_frame_timeout_ms`, `gpio_dir_invert`,
+  `edidhunt_max_regs`, `signal_poll_ms`, `force_timings`.
+- `/proc/mz0380-hdmi`: `ramtest wscan edidhunt gpiodump i2cscan edidburn
+  hpd edid watch` + `<input> <w> <h> <fps>`.
 
 ## Test scripts (each has a decision table in its header)
 
-`m35` live tokens · `m36` write extent + hole map · `m38` repoison ·
-`m39` respawn · `m42` real-signal capture · `m43` sink read-back ·
-`m45` detect watch · `m47` EDID opcode sweep · `m48` HPD isolation ·
-`m49` writability scan · `m50` nosg NV12 polling capture.
-
-## Note on the working tree
-
-Everything is uncommitted (`git status` shows the modified sources plus ~15
-untracked scripts, `mz0380-edid.h`, `ep-disasm.txt`, `re-dump/`). Worth a
-commit before the next session — nothing here has been committed since
-`6aaac66`.
+`m35` live tokens · `m36` extent+holes · `m38` repoison · `m39` respawn ·
+`m42` real-signal · `m43` sink read-back · `m45` detect watch · `m47` EDID
+opcodes · `m48` HPD · `m49` writability · **`m50` nosg NV12 capture** ·
+`m51` i2c bit-bang · `m51b` GPIO hunt · `m52` card recovery · `m53` edidhunt ·
+`m54` source trigger · **`m55` real capture**.
 
 ---
 
-## If you want to keep making progress without the Windows trace
+## If the real path lands, the ranked follow-ups are
 
-Ranked by value:
-
-1. **Commit the work** (above) — a lot of verified ground would be painful to
-   lose.
-2. **Pragmatic capture**: the fake path reliably delivers one complete raw
-   1080p frame per stream start. A polling drain plus V4L2 NV12 would give
-   working single-frame capture with no further RE.
-3. **Decode opcode 0x50** in the card's *userspace* binaries (`vcm.txt`,
-   `tinyvenc5.txt` — not `ep.ko`, which only doorbells it). Windows sends it
-   with 32-byte payloads during streaming; it is the last host→card channel
-   never decoded, and an outside chance for the EDID path.
-4. **Try the other inputs** (SDI/component) — they may not need an EDID at
-   all, which would exercise the whole capture path end-to-end and prove out
-   the real-signal code independently of the HDMI sink problem.
+1. Decode the delivered frames (H.264 NALs expected: `00 00 00 01`).
+2. Per-mode receiver config if the picture is wrong (M10 step 2).
+3. Audio (ALSA path is scaffolded, never exercised).
+4. The DSLR/EDID question - only a live Windows I2C trace or an inline EDID
+   emulator/HDMI splitter will make that camera transmit. It no longer
+   blocks driver development now that the microscope works.
