@@ -132,37 +132,181 @@ static void mz0380_mst3367_reset(struct mz0380_dev *dev)
  * Runs after the reset release; configures HDMI RX path, HDCP receive, YUV422
  * 8-bit output, then a HDMI + HDCP block reset.
  */
-static void mz0380_mst3367_init_regs(struct mz0380_dev *dev)
+/* read-modify-write helpers, matching hdcapm's mst3367_set / mst3367_clr */
+static void mst_set(struct mz0380_dev *dev, u8 reg, u8 mask)
 {
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0xb7, 0x02);   /* HPD off during config */
-	mst_wr(dev, 0x41, 0x6f);
-	mst_wr(dev, 0xb8, 0x00);
-	mst_bank(dev, MST3367_BANK1);
-	mst_wr(dev, 0x0f, 0x02);
-	mst_wr(dev, 0x16, 0x30);
-	mst_wr(dev, 0x24, 0x40);   /* HDCP receive */
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0xb0, 0x14);
-	mst_wr(dev, 0xb1, 0xe0);
-	mst_bank(dev, MST3367_BANK2);
-	mst_wr(dev, 0x01, 0x61);
-	mst_wr(dev, 0x02, 0xf5);
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0x51, 0x89);
-	mst_wr(dev, 0xb7, 0x00);   /* HPD + link on */
-	usleep_range(2000, 3000);
-	mst_wr(dev, 0xb0, 0x20);   /* YUV422 8-bit output */
+	u8 v = 0;
 
-	/* HDMI reset (BANK2 0x07 f4->04) + HDCP reset (BANK0 0xb8 10->00) */
-	mst_bank(dev, MST3367_BANK2);
-	mst_wr(dev, 0x07, 0xf4);
-	mst_wr(dev, 0x07, 0x04);
-	usleep_range(2000, 3000);
+	if (!mst_rd(dev, reg, &v))
+		mst_wr(dev, reg, v | mask);
+}
+
+static void mst_clr(struct mz0380_dev *dev, u8 reg, u8 mask)
+{
+	u8 v = 0;
+
+	if (!mst_rd(dev, reg, &v))
+		mst_wr(dev, reg, v & ~mask);
+}
+
+static void mst3367_hdcp_reset(struct mz0380_dev *dev)
+{
 	mst_bank(dev, MST3367_BANK0);
 	mst_wr(dev, 0xb8, 0x10);
 	mst_wr(dev, 0xb8, 0x00);
-	usleep_range(2000, 3000);
+	msleep(20);
+}
+
+static void mst3367_hdmi_reset(struct mz0380_dev *dev)
+{
+	mst_bank(dev, MST3367_BANK2);
+	mst_wr(dev, 0x07, 0xf4);
+	mst_wr(dev, 0x07, 0x04);
+	msleep(20);
+}
+
+/*
+ * MST3367 init - a faithful port of hdcapm's mst3367_init_setup() plus the
+ * RxHdmiInit block it ends with (GPL, same receiver, RE'd from the Windows
+ * driver for a sibling board).
+ *
+ * M56: our previous version was a small subset of this and, on hardware,
+ * the receiver would see a source's clock (detect bit 0x80, horizontal
+ * period measured) but never reach frame lock (0x55 & 0x3c stayed clear,
+ * the vertical-period counter sat saturated at 0x1fff). The blocks missing
+ * here are exactly the ones that would explain that: RxTmdsInit programs
+ * the TMDS equaliser/PLL, RxVideoInit the filter and sync handling, and the
+ * "patches" tail disables auto-positioning. Ordering is hdcapm's, which
+ * matters: HPD stays off across the whole sequence and only rises at the
+ * end, after the HDCP and HDMI blocks are reset.
+ */
+static void mz0380_mst3367_init_regs(struct mz0380_dev *dev)
+{
+	/* CSC coefficients, written as a block at BANK0 0x92.. (hdcapm) */
+	static const u8 csctbl[] = {
+		0x40,
+		0x08, 0x02, 0x03, 0x65, 0x7E, 0x28, /* M11, M12, M13 */
+		0x78, 0xB9, 0x0B, 0x65, 0x79, 0xD6, /* M21, M22, M23 */
+		0x7F, 0x45, 0x01, 0x27, 0x08, 0x02, /* M31, M32, M33 */
+		0x20, 0x00, 0x02, 0x81, 0x20, 0x01, /*  A1,  A2,  A3 */
+		0x15, 0x95, 0x05, 0x20, 0xC0, 0x08
+	};
+	unsigned int i;
+
+	/* HPD off for the whole configuration */
+	mst_bank(dev, MST3367_BANK0);
+	mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_OFF);
+
+	/* RxGeneralInit */
+	mst_wr(dev, 0x41, 0x6f);
+	mst_wr(dev, 0xb8, 0x00);
+
+	/* RxTmdsInit - equaliser / PLL; absent from our old sequence */
+	mst_bank(dev, MST3367_BANK1);
+	mst_wr(dev, 0x0f, 0x02);
+	mst_wr(dev, 0x16, 0x30);
+	mst_wr(dev, 0x17, 0x00);
+	mst_wr(dev, 0x18, 0x00);
+	mst_wr(dev, 0x19, 0x00);
+	mst_wr(dev, 0x1a, 0x50);
+	mst_clr(dev, 0x2a, 0x07);
+	mst_set(dev, 0x2a, 0x07);
+	mst_bank(dev, MST3367_BANK2);
+	mst_wr(dev, 0x08, 0x03);
+
+	/* RxHdcpInit - receive HDCP */
+	mst_bank(dev, MST3367_BANK1);
+	mst_wr(dev, 0x24, 0x40);
+	mst_wr(dev, 0x30, 0x80);
+	mst_wr(dev, 0x31, 0x00);
+	mst_wr(dev, 0x32, 0x00);
+
+	/* RxVideoInit */
+	mst_bank(dev, MST3367_BANK0);
+	mst_wr(dev, 0xb0, 0x14);
+	mst_set(dev, 0xae, 0x04);
+	mst_wr(dev, 0xad, 0x05);        /* enable low-pass filter */
+	mst_wr(dev, 0xb1, 0xe0);
+	mst_wr(dev, 0xb2, 0x08);
+	mst_wr(dev, 0xb3, 0x00);
+	mst_wr(dev, 0xb4, 0x55);
+
+	/* RxAudioInit */
+	mst_clr(dev, 0xb4, 0x03);
+	mst_bank(dev, MST3367_BANK2);
+	mst_wr(dev, 0x01, 0x61);
+	mst_wr(dev, 0x02, 0xf5);
+	mst_set(dev, 0x03, 0x02);
+	mst_wr(dev, 0x04, 0x01);
+	mst_wr(dev, 0x05, 0x00);
+	mst_wr(dev, 0x06, 0x08);
+	mst_wr(dev, 0x1c, 0x1a);
+	mst_wr(dev, 0x1d, 0x00);
+	mst_wr(dev, 0x1e, 0x00);
+	mst_wr(dev, 0x1f, 0x00);
+	mst_clr(dev, 0x25, 0xa2);
+	mst_set(dev, 0x25, 0xa2);
+
+	mst_set(dev, 0x02, 0x80);
+	mst_set(dev, 0x07, 0x04);
+	mst_wr(dev, 0x17, 0xc0);
+	mst_wr(dev, 0x19, 0xff);
+	mst_wr(dev, 0x1a, 0xff);
+	mst_wr(dev, 0x1b, 0xfc);
+	mst_wr(dev, 0x20, 0x00);
+	mst_clr(dev, 0x21, 0x03);
+	mst_wr(dev, 0x22, 0x26);
+	mst_wr(dev, 0x27, 0x00);
+	mst_set(dev, 0x2e, 0xa1);
+
+	/* colour range */
+	mst_bank(dev, MST3367_BANK0);
+	mst_wr(dev, 0xab, 0x15);
+	mst_clr(dev, 0xac, 0x3f);
+	mst_set(dev, 0xac, 0x15);
+
+	/* RxSwitchSource - HDMI */
+	mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_OFF);
+	mst3367_hdcp_reset(dev);
+	mst3367_hdmi_reset(dev);
+	mst_bank(dev, MST3367_BANK0);
+	mst_wr(dev, 0x51, 0x89);
+	mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_ON);
+	mst_wr(dev, 0xb7, 0x00);
+
+	/* patches */
+	mst_wr(dev, 0xe2, 0x00);        /* disable auto position */
+	mst_wr(dev, 0x1e, 0x11);
+	mst_wr(dev, 0x1f, 0x01);
+	mst_wr(dev, 0x73, 0x90);
+	mst_wr(dev, 0xb5, 0x0c);
+
+	/* CSC */
+	mst_wr(dev, 0x90, 0x15);
+	mst_wr(dev, 0x91, 0x15);
+	for (i = 0; i < ARRAY_SIZE(csctbl); i++)
+		mst_wr(dev, 0x92 + i, csctbl[i]);
+
+	/* YUV422, 8-bit, external sync */
+	mst_wr(dev, 0xb0, 0x20);
+
+	/* RxHdmiInit */
+	mst_bank(dev, MST3367_BANK2);
+	mst_clr(dev, 0x01, 0xf0);
+	mst_set(dev, 0x01, 0x40 | 0x20);
+	mst_set(dev, 0x04, 0x01);
+	mst_wr(dev, 0x06, 0x08);
+	mst_set(dev, 0x09, 0x20);
+	mst_bank(dev, MST3367_BANK0);
+	mst_clr(dev, 0x54, 0x10);
+	mst_set(dev, 0xac, 0x80);
+	mst_set(dev, 0x00, 0x80);
+	mst_set(dev, 0xce, 0x80);
+	mst_clr(dev, 0xcf, 0x07);
+	mst_set(dev, 0xcf, 0x02);
+	mst_clr(dev, 0x00, 0x80);
+
+	msleep(20);
 }
 
 /*
