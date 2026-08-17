@@ -80,22 +80,31 @@ NOTE: a few fields look like upstream typos — 1080p30 htotal_max `3305` (likel
 against real captured `htotal/vtotal` before trusting. Table also omits 1080i/576i — extend as
 needed from your own detect reads.
 
-## HD60 Pro measurement units differ from hdcapm's (M57, hardware-confirmed)
+## Reading this chip on the HD60 Pro (M58, hardware-confirmed)
 
-The first FULL lock on our card (`R55=0x7f`, all four `0x3c` bits) read
-`htot=2200 vtot=899 hper=674 vper=750 p`. That is a clean 1080p60 in *different units*:
+A clean full lock (`R55=0x3f`) reads `htot=2200 vtot=1125 hact=1922 hper=674 vper=599`.
 
-| field | our card | hdcapm table | factor | why |
-|---|---|---|---|---|
-| hperiod | 674 | 665–685 | 1 | raw 2372 x 67.5kHz = **160MHz** ref — hdcapm's `1600000` is correct for us |
-| vperiod | 750 | 595–605 | x0.8 | raw 1666 x 60Hz = **100kHz** ref, hdcapm assumes 125kHz (`1250000`) |
-| vtotal | 899 | 1120–1130 | x1.25 | derived from the same 100kHz reference, so 0.8x low |
-| htotal | 2200 | 3290–3310 | x1.5 | we report the TRUE video htotal; hdcapm's column is a 1.5x oversampled domain |
+| field | our card | hdcapm table (1080p60) | verdict |
+|---|---|---|---|
+| hperiod | 674 | 665–685 | ✅ raw 2372 x 67.5kHz = **160MHz** ref, `1600000` correct |
+| vperiod | 599 | 595–605 | ✅ `1250000` correct |
+| vtotal | 1125 | 1120–1130 | ✅ |
+| htotal | 2200 | 3290–3310 | ❌ x1.5 domain |
 
-The htotal split is not new — hdcapm's own table carries 720p60 twice (1650 = true, 2475 = 1.5x).
-So the driver keeps the table verbatim and normalises the measurement into it:
-match raw first, then retry with `htotal*3/2, vtotal*5/4, vperiod*4/5`. All four fields of the
-sample above land inside the 1080p60 row at once under that transform.
+Only **htotal** needs normalising (`* 3 / 2`), and that split is already in hdcapm's own table:
+720p60 appears twice, at 1650 (true video total) and 2475 (x1.5). The driver matches raw units
+first, then retries with the scaled htotal.
+
+**Reg 0x5f bit1 is not interlace on this part.** The sample above — 67.4kHz hfreq over 1125
+lines, i.e. unambiguously 1080**p**60, since 1080i60 would read hper≈337 — came back with
+`0x5f=0x17`. Interlace is derived from geometry instead: `lines = hperiod*1000/vperiod` equals
+vtotal when progressive and vtotal/2 when the vertical counter is measuring fields. 0x5f is
+still logged raw, pending a real interlaced source.
+
+**Gate on `(R55 & 0x3c) == 0x3c`, not `!= 0`.** Every torn read (`htot=656`, `vtot=5`, and the
+self-consistent-but-wrong `vtot=899 vper=750` 75Hz sample) came from a partial lock
+(`0xa3`/`0x23`/`0x27`, bit `0x20` only) — the source still settling while the multi-byte reads
+walk over moving counters.
 
 Also: gate on `(R55 & 0x3c) == 0x3c`, not `!= 0`. Every torn read in the M55/M56 runs
 (`htot=656`, `vtot=5`) came from a partial lock (`0xa3`/`0x23`, bit `0x20` only) — the source

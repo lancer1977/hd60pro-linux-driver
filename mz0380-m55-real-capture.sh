@@ -68,17 +68,31 @@ dmesg | grep -E "MST3367 signal|force_timings|locked but unmatched|partial lock"
 
 echo
 echo "=== 2. capture $FRAMES frames (power-cycle the source again if needed) ==="
-rm -f /tmp/cap-m55.h264
+# M58: the nosg path delivers raw NV12, not H.264 - name the file for what it
+# actually holds so the check below is not nonsense (the M57 run "failed"
+# ffprobe purely because raw NV12 was written to a .h264 name).
+if [ "$NOSG" = 1 ]; then CAP=/tmp/cap-m55.nv12; else CAP=/tmp/cap-m55.h264; fi
+rm -f "$CAP"
 dmesg -C
 timeout 40 v4l2-ctl -d /dev/video0 --stream-mmap --stream-count="$FRAMES" \
-	--stream-to=/tmp/cap-m55.h264
-SZ=$(stat -c %s /tmp/cap-m55.h264 2>/dev/null || echo 0)
+	--stream-to="$CAP"
+SZ=$(stat -c %s "$CAP" 2>/dev/null || echo 0)
 echo "--- captured $SZ bytes ---"
 
 echo "=== 3. what did the card do? ==="
 dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal" | head -20
-if [ "$SZ" -gt 0 ]; then
+if [ "$SZ" -gt 0 ] && [ "$NOSG" = 1 ]; then
+	# NV12: luma 0x10-0x11 across the whole frame means the encoder ran but
+	# the receiver had no live signal - black, not garbage. A spread of
+	# values means real picture content.
+	echo "=== 4. is there picture in the NV12, or is it black? ==="
+	head -c 64 "$CAP" | od -An -tx1
+	echo -n "distinct luma byte values in the first 256KiB: "
+	head -c 262144 "$CAP" | od -An -tx1 -v | tr -s ' ' '\n' | sort -u | grep -c .
+	echo "(1-3 distinct values => black/flat frame, source was not transmitting"
+	echo " during the capture; dozens => real picture)"
+elif [ "$SZ" -gt 0 ]; then
 	echo "=== 4. does it look like H.264? (expect 00 00 00 01 NAL starts) ==="
-	head -c 32 /tmp/cap-m55.h264 | od -An -tx1
-	command -v ffprobe >/dev/null && ffprobe -v error -show_streams /tmp/cap-m55.h264 2>&1 | head -20
+	head -c 32 "$CAP" | od -An -tx1
+	command -v ffprobe >/dev/null && ffprobe -v error -show_streams "$CAP" 2>&1 | head -20
 fi

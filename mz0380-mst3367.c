@@ -637,6 +637,8 @@ struct mst3367_measured {
 	u16 htotal, vtotal, hactive;
 	u16 hperiod, vperiod;       /* scaled, comparable to the table */
 	u16 hperiod_raw, vperiod_raw;
+	u16 lines;                  /* hfreq/vfreq: lines per vertical period */
+	u8 r5f;                     /* hdcapm's interlace register, logged raw */
 	bool interlaced;
 };
 
@@ -807,9 +809,10 @@ int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 					const struct v4l2_dv_timings *t =
 						mst3367_match_mode(&m, &scaled);
 
-					pr_info("%s: detect   -> htot=%u vtot=%u hact=%u hper=%u vper=%u %s => %s%s\n",
+					pr_info("%s: detect   -> htot=%u vtot=%u hact=%u hper=%u vper=%u lines=%u 5f=%02x %s => %s%s\n",
 						dev->name, m.htotal, m.vtotal,
 						m.hactive, m.hperiod, m.vperiod,
+						m.lines, m.r5f,
 						m.interlaced ? "i" : "p",
 						t ? "MATCHED" : "no table entry",
 						t && scaled ? " (host units)" : "");
@@ -1071,24 +1074,25 @@ static bool mst3367_in_range(const struct mst3367_mode *e, u16 htotal,
 }
 
 /*
- * M57 (hardware). The first FULL lock this card ever produced (R55=0x7f, all
- * four 0x3c bits) measured htot=2200 vtot=899 hper=674 vper=750 - and that is
- * a clean 1080p60 in different units, not a bad read:
+ * M58 (hardware). Only htotal is in a different domain than hdcapm's table.
+ * The clean full-lock sample reads
  *
- *   hperiod raw 2372 -> ref = 67.5kHz * 2372 = 160MHz, so hdcapm's 1600000
- *     constant is exactly right for our silicon (674 == 67.4kHz).
- *   vperiod raw 1666 -> ref = 60Hz * 1666 = 100kHz, but hdcapm's 1250000
- *     assumes 125kHz. Our vertical counters therefore read 1.25x high in
- *     frequency, and vtotal, derived from the same reference, reads 0.8x
- *     (899 vs 1125).
- *   htotal is the TRUE video total here (2200 for 1080p60), while hdcapm's
- *     column is a 1.5x oversampled domain - the same split their two 720p60
- *     rows (1650 vs 2475) already document.
+ *   htot=2200 vtot=1125 hper=674 vper=599
  *
- * Scaling the sample by x1.5 / x1.25 / x0.8 lands all four fields inside the
- * 1080p60 row at once, so the table is kept verbatim and the measurement is
- * normalised into its units instead. Raw units are tried first because the
- * chip does report hdcapm's domain for some sources (the 2475 row).
+ * where vtotal (1125) and vperiod (599 == 60.0Hz, from 1250000/raw) already
+ * sit inside the 1080p60 row, confirming hdcapm's vertical constants on this
+ * silicon; hperiod likewise (raw 2372 -> 160MHz reference -> 67.4kHz). But
+ * htotal is the TRUE video total, 2200, against the table's 3290-3310. That
+ * split is not new: hdcapm's own table carries 720p60 twice, at 1650 (true)
+ * and 2475 (x1.5), because the chip reports either depending on the clock
+ * domain it locks in.
+ *
+ * So the table stays verbatim and only htotal is normalised. Raw units are
+ * tried first, since the chip does report the x1.5 domain for some sources.
+ *
+ * (M57 read x1.25/x0.8 into the vertical fields too. That was fitted to one
+ * torn sample - htot=2200 vtot=899 vper=750 is a self-consistent 75Hz, the
+ * right TMDS clock with vsync still settling, not a unit mismatch. Retracted.)
  */
 static const struct v4l2_dv_timings *
 mst3367_match_mode(const struct mst3367_measured *m, bool *scaled)
@@ -1105,8 +1109,8 @@ mst3367_match_mode(const struct mst3367_measured *m, bool *scaled)
 
 	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++)
 		if (mst3367_in_range(&mst3367_modes[i], m->htotal * 3 / 2,
-				     m->vtotal * 5 / 4, m->hperiod,
-				     m->vperiod * 4 / 5, m->interlaced)) {
+				     m->vtotal, m->hperiod,
+				     m->vperiod, m->interlaced)) {
 			if (scaled)
 				*scaled = true;
 			return &mst3367_modes[i].timings;
@@ -1154,7 +1158,25 @@ static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out)
 	out->vperiod_raw = raw;
 	out->vperiod = raw ? 1250000u / raw : 0;
 
-	out->interlaced = !!(r5f & MST3367_B0_INTERLACE_BIT);
+	/*
+	 * M58 (hardware): do NOT trust hdcapm's reg 0x5f bit1 here. A sample
+	 * that is unambiguously 1080p60 - hper=674 (67.4kHz), vtot=1125,
+	 * vper=599 (60.0Hz) - came back with 0x5f=0x17, bit1 set. 1080i60
+	 * would have to read hper=337, so the bit means something else on
+	 * this part; it is kept only for logging until a real interlaced
+	 * source pins it down.
+	 *
+	 * Derive interlace from the geometry instead. lines = hfreq/vfreq,
+	 * with hperiod in 100Hz units and vperiod in 0.1Hz units. That equals
+	 * vtotal for a progressive source and vtotal/2 for an interlaced one,
+	 * where the vertical counter measures fields, not frames.
+	 */
+	out->r5f = r5f;
+	out->lines = out->vperiod ?
+		(u16)((u32)out->hperiod * 1000u / out->vperiod) : 0;
+	out->interlaced = out->lines && out->vtotal &&
+		abs((int)out->lines - (int)out->vtotal) >
+		abs((int)out->lines - (int)out->vtotal / 2);
 
 	if (mst_bank(dev, MST3367_BANK2) ||
 	    mst_rd(dev, MST3367_B2_HACTIVE_HI, &hi) ||
@@ -1235,9 +1257,10 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 
 	match = mst3367_match_mode(&m, &scaled);
 	if (!match) {
-		pr_info("%s: MST3367 locked but unmatched: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) %s [R55=0x%02x] - please report\n",
+		pr_info("%s: MST3367 locked but unmatched: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) lines=%u 5f=%02x %s [R55=0x%02x] - please report\n",
 			dev->name, m.htotal, m.vtotal, m.hactive,
 			m.hperiod, m.hperiod_raw, m.vperiod, m.vperiod_raw,
+			m.lines, m.r5f,
 			m.interlaced ? "i" : "p", detect);
 
 		/*
