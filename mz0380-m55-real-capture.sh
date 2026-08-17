@@ -81,6 +81,17 @@ echo "--- captured $SZ bytes ---"
 
 echo "=== 3. what did the card do? ==="
 dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal" | head -20
+
+# M59: a wall of SET_VIC ret=-110 is the known wedge, not a capture bug. The
+# mailbox stops answering after enough encoder spawns and ONLY a mains-off
+# cold boot clears it - rmmod/insmod and firmware re-upload do not. Say so
+# here, because every later result in this run is meaningless once it hits.
+if [ "$(dmesg | grep -c 'ret=-110')" -gt 2 ]; then
+	echo
+	echo "!!! CARD WEDGED: SET_VIC is timing out (-110). The mailbox is dead."
+	echo "!!! Shut down, switch the PSU off at the mains, then retry."
+	echo "!!! uptime: $(uptime -p) - a cold boot resets this counter."
+fi
 if [ "$SZ" -gt 0 ] && [ "$NOSG" = 1 ]; then
 	# NV12: luma 0x10-0x11 across the whole frame means the encoder ran but
 	# the receiver had no live signal - black, not garbage. A spread of

@@ -801,7 +801,13 @@ int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 			 * from telling us which range is off, instead of
 			 * needing another run to find out.
 			 */
-			if (locked) {
+			/*
+			 * M59: measure on ANY lock bit. The only usable sample
+			 * of that run sat at R55=0x5f, which is not a full
+			 * 0x3c, so gating the measurement on "LOCKED" hid the
+			 * very reading the table now matches.
+			 */
+			if (lock) {
 				struct mst3367_measured m;
 				bool scaled = false;
 
@@ -1209,53 +1215,60 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			return ret;
 	}
 
-	ret = mst_bank(dev, MST3367_BANK0);
-	if (ret)
-		return ret;
-
 	/*
 	 * M54 (hardware): a real source does not hold lock steadily while it
 	 * is settling - the detect byte was seen walking 0x83 -> 0xa3 (locked)
 	 * -> 0x83 -> 0x03 within a second. A single read therefore reports
 	 * "no signal" for a source that is plainly transmitting, so sample
-	 * until the lock bit appears or the window expires.
+	 * across a window rather than once.
 	 *
-	 * M57 (hardware): wait for a FULL 0x3c, not for any lock bit. The run
-	 * that produced garbage timings held only bit 0x20 (R55=0xa3/0x23) -
-	 * a settling source whose counters are still moving, so the multi-byte
-	 * reads tear (htot=656, vtot=5 out of the same source that reads
-	 * htot=2200 vtot=899 one full lock later). A partial lock still
-	 * counts as "something is there": if the window expires with one set,
-	 * measure it anyway rather than reporting no signal.
+	 * M59 (hardware): and do not try to rank sample quality by R55. The
+	 * one good sample of that run read R55=0x5f (only 0x1c of the 0x3c
+	 * lock bits), while the run before it produced a full 0x3c (0x7f)
+	 * carrying the bad 75Hz measurement. The bits that do correlate are
+	 * in reg 0x5f - every torn sample had 0x40 set and a vperiod counter
+	 * saturated (0x1fff) or near zero - but there is no need to guess at
+	 * a status bit when the mode table is itself the quality gate.
+	 *
+	 * So: measure on every sample that shows any lock, and return the
+	 * first one that MATCHES. Only if the window expires with no match do
+	 * we report what the last sample looked like.
 	 */
 	{
 		unsigned long deadline = jiffies +
 			msecs_to_jiffies(mz0380_signal_poll_ms);
-		u8 lock;
+		bool any_lock = false, have_sample = false;
 
 		for (;;) {
+			ret = mst_bank(dev, MST3367_BANK0);
+			if (ret)
+				return ret;
 			ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
 			if (ret)
 				return ret;
-			lock = detect & MST3367_B0_DETECT_LOCK_MASK;
-			if (lock == MST3367_B0_DETECT_LOCK_MASK)
-				break;
-			if (time_after_eq(jiffies, deadline)) {
-				if (!lock)
-					return -ENOLCK;  /* no signal at all */
-				pr_info("%s: MST3367 partial lock only (R55=0x%02x) - measuring anyway\n",
-					dev->name, detect);
-				break;
+
+			if (detect & MST3367_B0_DETECT_LOCK_MASK) {
+				any_lock = true;
+				if (!mst3367_measure(dev, &m)) {
+					have_sample = true;
+					match = mst3367_match_mode(&m, &scaled);
+					if (match)
+						goto matched;
+				}
 			}
+
+			if (time_after_eq(jiffies, deadline))
+				break;
 			msleep(20);
 		}
+
+		if (!any_lock)
+			return -ENOLCK;         /* receiver sees no signal */
+		if (!have_sample)
+			return -EIO;
+		match = NULL;
 	}
 
-	ret = mst3367_measure(dev, &m);
-	if (ret)
-		return ret;
-
-	match = mst3367_match_mode(&m, &scaled);
 	if (!match) {
 		pr_info("%s: MST3367 locked but unmatched: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) lines=%u 5f=%02x %s [R55=0x%02x] - please report\n",
 			dev->name, m.htotal, m.vtotal, m.hactive,
@@ -1282,6 +1295,7 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 		return -ERANGE;
 	}
 
+matched:
 	*out = *match;
 	pr_info("%s: MST3367 signal: %ux%u%s%s (htot=%u vtot=%u hper=%u vper=%u hact=%u R55=0x%02x)\n",
 		dev->name, out->bt.width, out->bt.height,
