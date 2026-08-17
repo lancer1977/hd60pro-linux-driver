@@ -80,6 +80,27 @@ NOTE: a few fields look like upstream typos — 1080p30 htotal_max `3305` (likel
 against real captured `htotal/vtotal` before trusting. Table also omits 1080i/576i — extend as
 needed from your own detect reads.
 
+## HD60 Pro measurement units differ from hdcapm's (M57, hardware-confirmed)
+
+The first FULL lock on our card (`R55=0x7f`, all four `0x3c` bits) read
+`htot=2200 vtot=899 hper=674 vper=750 p`. That is a clean 1080p60 in *different units*:
+
+| field | our card | hdcapm table | factor | why |
+|---|---|---|---|---|
+| hperiod | 674 | 665–685 | 1 | raw 2372 x 67.5kHz = **160MHz** ref — hdcapm's `1600000` is correct for us |
+| vperiod | 750 | 595–605 | x0.8 | raw 1666 x 60Hz = **100kHz** ref, hdcapm assumes 125kHz (`1250000`) |
+| vtotal | 899 | 1120–1130 | x1.25 | derived from the same 100kHz reference, so 0.8x low |
+| htotal | 2200 | 3290–3310 | x1.5 | we report the TRUE video htotal; hdcapm's column is a 1.5x oversampled domain |
+
+The htotal split is not new — hdcapm's own table carries 720p60 twice (1650 = true, 2475 = 1.5x).
+So the driver keeps the table verbatim and normalises the measurement into it:
+match raw first, then retry with `htotal*3/2, vtotal*5/4, vperiod*4/5`. All four fields of the
+sample above land inside the 1080p60 row at once under that transform.
+
+Also: gate on `(R55 & 0x3c) == 0x3c`, not `!= 0`. Every torn read in the M55/M56 runs
+(`htot=656`, `vtot=5`) came from a partial lock (`0xa3`/`0x23`, bit `0x20` only) — the source
+still settling while the multi-byte reads walk over changing counters.
+
 ## Architecture takeaway
 `mst3367-drv.c` is a self-contained V4L2 **i2c sub-device** driver that talks to the chip over a
 standard `i2c_adapter` (`i2c_transfer`). To reuse it on the HD60 Pro (PCIe), provide an

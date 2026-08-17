@@ -29,6 +29,11 @@ cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 FRAMES=${1:-60}
 LOCKWAIT=${2:-45}
+# M57: default to the delivery path that is PROVEN to land frames (m50's
+# nosg NV12). The SG path returned 0 bytes on the M55 run and that is a
+# separate, already-known completion problem - do not let it mask the
+# mode-detect result. NOSG=0 to test the SG path deliberately.
+NOSG=${NOSG:-1}
 make >/dev/null || { echo "build failed"; exit 1; }
 
 fuser -k /dev/video0 2>/dev/null
@@ -37,7 +42,7 @@ sleep 1
 modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
 insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
 	enable_video=1 procfs_verbosity=2 dma_iova_remap=1 aic_on=1 \
-	stream_nosg=0 force_timings=1 signal_poll_ms=4000 \
+	stream_nosg="$NOSG" force_timings=1 signal_poll_ms=4000 \
 	|| { echo "insmod failed"; exit 1; }
 echo "waiting for firmware upload + boot..."
 sleep 25
@@ -59,7 +64,7 @@ echo
 echo "=== 1b. can the driver name the mode? ==="
 dmesg -C
 v4l2-ctl -d /dev/video0 --query-dv-timings
-dmesg | grep -E "MST3367 signal|force_timings|locked but unmatched"
+dmesg | grep -E "MST3367 signal|force_timings|locked but unmatched|partial lock"
 
 echo
 echo "=== 2. capture $FRAMES frames (power-cycle the source again if needed) ==="

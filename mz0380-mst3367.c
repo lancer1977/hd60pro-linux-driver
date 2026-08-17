@@ -642,7 +642,7 @@ struct mst3367_measured {
 
 static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out);
 static const struct v4l2_dv_timings *
-mst3367_match_mode(const struct mst3367_measured *m);
+mst3367_match_mode(const struct mst3367_measured *m, bool *scaled);
 
 /* --- sink-chain diagnostics ----------------------------------------------- */
 
@@ -776,10 +776,19 @@ int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 		}
 
 		if (changed) {
-			bool locked = now[0] & MST3367_B0_DETECT_LOCK_MASK;
+			u8 lock = now[0] & MST3367_B0_DETECT_LOCK_MASK;
+			bool locked = lock == MST3367_B0_DETECT_LOCK_MASK;
 
+			/*
+			 * M57: only a FULL 0x3c is a usable lock. Partial
+			 * locks (0x20 alone) are the settling state, and the
+			 * timing block read during one is torn - that is where
+			 * vtot=5 and htot=656 came from.
+			 */
 			pr_info("%s: detect 55=%02x %s | 5f=%02x hper=%02x%02x vper=%02x%02x htot=%02x%02x\n",
-				dev->name, now[0], locked ? "LOCKED" : "no-lock",
+				dev->name, now[0],
+				locked ? "LOCKED" :
+					 lock ? "settling" : "no-lock",
 				now[1], now[2], now[3], now[4], now[5],
 				now[6], now[7]);
 
@@ -792,16 +801,18 @@ int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 			 */
 			if (locked) {
 				struct mst3367_measured m;
+				bool scaled = false;
 
 				if (!mst3367_measure(dev, &m)) {
 					const struct v4l2_dv_timings *t =
-						mst3367_match_mode(&m);
+						mst3367_match_mode(&m, &scaled);
 
-					pr_info("%s: detect   -> htot=%u vtot=%u hact=%u hper=%u vper=%u %s => %s\n",
+					pr_info("%s: detect   -> htot=%u vtot=%u hact=%u hper=%u vper=%u %s => %s%s\n",
 						dev->name, m.htotal, m.vtotal,
 						m.hactive, m.hperiod, m.vperiod,
 						m.interlaced ? "i" : "p",
-						t ? "MATCHED" : "no table entry");
+						t ? "MATCHED" : "no table entry",
+						t && scaled ? " (host units)" : "");
 					mst_bank(dev, MST3367_BANK0);
 				}
 			}
@@ -1049,22 +1060,58 @@ static const struct mst3367_mode mst3367_modes[] = {
 					 665,  685,  595,  605, false },
 };
 
+static bool mst3367_in_range(const struct mst3367_mode *e, u16 htotal,
+			     u16 vtotal, u16 hperiod, u16 vperiod, bool il)
+{
+	return htotal  >= e->htotal_min  && htotal  <= e->htotal_max &&
+	       vtotal  >= e->vtotal_min  && vtotal  <= e->vtotal_max &&
+	       hperiod >= e->hperiod_min && hperiod <= e->hperiod_max &&
+	       vperiod >= e->vperiod_min && vperiod <= e->vperiod_max &&
+	       il == e->interlaced;
+}
+
+/*
+ * M57 (hardware). The first FULL lock this card ever produced (R55=0x7f, all
+ * four 0x3c bits) measured htot=2200 vtot=899 hper=674 vper=750 - and that is
+ * a clean 1080p60 in different units, not a bad read:
+ *
+ *   hperiod raw 2372 -> ref = 67.5kHz * 2372 = 160MHz, so hdcapm's 1600000
+ *     constant is exactly right for our silicon (674 == 67.4kHz).
+ *   vperiod raw 1666 -> ref = 60Hz * 1666 = 100kHz, but hdcapm's 1250000
+ *     assumes 125kHz. Our vertical counters therefore read 1.25x high in
+ *     frequency, and vtotal, derived from the same reference, reads 0.8x
+ *     (899 vs 1125).
+ *   htotal is the TRUE video total here (2200 for 1080p60), while hdcapm's
+ *     column is a 1.5x oversampled domain - the same split their two 720p60
+ *     rows (1650 vs 2475) already document.
+ *
+ * Scaling the sample by x1.5 / x1.25 / x0.8 lands all four fields inside the
+ * 1080p60 row at once, so the table is kept verbatim and the measurement is
+ * normalised into its units instead. Raw units are tried first because the
+ * chip does report hdcapm's domain for some sources (the 2475 row).
+ */
 static const struct v4l2_dv_timings *
-mst3367_match_mode(const struct mst3367_measured *m)
+mst3367_match_mode(const struct mst3367_measured *m, bool *scaled)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++) {
-		const struct mst3367_mode *e = &mst3367_modes[i];
+	if (scaled)
+		*scaled = false;
 
-		if (m->htotal  < e->htotal_min  || m->htotal  > e->htotal_max ||
-		    m->vtotal  < e->vtotal_min  || m->vtotal  > e->vtotal_max ||
-		    m->hperiod < e->hperiod_min || m->hperiod > e->hperiod_max ||
-		    m->vperiod < e->vperiod_min || m->vperiod > e->vperiod_max ||
-		    m->interlaced != e->interlaced)
-			continue;
-		return &e->timings;
-	}
+	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++)
+		if (mst3367_in_range(&mst3367_modes[i], m->htotal, m->vtotal,
+				     m->hperiod, m->vperiod, m->interlaced))
+			return &mst3367_modes[i].timings;
+
+	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++)
+		if (mst3367_in_range(&mst3367_modes[i], m->htotal * 3 / 2,
+				     m->vtotal * 5 / 4, m->hperiod,
+				     m->vperiod * 4 / 5, m->interlaced)) {
+			if (scaled)
+				*scaled = true;
+			return &mst3367_modes[i].timings;
+		}
+
 	return NULL;
 }
 
@@ -1128,6 +1175,7 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 {
 	const struct v4l2_dv_timings *match;
 	struct mst3367_measured m;
+	bool scaled = false;
 	u8 detect;
 	int ret;
 
@@ -1149,19 +1197,34 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	 * -> 0x83 -> 0x03 within a second. A single read therefore reports
 	 * "no signal" for a source that is plainly transmitting, so sample
 	 * until the lock bit appears or the window expires.
+	 *
+	 * M57 (hardware): wait for a FULL 0x3c, not for any lock bit. The run
+	 * that produced garbage timings held only bit 0x20 (R55=0xa3/0x23) -
+	 * a settling source whose counters are still moving, so the multi-byte
+	 * reads tear (htot=656, vtot=5 out of the same source that reads
+	 * htot=2200 vtot=899 one full lock later). A partial lock still
+	 * counts as "something is there": if the window expires with one set,
+	 * measure it anyway rather than reporting no signal.
 	 */
 	{
 		unsigned long deadline = jiffies +
 			msecs_to_jiffies(mz0380_signal_poll_ms);
+		u8 lock;
 
 		for (;;) {
 			ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
 			if (ret)
 				return ret;
-			if (detect & MST3367_B0_DETECT_LOCK_MASK)
+			lock = detect & MST3367_B0_DETECT_LOCK_MASK;
+			if (lock == MST3367_B0_DETECT_LOCK_MASK)
 				break;
-			if (time_after_eq(jiffies, deadline))
-				return -ENOLCK;   /* receiver sees no signal */
+			if (time_after_eq(jiffies, deadline)) {
+				if (!lock)
+					return -ENOLCK;  /* no signal at all */
+				pr_info("%s: MST3367 partial lock only (R55=0x%02x) - measuring anyway\n",
+					dev->name, detect);
+				break;
+			}
 			msleep(20);
 		}
 	}
@@ -1170,7 +1233,7 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	if (ret)
 		return ret;
 
-	match = mst3367_match_mode(&m);
+	match = mst3367_match_mode(&m, &scaled);
 	if (!match) {
 		pr_info("%s: MST3367 locked but unmatched: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) %s [R55=0x%02x] - please report\n",
 			dev->name, m.htotal, m.vtotal, m.hactive,
@@ -1197,9 +1260,10 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	}
 
 	*out = *match;
-	pr_info("%s: MST3367 signal: %ux%u%s (htot=%u vtot=%u hper=%u vper=%u hact=%u R55=0x%02x)\n",
+	pr_info("%s: MST3367 signal: %ux%u%s%s (htot=%u vtot=%u hper=%u vper=%u hact=%u R55=0x%02x)\n",
 		dev->name, out->bt.width, out->bt.height,
-		out->bt.interlaced ? "i" : "p", m.htotal, m.vtotal,
+		out->bt.interlaced ? "i" : "p",
+		scaled ? " [host units]" : "", m.htotal, m.vtotal,
 		m.hperiod, m.vperiod, m.hactive, detect);
 	return 0;
 }
