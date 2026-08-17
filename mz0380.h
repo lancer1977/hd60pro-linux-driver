@@ -580,6 +580,8 @@ extern unsigned int mz0380_set_buf_stride;
 extern unsigned int mz0380_card_frame_offset;
 extern bool mz0380_probe_windows;
 extern bool mz0380_gpio_dir_invert;
+extern unsigned int mz0380_signal_poll_ms;
+extern bool mz0380_force_timings;
 extern unsigned int mz0380_edidhunt_max_regs;
 extern unsigned int mz0380_edid_opcode;
 extern unsigned int mz0380_edid_timeout_ms;

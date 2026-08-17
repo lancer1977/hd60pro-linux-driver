@@ -424,6 +424,29 @@ module_param_named(edidhunt_max_regs, mz0380_edidhunt_max_regs, uint, 0644);
 MODULE_PARM_DESC(edidhunt_max_regs,
 		 "M53: max writable registers per bank used as indirect address/data candidates (def:48; cost is quadratic)");
 
+/*
+ * M54. A real source walks in and out of lock while it settles (observed:
+ * detect 0x83 -> 0xa3 locked -> 0x83 -> 0x03 inside a second), so a
+ * single-shot detect read calls a transmitting source "no signal". How
+ * long to sample before giving up.
+ */
+unsigned int mz0380_signal_poll_ms = 2000;
+module_param_named(signal_poll_ms, mz0380_signal_poll_ms, uint, 0644);
+MODULE_PARM_DESC(signal_poll_ms,
+		 "M54: how long to sample the MST3367 detect register for a lock before reporting no signal (def:2000)");
+
+/*
+ * M54. Stream a locked-but-unmatched signal as 1080p60 when the geometry
+ * says 1080p (htotal 2200). The first source that ever locked reports a
+ * saturated vperiod counter, so the frame rate cannot be derived and no
+ * table entry matches - without this the whole real-signal path stays
+ * blocked on one unreadable register.
+ */
+bool mz0380_force_timings;
+module_param_named(force_timings, mz0380_force_timings, bool, 0644);
+MODULE_PARM_DESC(force_timings,
+		 "M54: on a locked but unmatched signal with htotal=2200, stream as 1920x1080p60 (def:0)");
+
 bool mz0380_gpio_dir_invert;
 module_param_named(gpio_dir_invert, mz0380_gpio_dir_invert, bool, 0644);
 MODULE_PARM_DESC(gpio_dir_invert,

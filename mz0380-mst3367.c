@@ -891,11 +891,29 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	ret = mst_bank(dev, MST3367_BANK0);
 	if (ret)
 		return ret;
-	ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
-	if (ret)
-		return ret;
-	if (!(detect & MST3367_B0_DETECT_LOCK_MASK))
-		return -ENOLCK;                     /* receiver sees no signal */
+
+	/*
+	 * M54 (hardware): a real source does not hold lock steadily while it
+	 * is settling - the detect byte was seen walking 0x83 -> 0xa3 (locked)
+	 * -> 0x83 -> 0x03 within a second. A single read therefore reports
+	 * "no signal" for a source that is plainly transmitting, so sample
+	 * until the lock bit appears or the window expires.
+	 */
+	{
+		unsigned long deadline = jiffies +
+			msecs_to_jiffies(mz0380_signal_poll_ms);
+
+		for (;;) {
+			ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
+			if (ret)
+				return ret;
+			if (detect & MST3367_B0_DETECT_LOCK_MASK)
+				break;
+			if (time_after_eq(jiffies, deadline))
+				return -ENOLCK;   /* receiver sees no signal */
+			msleep(20);
+		}
+	}
 
 	/* geometry (BANK0) */
 	if (mst_rd(dev, MST3367_B0_HTOTAL_HI, &hhi) ||
@@ -935,6 +953,25 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			dev->name, hactive, htotal, interlaced ? "i" : "p",
 			fps100, detect,
 			((u16)hp_hi << 8) | hp_lo, vperiod_raw, ilo);
+
+		/*
+		 * M54: the first source that ever locked reports htot=2200 -
+		 * the horizontal total of 1080p - while the vperiod counter
+		 * reads saturated (0x1fff), so the frame rate cannot be
+		 * derived and no table entry matches. Refusing to stream on
+		 * that would block the whole real-signal path on one unread
+		 * register. When the caller opts in, take the lock at face
+		 * value and stream the declared geometry instead.
+		 */
+		if (mz0380_force_timings && htotal == 2200) {
+			static const struct v4l2_dv_timings p60 =
+				V4L2_DV_BT_CEA_1920X1080P60;
+
+			*out = p60;
+			pr_info("%s: force_timings: streaming as 1920x1080p60 (htot=2200 says 1080p; vperiod unreadable)\n",
+				dev->name);
+			return 0;
+		}
 		return -ERANGE;
 	}
 
