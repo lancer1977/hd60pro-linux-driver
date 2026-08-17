@@ -488,6 +488,18 @@ int mz0380_mst3367_bringup(struct mz0380_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_bringup);
 
+/* one sample of the receiver's mode-detect block, in hdcapm's units */
+struct mst3367_measured {
+	u16 htotal, vtotal, hactive;
+	u16 hperiod, vperiod;       /* scaled, comparable to the table */
+	u16 hperiod_raw, vperiod_raw;
+	bool interlaced;
+};
+
+static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out);
+static const struct v4l2_dv_timings *
+mst3367_match_mode(const struct mst3367_measured *m);
+
 /* --- sink-chain diagnostics ----------------------------------------------- */
 
 /*
@@ -620,12 +632,35 @@ int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 		}
 
 		if (changed) {
+			bool locked = now[0] & MST3367_B0_DETECT_LOCK_MASK;
+
 			pr_info("%s: detect 55=%02x %s | 5f=%02x hper=%02x%02x vper=%02x%02x htot=%02x%02x\n",
-				dev->name, now[0],
-				(now[0] & MST3367_B0_DETECT_LOCK_MASK) ?
-					"LOCKED" : "no-lock",
+				dev->name, now[0], locked ? "LOCKED" : "no-lock",
 				now[1], now[2], now[3], now[4], now[5],
 				now[6], now[7]);
+
+			/*
+			 * M56: on a locked sample also print the fields the
+			 * mode table is matched on, already scaled. A locked
+			 * source that matches nothing is then one grep away
+			 * from telling us which range is off, instead of
+			 * needing another run to find out.
+			 */
+			if (locked) {
+				struct mst3367_measured m;
+
+				if (!mst3367_measure(dev, &m)) {
+					const struct v4l2_dv_timings *t =
+						mst3367_match_mode(&m);
+
+					pr_info("%s: detect   -> htot=%u vtot=%u hact=%u hper=%u vper=%u %s => %s\n",
+						dev->name, m.htotal, m.vtotal,
+						m.hactive, m.hperiod, m.vperiod,
+						m.interlaced ? "i" : "p",
+						t ? "MATCHED" : "no table entry");
+					mst_bank(dev, MST3367_BANK0);
+				}
+			}
 			memcpy(last, now, sizeof(last));
 			first = false;
 		}
@@ -827,43 +862,116 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_diag);
  * 30.00 frames, i.e. 1080i60). Matching uses a +/-150 window on fps100.
  */
 struct mst3367_mode {
-	u16 hactive;
-	bool interlaced;
-	u16 fps100_min;
-	u16 fps100_max;
 	struct v4l2_dv_timings timings;
+	u16 htotal_min, htotal_max;
+	u16 vtotal_min, vtotal_max;
+	u16 hperiod_min, hperiod_max;
+	u16 vperiod_min, vperiod_max;
+	bool interlaced;
 };
 
+
+/*
+ * M56: the hdcapm table, verbatim (GPL, same MST3367). Matching is on four
+ * measured ranges plus interlace - NOT on hactive, which our own table used
+ * and which is why a locked source came back "unmatched". Note htotal here
+ * is the receiver's own counter, not the video horizontal total: the same
+ * 720p60 source appears at ~2475 or ~1650 depending on the TMDS clock
+ * domain, so both are listed.
+ */
 static const struct mst3367_mode mst3367_modes[] = {
-	{ 1920, true,  2900, 3100, V4L2_DV_BT_CEA_1920X1080I60 },
-	{ 1920, true,  2400, 2600, V4L2_DV_BT_CEA_1920X1080I50 },
-	{ 1920, false, 5900, 6100, V4L2_DV_BT_CEA_1920X1080P60 },
-	{ 1920, false, 4900, 5100, V4L2_DV_BT_CEA_1920X1080P50 },
-	{ 1920, false, 2900, 3100, V4L2_DV_BT_CEA_1920X1080P30 },
-	{ 1920, false, 2400, 2600, V4L2_DV_BT_CEA_1920X1080P25 },
-	{ 1920, false, 2300, 2500, V4L2_DV_BT_CEA_1920X1080P24 },
-	{ 1280, false, 5900, 6100, V4L2_DV_BT_CEA_1280X720P60 },
-	{ 1280, false, 4900, 5100, V4L2_DV_BT_CEA_1280X720P50 },
-	{ 1280, false, 2900, 3100, V4L2_DV_BT_CEA_1280X720P30 },
-	{ 720,  true,  5900, 6100, V4L2_DV_BT_CEA_720X480I59_94 },
-	{ 720,  false, 5900, 6100, V4L2_DV_BT_CEA_720X480P59_94 },
-	{ 720,  true,  4900, 5100, V4L2_DV_BT_CEA_720X576I50 },
-	{ 720,  false, 4900, 5100, V4L2_DV_BT_CEA_720X576P50 },
+	/*                          htot_min htot_max vtot_min vtot_max
+	 *                          hper_min hper_max vper_min vper_max il  */
+	{ V4L2_DV_BT_CEA_720X480P59_94,  845,  865,  520,  525,
+					 310,  320,  595,  605, false },
+	{ V4L2_DV_BT_CEA_1280X720P30,   2300, 2500,  745,  755,
+					 215,  235,  290,  310, false },
+	{ V4L2_DV_BT_CEA_1280X720P50,   2965, 2985,  745,  755,
+					 360,  380,  480,  520, false },
+	{ V4L2_DV_BT_CEA_1280X720P60,   2470, 2480,  745,  755,
+					 445,  455,  595,  605, false },
+	/* same 720p60 seen in the other clock domain (hdcapm: "Tivo") */
+	{ V4L2_DV_BT_CEA_1280X720P60,   1645, 1655,  745,  755,
+					 445,  455,  595,  605, false },
+	{ V4L2_DV_BT_CEA_1920X1080P24,  4080, 4105, 1120, 1130,
+					 260,  280,  230,  250, false },
+	{ V4L2_DV_BT_CEA_1920X1080P25,  3950, 3970, 1120, 1130,
+					 270,  290,  240,  254, false },
+	{ V4L2_DV_BT_CEA_1920X1080P30,  2295, 3305, 1120, 1130,
+					 330,  345,  290,  310, false },
+	{ V4L2_DV_BT_CEA_1920X1080P50,  3950, 3970, 1120, 1130,
+					 550,  570,  480,  520, false },
+	{ V4L2_DV_BT_CEA_1920X1080P60,  3290, 3310, 1120, 1130,
+					 665,  685,  595,  605, false },
 };
 
 static const struct v4l2_dv_timings *
-mst3367_match_mode(u16 hactive, bool interlaced, u16 fps100)
+mst3367_match_mode(const struct mst3367_measured *m)
 {
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++) {
-		const struct mst3367_mode *m = &mst3367_modes[i];
+		const struct mst3367_mode *e = &mst3367_modes[i];
 
-		if (m->hactive == hactive && m->interlaced == interlaced &&
-		    fps100 >= m->fps100_min && fps100 <= m->fps100_max)
-			return &m->timings;
+		if (m->htotal  < e->htotal_min  || m->htotal  > e->htotal_max ||
+		    m->vtotal  < e->vtotal_min  || m->vtotal  > e->vtotal_max ||
+		    m->hperiod < e->hperiod_min || m->hperiod > e->hperiod_max ||
+		    m->vperiod < e->vperiod_min || m->vperiod > e->vperiod_max ||
+		    m->interlaced != e->interlaced)
+			continue;
+		return &e->timings;
 	}
 	return NULL;
+}
+
+/*
+ * Read every field hdcapm matches on, with its masks and scalings. The two
+ * period registers are rate counters: the driver converts them to hdcapm's
+ * units (1600000/raw and 1250000/raw) because the table is expressed there.
+ */
+static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out)
+{
+	u8 hi, lo, r57, r58, r59, r5a, r5f;
+	u16 raw;
+
+	memset(out, 0, sizeof(*out));
+
+	if (mst_bank(dev, MST3367_BANK0))
+		return -EIO;
+	if (mst_rd(dev, MST3367_B0_HTOTAL_HI, &hi) ||
+	    mst_rd(dev, MST3367_B0_HTOTAL_LO, &lo))
+		return -EIO;
+	out->htotal = (((u16)hi << 8) | lo) & 0xfff;
+
+	if (mst_rd(dev, MST3367_B0_VTOTAL_HI, &hi) ||
+	    mst_rd(dev, MST3367_B0_VTOTAL_LO, &lo))
+		return -EIO;
+	out->vtotal = (((u16)hi << 8) | lo) & 0x7ff;
+
+	if (mst_rd(dev, MST3367_B0_HPERIOD_HI, &r57) ||
+	    mst_rd(dev, MST3367_B0_HPERIOD_LO, &r58) ||
+	    mst_rd(dev, MST3367_B0_VPERIOD_HI, &r59) ||
+	    mst_rd(dev, MST3367_B0_VPERIOD_LO, &r5a) ||
+	    mst_rd(dev, MST3367_B0_INTERLACE, &r5f))
+		return -EIO;
+
+	raw = ((u16)(r57 & 0x3f) << 8) | r58;
+	out->hperiod_raw = raw;
+	out->hperiod = raw ? 1600000u / raw : 0;
+
+	raw = ((u16)(r59 & 0x3f) << 8) | r5a;
+	out->vperiod_raw = raw;
+	out->vperiod = raw ? 1250000u / raw : 0;
+
+	out->interlaced = !!(r5f & MST3367_B0_INTERLACE_BIT);
+
+	if (mst_bank(dev, MST3367_BANK2) ||
+	    mst_rd(dev, MST3367_B2_HACTIVE_HI, &hi) ||
+	    mst_rd(dev, MST3367_B2_HACTIVE_LO, &lo))
+		return -EIO;
+	out->hactive = (((u16)hi << 8) | lo) & 0x1fff;
+
+	return 0;
 }
 
 /*
@@ -874,10 +982,9 @@ mst3367_match_mode(u16 hactive, bool interlaced, u16 fps100)
 int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			       struct v4l2_dv_timings *out)
 {
-	u8 detect, ilo, ihi, hlo, hhi, hp_hi, hp_lo, vp_hi, vp_lo;
 	const struct v4l2_dv_timings *match;
-	u16 hactive, htotal, vperiod_raw, fps100;
-	bool interlaced;
+	struct mst3367_measured m;
+	u8 detect;
 	int ret;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY)
@@ -915,60 +1022,30 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 		}
 	}
 
-	/* geometry (BANK0) */
-	if (mst_rd(dev, MST3367_B0_HTOTAL_HI, &hhi) ||
-	    mst_rd(dev, MST3367_B0_HTOTAL_LO, &hlo) ||
-	    mst_rd(dev, MST3367_B0_VPERIOD_HI, &vp_hi) ||
-	    mst_rd(dev, MST3367_B0_VPERIOD_LO, &vp_lo) ||
-	    mst_rd(dev, MST3367_B0_HPERIOD_HI, &hp_hi) ||
-	    mst_rd(dev, MST3367_B0_HPERIOD_LO, &hp_lo) ||
-	    mst_rd(dev, MST3367_B0_INTERLACE, &ilo))
-		return -EIO;
+	ret = mst3367_measure(dev, &m);
+	if (ret)
+		return ret;
 
-	htotal = ((u16)hhi << 8) | hlo;
-	interlaced = ilo & MST3367_B0_INTERLACE_BIT;
-	vperiod_raw = ((u16)vp_hi << 8) | vp_lo;
-
-	/* active width lives in BANK2 */
-	if (mst_bank(dev, MST3367_BANK2) ||
-	    mst_rd(dev, MST3367_B2_HACTIVE_HI, &ihi) ||
-	    mst_rd(dev, MST3367_B2_HACTIVE_LO, &hlo))
-		return -EIO;
-	hactive = ((u16)ihi << 8) | hlo;
-
-	/*
-	 * The vperiod register is a line-count-per-field counter; the frame rate
-	 * is 1250000 / counter, which the hdcapm table shows lands at ~= fps*10
-	 * (e.g. counter 4175 -> 299 -> ~30 frame/s = 1080i60, counter 2083 ->
-	 * 600 -> 60p). fps100 = that * 10.
-	 */
-	if (vperiod_raw)
-		fps100 = (1250000u / vperiod_raw) * 10;
-	else
-		fps100 = 0;
-
-	match = mst3367_match_mode(hactive, interlaced, fps100);
+	match = mst3367_match_mode(&m);
 	if (!match) {
-		pr_info("%s: MST3367 locked but unmatched: hact=%u htot=%u %s fps100~%u [R55=0x%02x hp=%u vp=%u il=0x%02x] - please report\n",
-			dev->name, hactive, htotal, interlaced ? "i" : "p",
-			fps100, detect,
-			((u16)hp_hi << 8) | hp_lo, vperiod_raw, ilo);
+		pr_info("%s: MST3367 locked but unmatched: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) %s [R55=0x%02x] - please report\n",
+			dev->name, m.htotal, m.vtotal, m.hactive,
+			m.hperiod, m.hperiod_raw, m.vperiod, m.vperiod_raw,
+			m.interlaced ? "i" : "p", detect);
 
 		/*
-		 * M54: the first source that ever locked reports htot=2200 -
-		 * the horizontal total of 1080p - while the vperiod counter
-		 * reads saturated (0x1fff), so the frame rate cannot be
-		 * derived and no table entry matches. Refusing to stream on
-		 * that would block the whole real-signal path on one unread
-		 * register. When the caller opts in, take the lock at face
-		 * value and stream the declared geometry instead.
+		 * M54: rather than block the whole real-signal path on one
+		 * unmatched sample, let the caller opt into streaming a
+		 * plausible 1080p lock (2200 = the video horizontal total, or
+		 * the receiver counter's 1080p range) as 1080p60.
 		 */
-		if (mz0380_force_timings && htotal == 2200) {
+		if (mz0380_force_timings &&
+		    (m.htotal == 2200 || (m.htotal >= 3290 && m.htotal <= 3310))) {
 			static const struct v4l2_dv_timings p60 =
 				V4L2_DV_BT_CEA_1920X1080P60;
 
 			*out = p60;
-			pr_info("%s: force_timings: streaming as 1920x1080p60 (htot=2200 says 1080p; vperiod unreadable)\n",
+			pr_info("%s: force_timings: streaming as 1920x1080p60\n",
 				dev->name);
 			return 0;
 		}
@@ -976,9 +1053,10 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	}
 
 	*out = *match;
-	pr_info("%s: MST3367 signal: %ux%u%s (hact=%u htot=%u fps100~%u R55=0x%02x)\n",
+	pr_info("%s: MST3367 signal: %ux%u%s (htot=%u vtot=%u hper=%u vper=%u hact=%u R55=0x%02x)\n",
 		dev->name, out->bt.width, out->bt.height,
-		out->bt.interlaced ? "i" : "p", hactive, htotal, fps100, detect);
+		out->bt.interlaced ? "i" : "p", m.htotal, m.vtotal,
+		m.hperiod, m.vperiod, m.hactive, detect);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_read_signal);

@@ -28,6 +28,7 @@ cd "$(dirname "$0")"
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 FRAMES=${1:-60}
+LOCKWAIT=${2:-45}
 make >/dev/null || { echo "build failed"; exit 1; }
 
 fuser -k /dev/video0 2>/dev/null
@@ -41,17 +42,27 @@ insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
 echo "waiting for firmware upload + boot..."
 sleep 25
 
-echo "=== 1. what is on the wire? ==="
+# M55b: the source transmits around a plug/power event, not continuously -
+# the one lock ever seen arrived ~30 s into a watch, exactly when the source
+# was power-cycled, and lasted a single sample. So the detect window has to
+# be OPEN while you cycle it, not before.
+echo "=== 1. HPD edge, then watch while YOU power-cycle the source ==="
 dmesg -C
-for i in 1 2 3; do
-	v4l2-ctl -d /dev/video0 --query-dv-timings && break
-	echo "  (no lock yet, retrying $i/3 - power-cycle the source if it stays dark)"
-	sleep 3
-done
-dmesg | grep -E "MST3367 signal|force_timings|locked but unmatched|HPD"
+echo "hpd 2 2000" > /proc/mz0380-hdmi
+echo
+echo "   >>> POWER-CYCLE (or re-plug) THE SOURCE NOW - you have ${LOCKWAIT}s <<<"
+echo
+echo "watch $LOCKWAIT" > /proc/mz0380-hdmi
+dmesg | grep -E "detect|LOCKED|MATCHED|no table entry" | tail -25
 
 echo
-echo "=== 2. capture $FRAMES frames from the REAL path ==="
+echo "=== 1b. can the driver name the mode? ==="
+dmesg -C
+v4l2-ctl -d /dev/video0 --query-dv-timings
+dmesg | grep -E "MST3367 signal|force_timings|locked but unmatched"
+
+echo
+echo "=== 2. capture $FRAMES frames (power-cycle the source again if needed) ==="
 rm -f /tmp/cap-m55.h264
 dmesg -C
 timeout 40 v4l2-ctl -d /dev/video0 --stream-mmap --stream-count="$FRAMES" \
