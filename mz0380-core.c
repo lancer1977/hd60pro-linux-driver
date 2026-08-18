@@ -495,6 +495,20 @@ module_param_named(aic_on, mz0380_aic_on, bool, 0644);
 MODULE_PARM_DESC(aic_on,
 		 "M33: send SET_AIC_PARAMS(on=1) before START, releasing the encoder's audio_ready gate (def:1)");
 
+/*
+ * M60: the nosg path costs one encoder spawn per frame (M39: the card's
+ * encoder parks after exactly one frame, and only a fresh spawn unparks it),
+ * and the card wedges for good after roughly 8-18 of them - a wedge no PCIe
+ * reset clears (M52), only removing slot power. Every spawn also re-sent
+ * SET_AIC(on=1). audio_ready is a sysfs flag on the card, so re-arming it per
+ * frame is most likely pure waste; sending it once per streaming session may
+ * stretch the budget. Set aic_every_frame=1 to go back if frames stop landing.
+ */
+bool mz0380_aic_every_frame;
+module_param_named(aic_every_frame, mz0380_aic_every_frame, bool, 0644);
+MODULE_PARM_DESC(aic_every_frame,
+		 "M60: re-send SET_AIC(on=1) on every encoder spawn instead of once per session (def:0)");
+
 unsigned int mz0380_aic_channels = 2;
 module_param_named(aic_channels, mz0380_aic_channels, uint, 0644);
 MODULE_PARM_DESC(aic_channels, "M33: SET_AIC channel_num (def:2)");

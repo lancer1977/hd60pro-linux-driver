@@ -336,6 +336,8 @@ struct mz0380_dev {
 	 */
 	struct task_struct *nosg_task;
 	u32 nosg_sequence;
+	u32 nosg_spawns;            /* encoder spawns this session (wedge budget) */
+	bool aic_armed;             /* SET_AIC(on=1) already sent this session    */
 
 	/* HDMI signal */
 	// pattern-check: skip adding one bool state flag to existing struct
@@ -588,6 +590,7 @@ extern unsigned int mz0380_edid_timeout_ms;
 extern bool mz0380_buf_poison;
 extern unsigned int mz0380_poison_byte;
 extern bool mz0380_aic_on;
+extern bool mz0380_aic_every_frame;
 extern unsigned int mz0380_aic_channels;
 extern unsigned int mz0380_aic_bits;
 extern unsigned int mz0380_aic_freq;

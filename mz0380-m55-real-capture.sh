@@ -27,7 +27,20 @@ set -u
 cd "$(dirname "$0")"
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
-FRAMES=${1:-60}
+
+# M60: leave the machine as we found it. An insmod'd module left behind kept
+# the card armed between runs and made the next run's "reload" a no-op against
+# stale code.
+cleanup() {
+	fuser -k /dev/video0 2>/dev/null
+	rmmod mz0380 2>/dev/null && echo "(module unloaded)"
+}
+trap cleanup EXIT INT TERM
+# M60: each captured frame costs one encoder spawn, and the card wedges after
+# roughly 8-18 of them, so asking for 60 guarantees the run ends in a wedge.
+# Ask for a number that fits under the cliff; raise it deliberately, not by
+# default.
+FRAMES=${1:-6}
 LOCKWAIT=${2:-45}
 # M57: default to the delivery path that is PROVEN to land frames (m50's
 # nosg NV12). The SG path returned 0 bytes on the M55 run and that is a
@@ -81,6 +94,7 @@ echo "--- captured $SZ bytes ---"
 
 echo "=== 3. what did the card do? ==="
 dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal" | head -20
+dmesg | grep -E "encoder spawns|entering the range|SET_AIC\(on=0\)" | tail -3
 
 # M59: a wall of SET_VIC ret=-110 is the known wedge, not a capture bug. The
 # mailbox stops answering after enough encoder spawns and ONLY a mains-off

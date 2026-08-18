@@ -783,7 +783,7 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * card DMAs a raw frame but never writes channel_done, which is exactly
 	 * the state M30-M32 left us in: data in the buffer, no completion.
 	 */
-	if (mz0380_aic_on) {
+	if (mz0380_aic_on && (mz0380_aic_every_frame || !dev->aic_armed)) {
 		u32 aic[4] = {
 			/* cmd+4 channel_num | cmd+5 mono<<8 | cmd+6 bits<<16 */
 			(mz0380_aic_channels & 0xff) |
@@ -801,6 +801,8 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 			dev->name, mz0380_aic_channels, mz0380_aic_bits,
 			mz0380_aic_freq, mz0380_aic_period_frames,
 			mz0380_aic_periods, ret);
+		if (!ret)
+			dev->aic_armed = true;
 	}
 
 	/*
@@ -1029,6 +1031,18 @@ static int mz0380_nosg_thread(void *data)
 		       MZ0380_STREAM_RAW_FRAME_SIZE);
 		wmb();
 
+		/*
+		 * M60: count the spawns. The card wedges for good after
+		 * roughly 8-18 of them and nothing short of removing slot
+		 * power brings it back (M52), so the count is the single
+		 * most useful number in the log - and a warning before the
+		 * cliff is worth more than a post-mortem after it.
+		 */
+		dev->nosg_spawns++;
+		if (dev->nosg_spawns == 8)
+			pr_warn("%s: nosg: 8 encoder spawns this session - entering the range where the card has wedged before (needs a mains-off cold boot)\n",
+				dev->name);
+
 		ret = mz0380_dma_start(dev);
 		if (ret) {
 			pr_warn("%s: nosg spawn failed (%d) - retrying in 500 ms\n",
@@ -1076,6 +1090,8 @@ int mz0380_nosg_capture_start(struct mz0380_dev *dev)
 		return 0;
 
 	dev->nosg_sequence = 0;
+	dev->nosg_spawns = 0;
+	dev->aic_armed = false;
 	task = kthread_run(mz0380_nosg_thread, dev, "mz0380-nosg/%u", dev->nr);
 	if (IS_ERR(task))
 		return PTR_ERR(task);
@@ -1093,7 +1109,23 @@ void mz0380_nosg_capture_stop(struct mz0380_dev *dev)
 		return;
 	kthread_stop(dev->nosg_task);
 	dev->nosg_task = NULL;
-	pr_info("%s: nosg polling capture stopped after %u frames\n",
-		dev->name, dev->nosg_sequence);
+
+	/*
+	 * M60: hand the card's audio side back. Every session so far armed
+	 * audio_ready and never cleared it, once per frame, which is exactly
+	 * the kind of one-way resource churn that fits a card that dies after
+	 * a fixed number of spawns.
+	 */
+	if (dev->aic_armed) {
+		u32 aic[4] = { 0, 0, 0, 0 };   /* cmd+16 on=0 */
+		int ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS,
+					      aic, ARRAY_SIZE(aic), NULL, 2000);
+
+		pr_info("%s: nosg: SET_AIC(on=0) ret=%d\n", dev->name, ret);
+		dev->aic_armed = false;
+	}
+
+	pr_info("%s: nosg polling capture stopped after %u frames, %u encoder spawns\n",
+		dev->name, dev->nosg_sequence, dev->nosg_spawns);
 }
 EXPORT_SYMBOL_GPL(mz0380_nosg_capture_stop);
