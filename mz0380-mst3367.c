@@ -1174,6 +1174,64 @@ int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_watch);
 
+/*
+ * M73: dump the receiver's OUTPUT stage.
+ *
+ * Everything upstream is now proven: the receiver locks, measures a clean
+ * 1080p60 and holds it for tens of seconds. Everything downstream is armed:
+ * SET_VIC carries legal values, the encoder spawns, START fires. Yet the card
+ * writes nothing at all - the buffer poison scan reads 0/1024 pages touched -
+ * and tinyvenc5 opens the VIC itself ("Can't create video capture -> exit"),
+ * so a VIC that never sees a BT1120 clock is the remaining explanation.
+ *
+ * We configure that output stage in commit_digital_output() and have never
+ * once read it back. These are the registers that gate it:
+ *   BANK0 0xab bit7 - freeze/hold, set around the 0xb0 update and cleared
+ *   BANK0 0xb0      - output format/clock select (hdcapm writes 0x20 for
+ *                     "YUV422 / 8-bit output"; we write 0x21 for non-720p30)
+ *   BANK0 0xb1/0xb2 - output config / special-mode select
+ *   BANK0 0xb3      - written 0xff by the Windows indirect-port path
+ *   BANK2 0x07      - the timing latch (bit4 pulsed on first acquisition)
+ * plus 0x55 so the lock state at the same instant is on the same line.
+ */
+void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag)
+{
+	u8 r55 = 0, ab = 0, b0 = 0, b1 = 0, b2 = 0, b3 = 0, b7 = 0, r51 = 0;
+	u8 b2_01 = 0, b2_02 = 0, b2_07 = 0;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY || !dev->mst3367_ready)
+		return;
+
+	mutex_lock(&mst3367_lock);
+	if (mst_bank(dev, MST3367_BANK0))
+		goto out;
+	mst_rd(dev, MST3367_B0_DETECT, &r55);
+	mst_rd(dev, 0xab, &ab);
+	mst_rd(dev, 0xb0, &b0);
+	mst_rd(dev, 0xb1, &b1);
+	mst_rd(dev, 0xb2, &b2);
+	mst_rd(dev, 0xb3, &b3);
+	mst_rd(dev, 0xb7, &b7);
+	mst_rd(dev, 0x51, &r51);
+	if (!mst_bank(dev, MST3367_BANK2)) {
+		mst_rd(dev, 0x01, &b2_01);
+		mst_rd(dev, 0x02, &b2_02);
+		mst_rd(dev, 0x07, &b2_07);
+		mst_bank(dev, MST3367_BANK0);
+	}
+
+	pr_info("%s: output stage [%s]: R55=%02x %s | B0: ab=%02x b0=%02x b1=%02x b2=%02x b3=%02x b7=%02x 51=%02x | B2: 01=%02x 02=%02x 07=%02x\n",
+		dev->name, tag, r55,
+		mst3367_status_locked(r55) ? "LOCKED" : "no-lock",
+		ab, b0, b1, b2, b3, b7, r51, b2_01, b2_02, b2_07);
+	if (ab & 0x80)
+		pr_warn("%s: output stage [%s]: 0xab bit7 is STILL SET - the output is frozen\n",
+			dev->name, tag);
+out:
+	mutex_unlock(&mst3367_lock);
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_output_diag);
+
 void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m)
 {
 	static const struct { const char *name; unsigned int pin; } pins[] = {
@@ -1476,6 +1534,22 @@ static int mst3367_set_auto_position(struct mz0380_dev *dev, bool enable)
 	int ret;
 
 	lockdep_assert_held(&mst3367_lock);
+
+	/*
+	 * M74: never re-arm acquisition while the encoder is capturing.
+	 *
+	 * AUTO_POSITION restarts the receiver's position/phase hunt. Doing that
+	 * to a receiver that is actively feeding BT1120 to the SoC's VIC can
+	 * only disturb the very frames we are trying to capture - and the
+	 * diagnostic watch runs concurrently with capture by design, writing
+	 * this register on every lock/no-lock transition of a source that
+	 * flaps. Reads during streaming stay allowed; writes do not.
+	 */
+	if (READ_ONCE(dev->streaming) && enable) {
+		pr_info_ratelimited("%s: skipping auto-position re-arm while streaming\n",
+				    dev->name);
+		return 0;
+	}
 	ret = mst_bank(dev, MST3367_BANK0);
 	if (ret)
 		return ret;
@@ -1538,7 +1612,7 @@ mst3367_commit_digital_output(struct mz0380_dev *dev,
 	ret = mst_rd(dev, 0xb0, &b0);
 	if (!ret)
 		ret = mst_wr(dev, 0xb0, (b0 & 0xc2) |
-			     (special_720p30 ? 0x20 : 0x21));
+			     (special_720p30 ? 0x20 : (mz0380_vic_b0 & 0x3d)));
 	clear_ret = mst_clr(dev, 0xab, 0x80);
 
 	return ret ? ret : clear_ret;

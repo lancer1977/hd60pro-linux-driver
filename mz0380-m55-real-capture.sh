@@ -73,6 +73,7 @@ dmesg -C
 insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
 	enable_video=1 procfs_verbosity=2 dma_iova_remap=1 aic_on=1 \
 	stream_nosg="$NOSG" force_timings=0 signal_poll_ms=4000 \
+	set_buf_opcode="${SETBUF:-2}" vic_fw="${VICFW:-5}" \
 	|| { echo "insmod failed"; exit 1; }
 echo "waiting for firmware upload + boot..."
 sleep 25
@@ -170,12 +171,24 @@ CAPWAIT=${CAPWAIT:-60}
 # The writes are serialised on purpose: /proc/mz0380-hdmi runs "watch" inline,
 # so a concurrent hpd write would just block behind it. Alternating in one
 # background shell gives edges at roughly t+7s, t+21s and t+35s.
-( sleep 6
-  for _ in 1 2 3; do
-	echo "hpd 2 1000"  > /proc/mz0380-hdmi 2>/dev/null
-	echo "watch 12"    > /proc/mz0380-hdmi 2>/dev/null
-  done ) &
-WATCH_PID=$!
+# M74: WATCH=0 runs the capture with NO concurrent receiver I2C at all.
+# The watch samples the MST3367 every 250ms and, until M74, re-armed
+# auto-position on every lock transition - i.e. the diagnostic was poking
+# acquisition registers on a receiver that was mid-capture. Writes are now
+# suppressed while streaming, but a clean control run with zero I2C traffic
+# is still the only way to prove the observer is not the problem.
+WATCH=${WATCH:-1}
+WATCH_PID=
+if [ "$WATCH" = 1 ]; then
+	( sleep 6
+	  for _ in 1 2 3; do
+		echo "hpd 2 1000"  > /proc/mz0380-hdmi 2>/dev/null
+		echo "watch 12"    > /proc/mz0380-hdmi 2>/dev/null
+	  done ) &
+	WATCH_PID=$!
+else
+	echo "   (WATCH=0: no HPD pulses, no receiver polling during capture)"
+fi
 
 echo
 echo "   >>> The driver now pulses HPD 3x during this window by itself.    <<<"
@@ -186,7 +199,7 @@ echo
 timeout "$CAPWAIT" v4l2-ctl -d "$VIDEO_NODE" --stream-mmap --stream-count="$FRAMES" \
 	--stream-to="$CAP"
 SZ=$(stat -c %s "$CAP" 2>/dev/null || echo 0)
-wait "$WATCH_PID" 2>/dev/null
+[ -z "$WATCH_PID" ] || wait "$WATCH_PID" 2>/dev/null
 echo "--- captured $SZ bytes ---"
 
 echo "--- did the receiver see the source while the encoder was running? ---"
@@ -197,6 +210,8 @@ dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal" | head
 # M70: the per-buffer poison scan is the "did H.264 bytes land without a
 # completion" measurement - it has been printed at every stop and filtered
 # out by the grep above this whole time.
+echo "--- MST3367 output stage (is the receiver clocking BT1120 out?) ---"
+dmesg | grep -E "output stage" | tail -6
 echo "--- buffer poison scan (pages touched = card wrote data) ---"
 dmesg | grep -E "stop buf\[" | tail -8
 dmesg | grep -E "encoder spawns|entering the range|SET_AIC\(on=0\)" | tail -3

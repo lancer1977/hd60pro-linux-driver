@@ -572,6 +572,37 @@ module_param_named(vic_saturation, mz0380_vic_saturation, uint, 0644);
 MODULE_PARM_DESC(vic_saturation,
 		 "M72: SET_VIC byte18 saturation - 128=neutral, 0=mono (def:128)");
 
+/*
+ * M73: BANK0 0xb0 output format/clock select for ordinary (non-720p30) modes.
+ * We write 0x21; the GPL hdcapm driver ends its init with 0xb0 = 0x20,
+ * commented "YUV422 / 8-bit output". Bit0 is the difference and it is
+ * unidentified. Tunable so the two can be compared on hardware while the
+ * receiver's output stage is under suspicion for producing no BT1120 clock.
+ */
+unsigned int mz0380_vic_b0 = 0x21;
+module_param_named(vic_b0, mz0380_vic_b0, uint, 0644);
+MODULE_PARM_DESC(vic_b0,
+		 "M73: MST3367 BANK0 0xb0 output select for ordinary modes (def:0x21, hdcapm uses 0x20)");
+
+/*
+ * M75: which opcode programs the encoder's DMA destination buffers.
+ *
+ * We have always sent 0x02. The Windows driver builds the SAME 12-word command
+ * (doorbell, opcode, channel, stride, then {hi,lo} address pairs) with opcodes
+ * 0x04 and 0x05 - win64.txt 0x140279219 and 0x140279663, both with r8d=0xc
+ * words and the payload pulled from an address array in dword pairs.
+ *
+ * 0x02 demonstrably works for the card's synthetic raw-NV12 path, so it does
+ * reach a channel; but the H.264 bitstream may DMA from a different channel
+ * whose addresses 0x02 never programs, which would leave the encoder running
+ * with no destination and the host buffers untouched - exactly what the poison
+ * scan reports (0/1024 pages) while the receiver holds a clean lock.
+ */
+unsigned int mz0380_set_buf_opcode = 0x02;
+module_param_named(set_buf_opcode, mz0380_set_buf_opcode, uint, 0644);
+MODULE_PARM_DESC(set_buf_opcode,
+		 "M75: opcode that programs encoder DMA buffers - 2 (def), or 4/5/8 as the Windows driver uses");
+
 bool mz0380_signal_confirm;
 module_param_named(signal_confirm, mz0380_signal_confirm, bool, 0644);
 MODULE_PARM_DESC(signal_confirm,

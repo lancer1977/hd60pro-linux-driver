@@ -598,6 +598,7 @@ void mz0380_signal_event(struct mz0380_dev *dev);
 /* MST3367 receiver bring-up + signal detect (mz0380-mst3367.c) */
 int mz0380_mst3367_bringup(struct mz0380_dev *dev);
 void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m);
+void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag);
 int mz0380_mst3367_ramtest(struct mz0380_dev *dev);	/* M44 */
 int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs);	/* M45 */
 int mz0380_mst3367_reload_edid(struct mz0380_dev *dev);	/* M47 */
@@ -649,6 +650,8 @@ extern bool mz0380_signal_confirm;
 extern unsigned int mz0380_vic_fw;
 extern unsigned int mz0380_vic_out_format;
 extern unsigned int mz0380_vic_saturation;
+extern unsigned int mz0380_vic_b0;
+extern unsigned int mz0380_set_buf_opcode;
 extern unsigned int mz0380_signal_cache_ms;
 extern unsigned int mz0380_aic_channels;
 extern unsigned int mz0380_aic_bits;

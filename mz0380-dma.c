@@ -277,7 +277,7 @@ static int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 				dev->name, i, lo, mz0380_card_frame_offset);
 	}
 
-	ret = mz0380_send_command(dev, MZ0380_CMD_SET_BUF_2, params,
+	ret = mz0380_send_command(dev, mz0380_set_buf_opcode, params,
 				  ARRAY_SIZE(params), NULL, 2000);
 	if (ret || !mz0380_probe_windows)
 		return ret;
@@ -1099,8 +1099,8 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 		goto err_events;
 	}
 	if (!mz0380_stream_nosg)
-		pr_info("%s: SET_BUF_2 provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8\n",
-			dev->name);
+		pr_info("%s: SET_BUF(op 0x%02x) provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8\n",
+			dev->name, mz0380_set_buf_opcode);
 
 	/*
 	 * Real H.264 needs an owned poison suffix for bounded length inference.
@@ -1172,10 +1172,24 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * Frame arrival is confirmed downstream by the MSI/outbound-ATU path, not
 	 * by a command ack.
 	 */
+	/*
+	 * M73: photograph the receiver's output stage on both sides of START.
+	 * If the VIC never sees a clock, the evidence is here and nowhere the
+	 * host can otherwise reach - the card's own log is on a serial port we
+	 * do not have.
+	 */
+	if (!mz0380_stream_nosg)
+		mz0380_mst3367_output_diag(dev, "before START");
+
 	ret = mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
 				  NULL, 0, NULL, 0);
 	pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
 		dev->name, ret);
+
+	if (!mz0380_stream_nosg) {
+		msleep(500);   /* let the encoder settle into its capture loop */
+		mz0380_mst3367_output_diag(dev, "after START");
+	}
 	dev->stream_head = 0;
 	if (ret)
 		goto err_events;
@@ -1246,6 +1260,7 @@ static void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 			atomic_read(&dev->irq_count),
 			atomic_read(&dev->irq_video_count),
 			(unsigned long long)READ_ONCE(dev->frame_event_drops));
+		mz0380_mst3367_output_diag(dev, "at stop");
 		mz0380_stream_bufs_dump(dev, "stop");
 		WRITE_ONCE(dev->frame_poison_active, false);
 	}
