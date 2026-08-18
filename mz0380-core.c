@@ -536,6 +536,42 @@ module_param_named(signal_cache_ms, mz0380_signal_cache_ms, uint, 0644);
 MODULE_PARM_DESC(signal_cache_ms,
 		 "M65: reuse the last good HDMI detection for this long when arming the stream (def:30000, 0=require a live lock)");
 
+/*
+ * M71: SET_VIC byte6 = "fw", the card's ENCODER SELECTOR, not a pixel format.
+ * video_capture_mgr compares it to 7 and 8 to launch ./tinyvenc7 / ./tinyvenc8
+ * and otherwise falls through to ./tinyvenc5; the value is also handed to the
+ * encoder in its own argv. We had been sending 2 or 3 here (a misread of the
+ * field as "2=progressive, 3=interlaced"), which reached tinyvenc5 only by
+ * fallthrough. 5 is the H.264 encoder this card uses. Exposed as a parameter
+ * so the alternative can be bisected on hardware without a rebuild.
+ */
+unsigned int mz0380_vic_fw = 5;
+module_param_named(vic_fw, mz0380_vic_fw, uint, 0644);
+MODULE_PARM_DESC(vic_fw,
+		 "M71: SET_VIC byte6 'fw' encoder selector - 5=tinyvenc5 H.264, 7=tinyvenc7, 8=tinyvenc8 (def:5)");
+
+/*
+ * M72: SET_VIC byte12 ("m" in the card's log) is VideoCap's OUTPUT FORMAT.
+ * The SDK's own capture config, re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg,
+ * documents the enum inline: "1:YUV420, 2:YUV422" - and 0, which this driver
+ * has always sent, is not a legal value. H.264 encodes from YUV420.
+ */
+unsigned int mz0380_vic_out_format = 1;
+module_param_named(vic_out_format, mz0380_vic_out_format, uint, 0644);
+MODULE_PARM_DESC(vic_out_format,
+		 "M72: SET_VIC byte12 VideoCap output format - 1=YUV420, 2=YUV422 (def:1)");
+
+/*
+ * M72: SET_VIC bytes 16..19 ("color_info") line up with the same config file's
+ * brightness / contrast / saturation / field-invert block, whose documented
+ * neutral values are 0 / 0 / 128 / 0 - "saturation adjustment (0~255, 128:off,
+ * 0:mono)". We have always sent 0,0,0,0, i.e. saturation pinned to mono.
+ */
+unsigned int mz0380_vic_saturation = 128;
+module_param_named(vic_saturation, mz0380_vic_saturation, uint, 0644);
+MODULE_PARM_DESC(vic_saturation,
+		 "M72: SET_VIC byte18 saturation - 128=neutral, 0=mono (def:128)");
+
 bool mz0380_signal_confirm;
 module_param_named(signal_confirm, mz0380_signal_confirm, bool, 0644);
 MODULE_PARM_DESC(signal_confirm,

@@ -961,8 +961,19 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	bool interlaced = dev->capture.source_interlaced;
 	u32 fps = dev->capture.source_fps ?:
 		  mz0380_timings_fps(&dev->detected_timings);
-	u32 fmt = interlaced ? 3 : 2;   /* byte6: venc5 H.264, 2=prog 3=interlaced */
-	u32 input_bus = interlaced ? 7 : 6; /* byte7: 6=BT1120p, 7=BT1120i */
+	u32 fw = mz0380_vic_fw;         /* byte6: encoder selector, see M71 */
+	/*
+	 * byte7: VideoCap INPUT FORMAT, not a boolean. M72 restores 6/7 after
+	 * M71 briefly made this an interlace flag - the card's printf calls it
+	 * "interlace", but the SDK capture config
+	 * (re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg) documents the
+	 * actual enum: "input format (1:8-bits Raw, 2:CCIR656i, 3:CCIR656p,
+	 * 4:Bayer, 5:16-bits Raw, 6:BT1120p, 7:BT1120i)". 6 vs 7 IS
+	 * progressive vs interlaced here, which is why the label is not wrong,
+	 * merely loose - but 0/1 are Raw/none and would be nonsense.
+	 */
+	u32 in_fmt = interlaced ? 7 : 6;
+	u32 out_fmt = mz0380_vic_out_format;    /* byte12 "m", see M72 */
 	bool aic_newly_armed = false;
 	bool vic_fired = false;
 	int ret;
@@ -979,13 +990,30 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * video_capture_mgr's op-41 handler (RE_FINDINGS.md M23). The mailbox puts
 	 * the opcode at struct[0..3]; our params[i] lands at struct[4+4i..7+4i]
 	 * (params[0]=struct[4..7]). Authoritative field map:
-	 *   [4]=ch  [5]=fps  [6]=fw/format(2 prog|3 interlaced)
-	 *   [7]=input bus (6 BT1120 progressive | 7 BT1120 interlaced)
-	 *   [8..9]=width  [10..11]=height  [12]=m  [16..19]=color_info
-	 *   [20..21]=x_start  [22..23]=y_start
+	 *   [4]=ch  [5]=fps  [6]=fw  [7]=interlace
+	 *   [8..9]=width  [10..11]=height  [12]=m  [13]=flip  [14]=mirror
+	 *   [16..19]=color_info  [20..21]=x_start  [22..23]=y_start
 	 *   [24..25]=input_frame_width  [26..27]=input_frame_height
 	 *   [28]=bitstream_num(MUST be >=1)  [29]=osd_en  [30]=osd_size
-	 *   [31]=is_nosg  [35]=is_slave  [36..39]=nosg back/y/u/v
+	 *   [31]=is_nosg  [32]=vanc_lines  [33]=fast_kill  [35]=is_slave
+	 *   [36..39]=nosg back/y/u/v
+	 *
+	 * M71: bytes 6 and 7 corrected against the card's OWN printf. The
+	 * format string at video_capture_mgr .rodata 0xb734 is
+	 *   "[Video_MGR][ch%d] SET_VIC fw(%d), fps(%d), resolution(%dx%d)
+	 *    interlace(%d), m(%d), color_info ..."
+	 * and decoding its call at vcm 0x8f60..0x8fbc under AAPCS gives
+	 * r1=[cmd+4]=ch, r2=[cmd+6]=fw, r3=[cmd+5]=fps, then stack args
+	 * [cmd+8]=W, [cmd+10]=H, [cmd+7]=interlace, [cmd+12]=m, ... So byte6
+	 * is the ENCODER SELECTOR (vcm 0x9250 compares it to 7 -> ./tinyvenc7,
+	 * and 8 -> ./tinyvenc8, else ./tinyvenc5) and byte7 is the INTERLACE
+	 * FLAG, which is passed straight into the encoder's argv.
+	 *
+	 * We had byte6 = 2|3 and byte7 = 6|7 (a "BT1120 bus selector" that does
+	 * not exist in this struct). The encoder therefore spawned - by
+	 * fallthrough - and was told interlace=6 for a progressive source,
+	 * which is a plausible reason VideoCap_*VIC captured nothing at all
+	 * while the receiver held a clean 1080p60 lock.
 	 * params[8] explicitly clears those final no-signal colour bytes; the
 	 * following struct word is PARAM10/STATUS and is never SET_VIC payload.
 	 * The old M20/M22 packing put input_w/input_h/bitstream_num two bytes early,
@@ -1001,7 +1029,15 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * fake-frame generator paced itself, but the real capture path derives
 	 * its frame cadence from it, so send the rate we actually detected.
 	 */
-	params[0] = (fps << 8) | (fmt << 16) | (input_bus << 24);
+	params[0] = (fps << 8) | (fw << 16) | (in_fmt << 24);
+	/*
+	 * M72: byte12 = output format, bytes 16..19 = brightness, contrast,
+	 * saturation, field-invert. Both blocks were left at zero for this
+	 * driver's whole life; zero is not a legal output format and zero
+	 * saturation is the config's documented "mono".
+	 */
+	params[2] = out_fmt & 0xff;
+	params[3] = (mz0380_vic_saturation & 0xff) << 16;
 	params[1] = ((out_h & 0xffff) << 16) | (out_w & 0xffff);
 	params[5] = ((in_h & 0xffff) << 16) | (in_w & 0xffff);
 	params[6] = 1u | ((mz0380_stream_nosg ? 1u : 0u) << 24); /* [28]=bitstream_num=1, [31]=is_nosg */
@@ -1011,13 +1047,13 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
 				  ARRAY_SIZE(params), NULL, 2000);
 	if (mz0380_stream_nosg)
-		pr_info("%s: stream start: SET_VIC(synthetic no-signal source %ux%u@%u, bus=BT1120%s; host output is polled NV12, not live HDMI/H.264) ret=%d\n",
+		pr_info("%s: stream start: SET_VIC(synthetic no-signal source %ux%u@%u %s, fw=%u; host output is polled NV12, not live HDMI/H.264) ret=%d\n",
 			dev->name, in_w, in_h, fps,
-			interlaced ? "i" : "p", ret);
+			interlaced ? "i" : "p", fw, ret);
 	else
-		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u BT1120%s -> H.264 output=%ux%u, bitstreams=1) ret=%d\n",
+		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u -> H.264 output=%ux%u, bitstreams=1) ret=%d\n",
 			dev->name, in_w, in_h, interlaced ? "i" : "p",
-			fps, interlaced ? "i" : "p", out_w, out_h, ret);
+			fps, fw, in_fmt, out_fmt, out_w, out_h, ret);
 	if (ret)
 		goto err_events;
 
