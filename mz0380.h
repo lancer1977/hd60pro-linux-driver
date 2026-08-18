@@ -182,6 +182,11 @@ struct mz0380_capture_state {
 	u32 width;
 	u32 height;
 	struct v4l2_fract timeperframe;
+	/* Receiver timing, kept separate from the encoder's output geometry. */
+	u32 source_width;
+	u32 source_height;
+	u32 source_fps;
+	bool source_interlaced;
 	u32 input;
 	u32 record_mode;
 	u32 bitrate;
@@ -233,6 +238,21 @@ struct mz0380_event_rec {
 };
 
 #define MZ0380_EVENT_RING_SIZE 256
+
+/*
+ * Frame-completion mailboxes are one-shot: EVENT acknowledgement lets the
+ * endpoint overwrite TOKEN/PAYLOAD immediately.  Keep the complete pre-ACK
+ * image in a bounded IRQ-safe FIFO and let process context consume it.
+ */
+struct mz0380_frame_event {
+	u64 timestamp_ns;
+	u32 event;
+	u32 token;
+	u32 payload[3];
+	u32 enc_status;
+};
+
+#define MZ0380_FRAME_EVENT_FIFO_SIZE 64
 
 struct mz0380_dev {
 	struct list_head devlist;
@@ -325,6 +345,19 @@ struct mz0380_dev {
 	struct list_head buf_list;
 	spinlock_t buf_lock;
 	struct work_struct drain_work;
+	spinlock_t frame_event_lock;
+	struct mz0380_frame_event
+		frame_events[MZ0380_FRAME_EVENT_FIFO_SIZE];
+	u16 frame_event_head;
+	u16 frame_event_tail;
+	bool frame_event_drain_scheduled;
+	bool frame_events_accepting;
+	bool frame_event_ack_deferred;
+	u8 frame_event_drop_tokens;
+	u64 frame_event_drops;
+	u32 video_sequence;
+	u8 frame_poison_byte;
+	bool frame_poison_active;
 	bool streaming;
 
 	// pattern-check: skip two plain fields on the existing device struct
@@ -342,6 +375,15 @@ struct mz0380_dev {
 	/* HDMI signal */
 	// pattern-check: skip adding one bool state flag to existing struct
 	struct v4l2_dv_timings detected_timings;
+	/*
+	 * M65: the last detection that actually succeeded, kept across later
+	 * failures. A source that transmits in short bursts cannot be locked
+	 * at STREAMON time, but the geometry it showed us is still the right
+	 * thing to arm the encoder with.
+	 */
+	struct v4l2_dv_timings last_good_timings;
+	unsigned long last_good_stamp;
+	bool have_last_good;
 	bool signal_locked;
 	bool mst3367_ready;	/* receiver reset released + init applied */
 
@@ -507,6 +549,11 @@ static inline void mz_mmio_clr(struct mz0380_dev *dev, u32 reg, u32 bits)
 int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 			const u32 *params, unsigned int nparams,
 			u32 *status_out, unsigned int timeout_ms);
+/* Copy PARAM0..reply_words-1 before cmd_lock permits another transaction. */
+int mz0380_send_command_reply(struct mz0380_dev *dev, u32 opcode,
+			       const u32 *params, unsigned int nparams,
+			       u32 *status_out, unsigned int timeout_ms,
+			       u32 *reply, unsigned int reply_words);
 void mz0380_mb_ack_event(struct mz0380_dev *dev);
 int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val);
 int mz0380_periph_write(struct mz0380_dev *dev, u8 chip, u8 reg, u32 val);
@@ -526,6 +573,13 @@ int mz0380_dma_setup(struct mz0380_dev *dev);
 void mz0380_dma_teardown(struct mz0380_dev *dev);
 int mz0380_dma_start(struct mz0380_dev *dev);
 void mz0380_dma_stop(struct mz0380_dev *dev);
+/*
+ * Non-sleeping pre-ACK hook.  mz0380_mb_ack_event() must call this with the
+ * live EVENT value before clearing EVENT, so TOKEN/PAYLOAD cannot be lost when
+ * the command poller (rather than the MSI ISR) consumes a combined event.
+ */
+void mz0380_handle_event_snapshot(struct mz0380_dev *dev, u32 event);
+void mz0380_dma_flush_events(struct mz0380_dev *dev);
 int mz0380_nosg_capture_start(struct mz0380_dev *dev);
 void mz0380_nosg_capture_stop(struct mz0380_dev *dev);
 void mz0380_extent_repoison(struct mz0380_dev *dev);	/* M38 */
@@ -591,6 +645,8 @@ extern bool mz0380_buf_poison;
 extern unsigned int mz0380_poison_byte;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;
+extern bool mz0380_signal_confirm;
+extern unsigned int mz0380_signal_cache_ms;
 extern unsigned int mz0380_aic_channels;
 extern unsigned int mz0380_aic_bits;
 extern unsigned int mz0380_aic_freq;

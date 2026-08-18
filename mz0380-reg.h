@@ -123,8 +123,8 @@
 #define MZ0380_CFG_INT_FLAG            0xdc
 #define MZ0380_CFG_INT_ACK_VAL         2
 
-/* number of 32-bit param slots the driver tracks per command */
-#define MZ0380_REG_PARAM_MAX           14
+/* opcode plus ten arguments; the next word is EVENT and is never payload */
+#define MZ0380_REG_PARAM_MAX           11
 
 /* Opcodes (RE-confirmed from DownloadFirmware/DownloadBaseFirmware) */
 #define MZ0380_CMD_BEGIN_FW_DL          0x0b  /* begin main (HD) firmware, param=size */
@@ -137,6 +137,10 @@
  * FUN_1402851cc): cmd {opcode, chip, reg, value}; read result lands in
  * PARAM3 (BAR0+0x10).
  */
+#define MZ0380_CMD_I2C_READ_S           0x1e  /* M69: block read twin of 0x1f;
+                                               * on NAK leaves the payload
+                                               * UNTOUCHED (clean NAK detector,
+                                               * unlike 0x1a which forces 0)   */
 #define MZ0380_CMD_REG_READ             0x1a
 #define MZ0380_CMD_REG_WRITE            0x1b
 
@@ -168,7 +172,7 @@
  *   cmd[0x22]=int_reduce flag. width==0||height==0 -> firmware sets no_signal.
  */
 #define MZ0380_CMD_SET_VIC_PARAMS       0x29  /* 41: select input + WxH/fps    */
-#define MZ0380_CMD_SET_AIC_INT_MODE     0x2d  /* 45: audio int mode            */
+#define MZ0380_CMD_SET_ENC_PARAMS       0x2d  /* 45: masked H.264 encoder config */
 #define MZ0380_CMD_GPIO_READ            0x14  /* 20: read GPIO bitmap          */
 #define MZ0380_CMD_GPIO_SET             0x15  /* 21: set GPIO data (prop 941)  */
 #define MZ0380_CMD_GPIO_DIR             0x17  /* 23: set GPIO direction (940)  */
@@ -182,7 +186,17 @@
  * outputs), so there is no GPIO_DIR step. pin9 held low at power-up is what
  * kept the MST3367 in reset and the I2C bus dead (M11-M15).
  */
-#define MZ0380_GPIO_HPD                 1     /* HDMI hot-plug detect          */
+#define MZ0380_GPIO_HPD                 1     /* HDMI hot-plug detect. M69:
+                                               * ACTIVE-LOW on the Elgato board:
+                                               * win64 FUN_14024eeb8 computes
+                                               * pin1 = ~(arg>>4)&1, so HPD_ON
+                                               * drives the pin LOW. We had it
+                                               * inverted for the whole project. */
+#define MZ0380_GPIO_EDID_MUX            2     /* M69: DDC path mux, only ever
+                                               * touched by the Windows EDID
+                                               * handler: 1 = local EDID store
+                                               * on the SoC's i2c-0, 0 = the
+                                               * passthrough/monitor side.     */
 #define MZ0380_GPIO_RX_ENABLE           3     /* receiver / mux enable (=1)    */
 #define MZ0380_GPIO_RX_STRAP            8     /* companion reset/power strap   */
 #define MZ0380_GPIO_RX_RESET            9     /* MST3367 reset, ACTIVE-LOW     */
@@ -194,25 +208,15 @@
  * Register roles + detect math: RE_FINDINGS.md M15 + docs/re-2026-07-05/.
  */
 /*
- * Multi-byte ("combo") I2C transfer - the opcode the Windows driver uses for
- * EDID (i2c_combo_cmd_x). Frame, from docs/re-2026-07-05/HD60-PRO-LINUX-
- * DRIVER.md §3d item 3 (both-sides disassembly):
- *   cmd[4] = dev8, cmd[5] = rw, cmd[6..7] = len, cmd[8..] = payload
- * i.e. PARAM1 = dev8 | (rw << 8) | (len << 16), PARAM2.. = payload bytes
- * packed little-endian. The card chunks the transfer into 16-byte pieces
- * internally.
- *
- * M43: the earlier code used 0x1f here. That opcode is read_s/write_s, whose
- * bus assignment our two RE sources disagree on, and it left the EDID EEPROM
- * untouched (read-back was all zeros on hardware). 0x20 is the one both
- * sources agree on.
- *
- * A write to an I2C EEPROM carries its target offset as the first payload
- * byte, so a 32-byte chunk is a 33-byte transfer.
+ * EDID bulk write, confirmed in both e60MZ0380.X64.SYS and yuan_ioctrl.
+ * Opcode 0x1f consumes this packed command:
+ *   cmd[4] = dev8, cmd[5] = EEPROM offset, cmd[6..7] = payload length,
+ *   cmd[8..] = payload bytes.
+ * The Windows driver writes 32-byte chunks and waits synchronously for the
+ * shared STATUS completion before reusing the mailbox.  Opcode 0x20 is a
+ * different generic combo transaction whose byte 5 is a direction flag.
  */
-#define MZ0380_CMD_I2C_COMBO            0x20
-#define MZ0380_I2C_COMBO_WRITE          0
-#define MZ0380_I2C_COMBO_READ           1
+#define MZ0380_CMD_I2C_WRITE_S          0x1f
 #define MZ0380_EDID_I2C_DEV             0xa0
 #define MZ0380_EDID_CHUNK               32
 #define MZ0380_EDID_SIZE                256
@@ -239,18 +243,36 @@
 #define MST3367_B0_HPD_ON               0x00
 #define MST3367_B0_HPD_OFF              0x02
 /* BANK0 mode-detect block */
-#define MST3367_B0_DETECT               0x55  /* signal present if (v & 0x3c)  */
+#define MST3367_B0_DETECT               0x55  /* usable lock iff mask == 0x3c   */
 #define MST3367_B0_DETECT_LOCK_MASK     0x3c
+/*
+ * M67: bit 0x20 flaps independently of a usable lock, so the bits that must
+ * ALL be set for the timing block to be readable are 0x04|0x08|0x10. Evidence
+ * from every R55 this project has logged:
+ *
+ *   0x3f 0x5f 0x7f          -> timing block good (0x5f carried a textbook
+ *                              1080p60, and 0x5f fails a 0x3c test)
+ *   0xa3 0x23 0x27 0xc7 0x2b -> torn counters (vtot=5, htot=656, ...)
+ *   0x83 0x03               -> no signal
+ *
+ * 0x1c classifies all ten correctly; 0x3c rejects good data whenever 0x20
+ * happens to be low, which it was on three consecutive runs - and it can drop
+ * BETWEEN the poll's read and the measurement's own re-read.
+ */
+#define MST3367_B0_DETECT_LOCK_CORE     0x1c
 #define MST3367_B0_HPERIOD_HI           0x57  /* hperiod = 1600000/(hi<<8|lo)  */
 #define MST3367_B0_HPERIOD_LO           0x58
 #define MST3367_B0_VPERIOD_HI           0x59  /* vperiod = 1250000/(hi<<8|lo)  */
 #define MST3367_B0_VPERIOD_LO           0x5a
 #define MST3367_B0_VTOTAL_HI            0x5b
 #define MST3367_B0_VTOTAL_LO            0x5c
-#define MST3367_B0_INTERLACE            0x5f  /* bit1 = interlaced             */
-#define MST3367_B0_INTERLACE_BIT        0x02
+#define MST3367_B0_INTERLACE            0x5f  /* HD60 Pro: bit3 = interlaced   */
+#define MST3367_B0_INTERLACE_BIT        0x08
 #define MST3367_B0_HTOTAL_HI            0x6a
 #define MST3367_B0_HTOTAL_LO            0x6b
+#define MST3367_B0_AUTO_POSITION        0xe2
+#define MST3367_B0_AUTO_POSITION_ON     0x80
+#define MST3367_B0_AUTO_POSITION_OFF    0x00
 /* BANK2 active-pixel counter */
 #define MST3367_B2_HACTIVE_LO           0x28  /* hactive = (0x29<<8)|0x28      */
 #define MST3367_B2_HACTIVE_HI           0x29
@@ -285,7 +307,7 @@
  * from host-supplied physical addresses. The host hands those addresses over
  * with the config-setter opcodes below (12-word command: opcode, channel,
  * stride, then up to 4 {phys_hi, phys_lo} pairs), arms with SET_VIC_PARAMS
- * (0x29), and stops with 0x2a. Frame completion arrives as an EVENT (BAR0+0x30)
+ * (0x29), and stops with 0x07. Frame completion arrives as an EVENT (BAR0+0x30)
  * with the buffer token in BAR0+0x40.
  */
 #define MZ0380_CMD_SET_BUF_2            0x02  /* buffer phys addrs (primary)   */

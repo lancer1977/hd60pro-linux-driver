@@ -15,12 +15,40 @@
  */
 
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/v4l2-dv-timings.h>
 #include <media/v4l2-dv-timings.h>
 
 #include "mz0380.h"
 #include "mz0380-reg.h"
 #include "mz0380-edid.h"
+
+/*
+ * The MST3367 bank selector is global chip state, while each mailbox command
+ * is only serialized individually.  Keep bank-select + register batches
+ * atomic with respect to every receiver operation in this file.  This is a
+ * global lock because the device structure predates the receiver support;
+ * HD60 Pro systems normally contain one such card.
+ */
+static DEFINE_MUTEX(mst3367_lock);
+
+static bool mst3367_status_locked(u8 status)
+{
+	/*
+	 * M67: gate on the core bits (0x1c), not the full 0x3c. Bit 0x20 is
+	 * not required for the timing block to be valid - see the evidence
+	 * table at MST3367_B0_DETECT_LOCK_CORE - and it toggles fast enough to
+	 * be set when the poll loop reads R55 and clear ~5ms later when
+	 * measure_once() re-reads it, which is exactly how three runs died
+	 * with "no full lock at start of pass" while R55 read 0x5f.
+	 *
+	 * Sample quality is not this predicate's job anyway: the snapshot
+	 * re-read, the vtotal delta and the line-count cross-check decide
+	 * whether a measurement is trustworthy.
+	 */
+	return (status & MST3367_B0_DETECT_LOCK_CORE) ==
+		MST3367_B0_DETECT_LOCK_CORE;
+}
 
 /* --- low-level MST3367 register access over the mailbox proxy ------------- */
 
@@ -54,18 +82,24 @@ static int mst_bank(struct mz0380_dev *dev, u8 bank)
  * distinguishable from a live one, which always has some non-zero config.
  * Sampled across bank0 so one zeroed register cannot decide it.
  */
-static bool mst_bus_alive(struct mz0380_dev *dev)
+static int mst_bus_alive(struct mz0380_dev *dev)
 {
 	unsigned int reg;
+	int ret;
 
-	mst_bank(dev, MST3367_BANK0);
+	ret = mst_bank(dev, MST3367_BANK0);
+	if (ret)
+		return ret;
 	for (reg = 0x01; reg <= 0xf1; reg += 0x10) {
 		u8 v = 0;
 
-		if (!mst_rd(dev, reg, &v) && v)
-			return true;
+		ret = mst_rd(dev, reg, &v);
+		if (ret)
+			return ret;
+		if (v)
+			return 1;
 	}
-	return false;
+	return 0;
 }
 
 /* --- GPIO (op 0x15, single-pin mask+data; see reg.h GPIO pin map) --------- */
@@ -99,32 +133,51 @@ static int mz0380_gpio_force_output(struct mz0380_dev *dev, unsigned int pin,
 }
 
 /*
- * Release the MST3367 from reset. The card holds pin9 (active-low reset) low at
- * power-up; Windows pulses pin9 1->0->1 with pin3 (RX enable) high and pin8
- * (companion strap) alongside. Until this runs, the receiver I2C bus is dead.
+ * Release the MST3367 from reset.  The HD60 Pro Windows routine
+ * FUN_14024dc28 drives pin9 1->0->1 with 50 ms at every phase, then drives
+ * pin8 low and waits another 50 ms.  The old sibling-board sequence used
+ * 2/5/10 ms delays and put pin8 back high; that is not the sequence shipped
+ * for this PCI ID and can leave the receiver's acquisition state marginal.
+ * Keep pin3 enabled around the device-specific reset because it is the board
+ * RX/mux gate discovered during the original hardware bring-up.
  */
-static void mz0380_mst3367_reset(struct mz0380_dev *dev)
+static int mz0380_mst3367_reset(struct mz0380_dev *dev)
 {
 	static const u8 driven[] = {
 		MZ0380_GPIO_HPD, MZ0380_GPIO_RX_ENABLE,
 		MZ0380_GPIO_RX_STRAP, MZ0380_GPIO_RX_RESET,
 	};
 	unsigned int i;
+	int ret;
 
 	/* every pin we are about to drive must actually be an output */
-	for (i = 0; i < ARRAY_SIZE(driven); i++)
-		mz0380_gpio_force_output(dev, driven[i],
-					 mz0380_gpio_dir_invert);
+	for (i = 0; i < ARRAY_SIZE(driven); i++) {
+		ret = mz0380_gpio_force_output(dev, driven[i],
+						mz0380_gpio_dir_invert);
+		if (ret)
+			return ret;
+	}
 
-	mz0380_gpio_set(dev, MZ0380_GPIO_RX_ENABLE, 1);   /* RX / mux enable  */
-	mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 1);    /* released baseline */
-	usleep_range(2000, 3000);
-	mz0380_gpio_set(dev, MZ0380_GPIO_RX_STRAP, 0);    /* strap low        */
-	mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 0);    /* ASSERT reset     */
-	usleep_range(5000, 6000);
-	mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 1);    /* RELEASE reset    */
-	mz0380_gpio_set(dev, MZ0380_GPIO_RX_STRAP, 1);    /* strap high       */
-	usleep_range(10000, 12000);                       /* PLL/I2C come-up  */
+	ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_ENABLE, 1);
+	if (ret)
+		return ret;
+	ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 1);
+	if (ret)
+		return ret;
+	msleep(50);
+	ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 0);
+	if (ret)
+		return ret;
+	msleep(50);
+	ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_RESET, 1);
+	if (ret)
+		return ret;
+	msleep(50);
+	ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_STRAP, 0);
+	if (ret)
+		return ret;
+	msleep(50);
+	return 0;
 }
 
 /*
@@ -133,36 +186,60 @@ static void mz0380_mst3367_reset(struct mz0380_dev *dev)
  * 8-bit output, then a HDMI + HDCP block reset.
  */
 /* read-modify-write helpers, matching hdcapm's mst3367_set / mst3367_clr */
-static void mst_set(struct mz0380_dev *dev, u8 reg, u8 mask)
+static int mst_set(struct mz0380_dev *dev, u8 reg, u8 mask)
 {
 	u8 v = 0;
+	int ret;
 
-	if (!mst_rd(dev, reg, &v))
-		mst_wr(dev, reg, v | mask);
+	ret = mst_rd(dev, reg, &v);
+	if (ret)
+		return ret;
+	return mst_wr(dev, reg, v | mask);
 }
 
-static void mst_clr(struct mz0380_dev *dev, u8 reg, u8 mask)
+static int mst_clr(struct mz0380_dev *dev, u8 reg, u8 mask)
 {
 	u8 v = 0;
+	int ret;
 
-	if (!mst_rd(dev, reg, &v))
-		mst_wr(dev, reg, v & ~mask);
+	ret = mst_rd(dev, reg, &v);
+	if (ret)
+		return ret;
+	return mst_wr(dev, reg, v & ~mask);
 }
 
-static void mst3367_hdcp_reset(struct mz0380_dev *dev)
+static int mst3367_hdcp_reset(struct mz0380_dev *dev)
 {
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0xb8, 0x10);
-	mst_wr(dev, 0xb8, 0x00);
+	int ret;
+
+	ret = mst_bank(dev, MST3367_BANK0);
+	if (ret)
+		return ret;
+	ret = mst_wr(dev, 0xb8, 0x10);
+	if (ret)
+		return ret;
+	ret = mst_wr(dev, 0xb8, 0x00);
+	if (ret)
+		return ret;
 	msleep(20);
+	return 0;
 }
 
-static void mst3367_hdmi_reset(struct mz0380_dev *dev)
+static int mst3367_hdmi_reset(struct mz0380_dev *dev)
 {
-	mst_bank(dev, MST3367_BANK2);
-	mst_wr(dev, 0x07, 0xf4);
-	mst_wr(dev, 0x07, 0x04);
+	int ret;
+
+	ret = mst_bank(dev, MST3367_BANK2);
+	if (ret)
+		return ret;
+	ret = mst_wr(dev, 0x07, 0xf4);
+	if (ret)
+		return ret;
+	ret = mst_wr(dev, 0x07, 0x04);
+	if (ret)
+		return ret;
 	msleep(20);
+	return 0;
 }
 
 /*
@@ -175,12 +252,18 @@ static void mst3367_hdmi_reset(struct mz0380_dev *dev)
  * period measured) but never reach frame lock (0x55 & 0x3c stayed clear,
  * the vertical-period counter sat saturated at 0x1fff). The blocks missing
  * here are exactly the ones that would explain that: RxTmdsInit programs
- * the TMDS equaliser/PLL, RxVideoInit the filter and sync handling, and the
- * "patches" tail disables auto-positioning. Ordering is hdcapm's, which
- * matters: HPD stays off across the whole sequence and only rises at the
- * end, after the HDCP and HDMI blocks are reset.
+ * the TMDS equaliser/PLL and RxVideoInit the filter and sync handling.
+ * Ordering is hdcapm's: HPD stays off across the whole sequence and only
+ * rises at the end, after the HDCP and HDMI blocks are reset. Auto-position
+ * remains enabled for acquisition and is disabled only after mode recognition.
  */
-static void mz0380_mst3367_init_regs(struct mz0380_dev *dev)
+#define MST3367_TRY(_op) do { \
+		ret = (_op); \
+		if (ret) \
+			return ret; \
+	} while (0)
+
+static int mz0380_mst3367_init_regs(struct mz0380_dev *dev)
 {
 	/* CSC coefficients, written as a block at BANK0 0x92.. (hdcapm) */
 	static const u8 csctbl[] = {
@@ -192,165 +275,261 @@ static void mz0380_mst3367_init_regs(struct mz0380_dev *dev)
 		0x15, 0x95, 0x05, 0x20, 0xC0, 0x08
 	};
 	unsigned int i;
+	int ret;
 
 	/* HPD off for the whole configuration */
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_OFF);
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
+	MST3367_TRY(mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_OFF));
+
+	/*
+	 * HD60 Pro FUN_14024dc28 preamble.  These fixed writes precede the
+	 * receiver's TMDS setup in the shipping driver; the older sibling-board
+	 * sequence omitted them even though 0x64..0x67 sit in the clock/sync
+	 * acquisition block.
+	 */
+	MST3367_TRY(mst_wr(dev, 0x13, 0x08));
+	/*
+	 * FUN_14024eeb8(0): park HPD DEASSERTED during configuration. M69: the
+	 * pin is active-low (pin1 = ~(arg>>4)&1 in the Windows driver), so
+	 * deasserted = pin HIGH. We wrote 0 here for the entire project, which
+	 * ASSERTED hot-plug while the receiver was half-configured and while
+	 * the EDID write was in flight - inviting the source to master the
+	 * DDC bus under our EEPROM writes.
+	 */
+	MST3367_TRY(mz0380_gpio_set(dev, MZ0380_GPIO_HPD, 1));
 
 	/* RxGeneralInit */
-	mst_wr(dev, 0x41, 0x6f);
-	mst_wr(dev, 0xb8, 0x00);
+	MST3367_TRY(mst_wr(dev, 0x41, 0x6f));
+	MST3367_TRY(mst_wr(dev, 0xb8, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x64, 0x02));
+	MST3367_TRY(mst_wr(dev, 0x65, 0xff));
+	MST3367_TRY(mst_wr(dev, 0x66, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x67, 0x02));
 
 	/* RxTmdsInit - equaliser / PLL; absent from our old sequence */
-	mst_bank(dev, MST3367_BANK1);
-	mst_wr(dev, 0x0f, 0x02);
-	mst_wr(dev, 0x16, 0x30);
-	mst_wr(dev, 0x17, 0x00);
-	mst_wr(dev, 0x18, 0x00);
-	mst_wr(dev, 0x19, 0x00);
-	mst_wr(dev, 0x1a, 0x50);
-	mst_clr(dev, 0x2a, 0x07);
-	mst_set(dev, 0x2a, 0x07);
-	mst_bank(dev, MST3367_BANK2);
-	mst_wr(dev, 0x08, 0x03);
+	MST3367_TRY(mst_bank(dev, MST3367_BANK1));
+	MST3367_TRY(mst_wr(dev, 0x0f, 0x02));
+	MST3367_TRY(mst_wr(dev, 0x16, 0x30));
+	MST3367_TRY(mst_wr(dev, 0x17, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x18, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x19, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x1a, 0x50));
+	MST3367_TRY(mst_clr(dev, 0x2a, 0x07));
+	MST3367_TRY(mst_set(dev, 0x2a, 0x07));
+	MST3367_TRY(mst_bank(dev, MST3367_BANK2));
+	MST3367_TRY(mst_wr(dev, 0x08, 0x03));
 
 	/* RxHdcpInit - receive HDCP */
-	mst_bank(dev, MST3367_BANK1);
-	mst_wr(dev, 0x24, 0x40);
-	mst_wr(dev, 0x30, 0x80);
-	mst_wr(dev, 0x31, 0x00);
-	mst_wr(dev, 0x32, 0x00);
+	MST3367_TRY(mst_bank(dev, MST3367_BANK1));
+	MST3367_TRY(mst_wr(dev, 0x24, 0x40));
+	MST3367_TRY(mst_wr(dev, 0x30, 0x80));
+	MST3367_TRY(mst_wr(dev, 0x31, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x32, 0x00));
 
 	/* RxVideoInit */
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0xb0, 0x14);
-	mst_set(dev, 0xae, 0x04);
-	mst_wr(dev, 0xad, 0x05);        /* enable low-pass filter */
-	mst_wr(dev, 0xb1, 0xe0);
-	mst_wr(dev, 0xb2, 0x08);
-	mst_wr(dev, 0xb3, 0x00);
-	mst_wr(dev, 0xb4, 0x55);
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
+	MST3367_TRY(mst_wr(dev, 0xb0, 0x14));
+	MST3367_TRY(mst_set(dev, 0xae, 0x04));
+	MST3367_TRY(mst_wr(dev, 0xad, 0x05)); /* enable low-pass filter */
+	/* Exact HD60 Pro FUN_14024dc28 values (the sibling uses e0/08). */
+	MST3367_TRY(mst_wr(dev, 0xb1, 0xc0));
+	MST3367_TRY(mst_wr(dev, 0xb2, 0x00));
+	MST3367_TRY(mst_wr(dev, 0xb3, 0x00));
+	MST3367_TRY(mst_wr(dev, 0xb4, 0x55));
 
 	/* RxAudioInit */
-	mst_clr(dev, 0xb4, 0x03);
-	mst_bank(dev, MST3367_BANK2);
-	mst_wr(dev, 0x01, 0x61);
-	mst_wr(dev, 0x02, 0xf5);
-	mst_set(dev, 0x03, 0x02);
-	mst_wr(dev, 0x04, 0x01);
-	mst_wr(dev, 0x05, 0x00);
-	mst_wr(dev, 0x06, 0x08);
-	mst_wr(dev, 0x1c, 0x1a);
-	mst_wr(dev, 0x1d, 0x00);
-	mst_wr(dev, 0x1e, 0x00);
-	mst_wr(dev, 0x1f, 0x00);
-	mst_clr(dev, 0x25, 0xa2);
-	mst_set(dev, 0x25, 0xa2);
+	MST3367_TRY(mst_clr(dev, 0xb4, 0x03));
+	MST3367_TRY(mst_bank(dev, MST3367_BANK2));
+	MST3367_TRY(mst_wr(dev, 0x01, 0x61));
+	MST3367_TRY(mst_wr(dev, 0x02, 0xf5));
+	MST3367_TRY(mst_set(dev, 0x03, 0x02));
+	MST3367_TRY(mst_wr(dev, 0x04, 0x01));
+	MST3367_TRY(mst_wr(dev, 0x05, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x06, 0x08));
+	MST3367_TRY(mst_wr(dev, 0x1c, 0x1a));
+	MST3367_TRY(mst_wr(dev, 0x1d, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x1e, 0x00));
+	MST3367_TRY(mst_wr(dev, 0x1f, 0x00));
+	MST3367_TRY(mst_clr(dev, 0x25, 0xa2));
+	MST3367_TRY(mst_set(dev, 0x25, 0xa2));
 
-	mst_set(dev, 0x02, 0x80);
-	mst_set(dev, 0x07, 0x04);
-	mst_wr(dev, 0x17, 0xc0);
-	mst_wr(dev, 0x19, 0xff);
-	mst_wr(dev, 0x1a, 0xff);
-	mst_wr(dev, 0x1b, 0xfc);
-	mst_wr(dev, 0x20, 0x00);
-	mst_clr(dev, 0x21, 0x03);
-	mst_wr(dev, 0x22, 0x26);
-	mst_wr(dev, 0x27, 0x00);
-	mst_set(dev, 0x2e, 0xa1);
+	MST3367_TRY(mst_set(dev, 0x02, 0x80));
+	MST3367_TRY(mst_set(dev, 0x07, 0x04));
+	MST3367_TRY(mst_wr(dev, 0x17, 0xc0));
+	MST3367_TRY(mst_wr(dev, 0x19, 0xff));
+	MST3367_TRY(mst_wr(dev, 0x1a, 0xff));
+	MST3367_TRY(mst_wr(dev, 0x1b, 0xfc));
+	MST3367_TRY(mst_wr(dev, 0x20, 0x00));
+	MST3367_TRY(mst_clr(dev, 0x21, 0x03));
+	MST3367_TRY(mst_wr(dev, 0x22, 0x26));
+	MST3367_TRY(mst_wr(dev, 0x27, 0x00));
+	MST3367_TRY(mst_set(dev, 0x2e, 0xa1));
 
 	/* colour range */
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0xab, 0x15);
-	mst_clr(dev, 0xac, 0x3f);
-	mst_set(dev, 0xac, 0x15);
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
+	MST3367_TRY(mst_wr(dev, 0xab, 0x15));
+	MST3367_TRY(mst_clr(dev, 0xac, 0x3f));
+	MST3367_TRY(mst_set(dev, 0xac, 0x15));
 
 	/* RxSwitchSource - HDMI */
-	mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_OFF);
-	mst3367_hdcp_reset(dev);
-	mst3367_hdmi_reset(dev);
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, 0x51, 0x89);
-	mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_ON);
-	mst_wr(dev, 0xb7, 0x00);
+	MST3367_TRY(mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_OFF));
+	MST3367_TRY(mst3367_hdcp_reset(dev));
+	MST3367_TRY(mst3367_hdmi_reset(dev));
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
+	MST3367_TRY(mst_wr(dev, 0x51, 0x89));
+	MST3367_TRY(mst_wr(dev, MST3367_B0_HPD, MST3367_B0_HPD_ON));
 
-	/* patches */
-	mst_wr(dev, 0xe2, 0x00);        /* disable auto position */
-	mst_wr(dev, 0x1e, 0x11);
-	mst_wr(dev, 0x1f, 0x01);
-	mst_wr(dev, 0x73, 0x90);
-	mst_wr(dev, 0xb5, 0x0c);
+	/* Keep auto-position enabled until a coherent mode has been recognized. */
+	MST3367_TRY(mst_wr(dev, MST3367_B0_AUTO_POSITION,
+			       MST3367_B0_AUTO_POSITION_ON));
+	MST3367_TRY(mst_wr(dev, 0x1e, 0x11));
+	MST3367_TRY(mst_wr(dev, 0x1f, 0x01));
+	MST3367_TRY(mst_wr(dev, 0x73, 0x90));
+	MST3367_TRY(mst_wr(dev, 0xb5, 0x0c));
 
 	/* CSC */
-	mst_wr(dev, 0x90, 0x15);
-	mst_wr(dev, 0x91, 0x15);
+	MST3367_TRY(mst_wr(dev, 0x90, 0x15));
+	MST3367_TRY(mst_wr(dev, 0x91, 0x15));
 	for (i = 0; i < ARRAY_SIZE(csctbl); i++)
-		mst_wr(dev, 0x92 + i, csctbl[i]);
+		MST3367_TRY(mst_wr(dev, 0x92 + i, csctbl[i]));
 
 	/* YUV422, 8-bit, external sync */
-	mst_wr(dev, 0xb0, 0x20);
+	MST3367_TRY(mst_wr(dev, 0xb0, 0x20));
 
 	/* RxHdmiInit */
-	mst_bank(dev, MST3367_BANK2);
-	mst_clr(dev, 0x01, 0xf0);
-	mst_set(dev, 0x01, 0x40 | 0x20);
-	mst_set(dev, 0x04, 0x01);
-	mst_wr(dev, 0x06, 0x08);
-	mst_set(dev, 0x09, 0x20);
-	mst_bank(dev, MST3367_BANK0);
-	mst_clr(dev, 0x54, 0x10);
-	mst_set(dev, 0xac, 0x80);
-	mst_set(dev, 0x00, 0x80);
-	mst_set(dev, 0xce, 0x80);
-	mst_clr(dev, 0xcf, 0x07);
-	mst_set(dev, 0xcf, 0x02);
-	mst_clr(dev, 0x00, 0x80);
+	MST3367_TRY(mst_bank(dev, MST3367_BANK2));
+	MST3367_TRY(mst_clr(dev, 0x01, 0xf0));
+	MST3367_TRY(mst_set(dev, 0x01, 0x40 | 0x20));
+	MST3367_TRY(mst_set(dev, 0x04, 0x01));
+	MST3367_TRY(mst_wr(dev, 0x06, 0x08));
+	MST3367_TRY(mst_set(dev, 0x09, 0x20));
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
+	MST3367_TRY(mst_clr(dev, 0x54, 0x10));
+	MST3367_TRY(mst_set(dev, 0xac, 0x80));
+	MST3367_TRY(mst_set(dev, 0x00, 0x80));
+	MST3367_TRY(mst_set(dev, 0xce, 0x80));
+	MST3367_TRY(mst_clr(dev, 0xcf, 0x07));
+	MST3367_TRY(mst_set(dev, 0xcf, 0x02));
+	MST3367_TRY(mst_clr(dev, 0x00, 0x80));
+
+	/*
+	 * Complete FUN_14024d2ec's HD60 Pro output-pin mapping.  Registry
+	 * defaults are output-map index 1 and automatic mapping enabled, which
+	 * select table value zero: BANK80:D0[1:0]=0 and CF[7]=0.
+	 */
+	MST3367_TRY(mst_bank(dev, 0x80));
+	MST3367_TRY(mst_clr(dev, 0xd0, 0x03));
+	MST3367_TRY(mst_clr(dev, 0xcf, 0x80));
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
 
 	msleep(20);
+	return 0;
 }
 
 /*
- * Load the EDID into the receiver's DDC EEPROM (I2C 0xA0) with the bulk-write
- * opcode, 32 bytes per command (M10: PARAM1 = (len<<16)|(block<<8)|dev8, then
- * the bytes little-endian). This is the half of "look like a sink" that the
- * driver has been missing: an HDMI source that cannot read an EDID keeps its
- * transmitter off, so the receiver never locks no matter what else we do.
+ * Load the EDID into the receiver's DDC EEPROM (I2C 0xA0) using the exact
+ * Windows write_s packet: PARAM1=(len<<16)|(offset<<8)|dev8 followed by 32
+ * data bytes in PARAM2..PARAM9.  This deliberately leaves PARAM10/STATUS free
+ * so each chunk can complete synchronously before the mailbox is reused.
  */
+/*
+ * M69: read the EDID store back through opcode 0x1e - the block-read twin of
+ * the 0x1f write. Unlike 0x1a, whose result the firmware forces to 0 on a
+ * NAK, 0x1e leaves the host's payload bytes UNTOUCHED on failure - so poison
+ * the buffer first and a NAK is unambiguous. Returns 0 with 32 bytes in *buf.
+ */
+static int mz0380_mst3367_read_edid_chunk(struct mz0380_dev *dev,
+					  unsigned int off, u8 *buf)
+{
+	u32 params[1 + MZ0380_EDID_CHUNK / sizeof(u32)];
+	unsigned int i;
+	int ret;
+
+	memset(params, 0xa5, sizeof(params));    /* poison: NAK leaves it */
+	params[0] = MZ0380_EDID_I2C_DEV |
+		    ((u32)off << 8) |
+		    ((u32)MZ0380_EDID_CHUNK << 16);
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_I2C_READ_S, params,
+				  ARRAY_SIZE(params), NULL, 500);
+	if (ret)
+		return ret;
+	/* the reply payload lands back in the PARAM slots */
+	for (i = 0; i < MZ0380_EDID_CHUNK / sizeof(u32); i++) {
+		u32 v = mz_mmio_read(dev, MZ0380_MB_PARAM(1 + i));
+
+		memcpy(buf + i * sizeof(u32), &v, sizeof(v));
+	}
+	return 0;
+}
+
 static int mz0380_mst3367_load_edid(struct mz0380_dev *dev)
 {
+	u8 verify[MZ0380_EDID_CHUNK];
 	unsigned int off;
 	int ret;
 
-	for (off = 0; off < MZ0380_EDID_SIZE; off += MZ0380_EDID_CHUNK) {
-		/* payload = offset byte + the chunk, padded to whole words */
-		u8 buf[1 + MZ0380_EDID_CHUNK] = { 0 };
-		u32 params[1 + (sizeof(buf) + 3) / 4] = { 0 };
-		unsigned int i;
+	/*
+	 * M69: GPIO pin 2 is the DDC path mux, driven ONLY by the Windows
+	 * EDID handler: 1 = the local EDID store is on the SoC's i2c-0
+	 * (where our opcode 0x1f writes go), 0 = the passthrough side. Every
+	 * previous EDID attempt ran with pin 2 in its power-on state - if
+	 * that state is 0, our writes went to a bus with nothing on it,
+	 * which is exactly the observed NAK-and-read-back-zero.
+	 */
+	ret = mz0380_gpio_force_output(dev, MZ0380_GPIO_EDID_MUX,
+				       mz0380_gpio_dir_invert);
+	if (!ret)
+		ret = mz0380_gpio_set(dev, MZ0380_GPIO_EDID_MUX, 1);
+	if (ret)
+		pr_warn("%s: EDID mux (pin2) drive failed (%d) - writing with it as-is\n",
+			dev->name, ret);
 
-		buf[0] = off;                            /* EEPROM byte offset */
-		memcpy(&buf[1], &mz0380_edid_default[off], MZ0380_EDID_CHUNK);
+	for (off = 0; off < MZ0380_EDID_SIZE; off += MZ0380_EDID_CHUNK) {
+		u32 params[1 + MZ0380_EDID_CHUNK / sizeof(u32)] = { 0 };
 
 		params[0] = MZ0380_EDID_I2C_DEV |
-			    ((u32)MZ0380_I2C_COMBO_WRITE << 8) |
-			    ((u32)sizeof(buf) << 16);
-		for (i = 0; i < sizeof(buf); i++)
-			params[1 + i / 4] |= (u32)buf[i] << (8 * (i % 4));
+			    ((u32)off << 8) |
+			    ((u32)MZ0380_EDID_CHUNK << 16);
+		memcpy(&params[1], &mz0380_edid_default[off],
+		       MZ0380_EDID_CHUNK);
 
-		/*
-		 * M47: default timeout 0 = fire-and-forget. The card posts no
-		 * completion for this opcode (it returned -110 while the very
-		 * next command worked), exactly like START_STREAMING.
-		 */
+		if (!mz0380_edid_timeout_ms) {
+			pr_warn("%s: refusing unsafe asynchronous EDID write at offset %u\n",
+				dev->name, off);
+			return -EINVAL;
+		}
 		ret = mz0380_send_command(dev, mz0380_edid_opcode, params,
 					  ARRAY_SIZE(params), NULL,
 					  mz0380_edid_timeout_ms);
-		if (ret && mz0380_edid_timeout_ms) {
+		if (ret) {
 			pr_warn("%s: EDID write failed at offset %u (%d)\n",
 				dev->name, off, ret);
+			/* leave the mux on the connector side on the way out */
+			mz0380_gpio_set(dev, MZ0380_GPIO_EDID_MUX, 0);
 			return ret;
 		}
-		msleep(20);   /* bit-banged I2C + EEPROM page-write cycle */
+		msleep(20);   /* conservative EEPROM page-write cycle */
 	}
+
+	/*
+	 * M69: verify with the clean NAK detector while the mux still points
+	 * at the local store. Header bytes 1..6 of a valid EDID are 0xff - a
+	 * value the poison (0xa5) cannot fake.
+	 */
+	memset(verify, 0, sizeof(verify));
+	ret = mz0380_mst3367_read_edid_chunk(dev, 0, verify);
+	if (!ret && verify[1] == 0xff && verify[2] == 0xff && verify[6] == 0xff)
+		pr_info("%s: EDID READ-BACK OK (%02x %02x %02x %02x %02x %02x %02x %02x) - a real store holds our EDID\n",
+			dev->name, verify[0], verify[1], verify[2], verify[3],
+			verify[4], verify[5], verify[6], verify[7]);
+	else
+		pr_warn("%s: EDID read-back failed (ret=%d, first bytes %02x %02x %02x %02x) - nothing is holding the EDID at 0xa0\n",
+			dev->name, ret, verify[0], verify[1], verify[2],
+			verify[3]);
+
+	/* hand the store back to the connector side, as Windows does */
+	mz0380_gpio_set(dev, MZ0380_GPIO_EDID_MUX, 0);
 
 	pr_info("%s: EDID pushed (%u bytes, opcode 0x%02x, wait %ums) - the source is the oracle: a camera switches to HDMI out once it can read one\n",
 		dev->name, MZ0380_EDID_SIZE, mz0380_edid_opcode,
@@ -367,13 +546,20 @@ static int mz0380_mst3367_load_edid(struct mz0380_dev *dev)
  */
 static int mz0380_gpio_get(struct mz0380_dev *dev, unsigned int pin, u32 *out);
 
-static void mz0380_mst3367_hpd(struct mz0380_dev *dev, bool on)
+static int mz0380_mst3367_hpd(struct mz0380_dev *dev, bool on)
 {
 	u32 level = 0;
 	u8 b7 = 0;
+	bool pin_ok, receiver_ok;
+	int ret;
 
-	mst_bank(dev, MST3367_BANK0);
-	mst_wr(dev, MST3367_B0_HPD, on ? MST3367_B0_HPD_ON : MST3367_B0_HPD_OFF);
+	ret = mst_bank(dev, MST3367_BANK0);
+	if (ret)
+		return ret;
+	ret = mst_wr(dev, MST3367_B0_HPD,
+		     on ? MST3367_B0_HPD_ON : MST3367_B0_HPD_OFF);
+	if (ret)
+		return ret;
 
 	/*
 	 * Drive the board pin - and make sure it IS driven. A GPIO_SET on a
@@ -382,41 +568,51 @@ static void mz0380_mst3367_hpd(struct mz0380_dev *dev, bool on)
 	 * source saw no edge at all. Force the direction, then read the pin
 	 * and the receiver's own HPD bit back and report what actually stuck.
 	 */
-	mz0380_gpio_force_output(dev, MZ0380_GPIO_HPD, mz0380_gpio_dir_invert);
-	mz0380_gpio_set(dev, MZ0380_GPIO_HPD, on);
+	ret = mz0380_gpio_force_output(dev, MZ0380_GPIO_HPD,
+				       mz0380_gpio_dir_invert);
+	if (ret)
+		return ret;
+	/*
+	 * M69: HPD is ACTIVE-LOW on this board (win64 FUN_14024eeb8:
+	 * pin1 = ~(arg>>4)&1 - HPD_ON drives the pin LOW). Every earlier run
+	 * asserted when it meant to release and vice versa, which is exactly
+	 * the recorded behaviour: the camera reacted to our edge, then fell
+	 * back to its LCD because our "asserted" steady state was, physically,
+	 * no sink present.
+	 */
+	ret = mz0380_gpio_set(dev, MZ0380_GPIO_HPD, !on);
+	if (ret)
+		return ret;
 
-	mz0380_gpio_get(dev, MZ0380_GPIO_HPD, &level);
-	mst_rd(dev, MST3367_B0_HPD, &b7);
+	ret = mz0380_gpio_get(dev, MZ0380_GPIO_HPD, &level);
+	if (ret)
+		return ret;
+	ret = mst_rd(dev, MST3367_B0_HPD, &b7);
+	if (ret)
+		return ret;
 
-	pr_info("%s: HPD %s -> pin%u reads %u, BANK0[0x%02x]=0x%02x%s\n",
+	pin_ok = !!level == !on;    /* active-low: asserted reads 0 */
+	receiver_ok = (!(b7 & MST3367_B0_HPD_OFF)) == on;
+	pr_info("%s: HPD %s -> pin%u reads %u, BANK0[0x%02x]=0x%02x%s%s\n",
 		dev->name, on ? "asserted" : "deasserted", MZ0380_GPIO_HPD,
 		level, MST3367_B0_HPD, b7,
-		(!!level == !!on) ? "" :
-		"  <- PIN DID NOT FOLLOW: the source is seeing nothing");
-}
+		pin_ok ? "" : "  <- board HPD pin did not follow",
+		receiver_ok ? "" : "  <- receiver HPD bit did not follow");
 
-/*
- * M46. Declare the input BEFORE touching the receiver. The Windows bring-up
- * order is AUTO.INPUT (input select) -> EDID -> HPD -> detect, and our
- * RE notes flag input-select as the prime suspect for the "receiver domain is
- * gated until Windows does something first" behaviour. Everything we have
- * done so far skipped straight to the receiver, so the card was never told
- * which front-end to route - which fits a receiver that answers I2C happily
- * but never sees a signal, and a detect block frozen at its idle values.
- */
-static void mz0380_mst3367_select_input(struct mz0380_dev *dev)
-{
-	u32 params[8] = { 0 };
-	int ret;
-
-	/* cmd[6] = input code (HDMI), cmd[5] = fps, cmd[8..11] = geometry */
-	params[0] = ((u32)MZ0380_INPUT_CODE_HDMI << 16) | (60u << 8);
-	params[1] = (1080u << 16) | 1920u;
-
-	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
-				  ARRAY_SIZE(params), NULL, 500);
-	pr_info("%s: input select: SET_VIC(input=HDMI 1920x1080@60) ret=%d\n",
-		dev->name, ret);
+	/*
+	 * M61: this read-back is DIAGNOSTIC, not a gate. Every command above
+	 * already returned its own error; what is left is a sampled pin, and
+	 * on this SoC a GPIO read returns the input register, which need not
+	 * follow a pin we are driving as an output. Asserting HPD failed the
+	 * check while deasserting passed it - a one-sided result that fits a
+	 * read-back artefact, not a dead line. What actually proved HPD works
+	 * is the source reacting to the edge (M48/M49), and failing bring-up
+	 * here throws away the detect path over a sample we cannot trust.
+	 */
+	if (!pin_ok || !receiver_ok)
+		pr_warn("%s: HPD read-back did not follow (pin_ok=%u receiver_ok=%u) - continuing; the edge is verified by the source's reaction, not by this sample\n",
+			dev->name, pin_ok, receiver_ok);
+	return 0;
 }
 
 /*
@@ -467,6 +663,7 @@ int mz0380_mst3367_wscan(struct mz0380_dev *dev)
 	pr_info("%s: writability scan (finding RAM windows; '#' = holds an arbitrary byte)\n",
 		dev->name);
 
+	mutex_lock(&mst3367_lock);
 	for (bank = 0; bank <= 3; bank++) {
 		bool ram[256] = { false };
 		unsigned int reg, run_start = 0;
@@ -527,6 +724,7 @@ int mz0380_mst3367_wscan(struct mz0380_dev *dev)
 	}
 
 	mst_bank(dev, MST3367_BANK0);
+	mutex_unlock(&mst3367_lock);
 	pr_info("%s: writability scan done - a long run of '#' is the EDID RAM candidate\n",
 		dev->name);
 	return 0;
@@ -537,21 +735,28 @@ int mz0380_mst3367_hpd_pulse(struct mz0380_dev *dev, unsigned int count,
 			     unsigned int gap_ms)
 {
 	unsigned int i;
+	int ret = 0;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY)
 		return -ENODEV;
 
+	mutex_lock(&mst3367_lock);
 	for (i = 0; i < count; i++) {
 		pr_info("%s: HPD pulse %u/%u: deassert\n",
 			dev->name, i + 1, count);
-		mz0380_mst3367_hpd(dev, false);
+		ret = mz0380_mst3367_hpd(dev, false);
+		if (ret)
+			break;
 		msleep(gap_ms);
 		pr_info("%s: HPD pulse %u/%u: assert - watch the source now\n",
 			dev->name, i + 1, count);
-		mz0380_mst3367_hpd(dev, true);
+		ret = mz0380_mst3367_hpd(dev, true);
+		if (ret)
+			break;
 		msleep(gap_ms);
 	}
-	return 0;
+	mutex_unlock(&mst3367_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_hpd_pulse);
 
@@ -563,28 +768,47 @@ int mz0380_mst3367_reload_edid(struct mz0380_dev *dev)
 		return -ENODEV;
 	if (!dev->mst3367_ready) {
 		ret = mz0380_mst3367_bringup(dev);
-		return ret;
+		if (ret)
+			return ret;
 	}
 
-	mz0380_mst3367_hpd(dev, false);
+	mutex_lock(&mst3367_lock);
+	ret = mz0380_mst3367_hpd(dev, false);
+	if (ret)
+		goto out;
 	msleep(200);
 	ret = mz0380_mst3367_load_edid(dev);
+	if (ret)
+		goto out;
 	msleep(100);
-	mz0380_mst3367_hpd(dev, true);
+	ret = mz0380_mst3367_hpd(dev, true);
+out:
+	mutex_unlock(&mst3367_lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_reload_edid);
 
 int mz0380_mst3367_bringup(struct mz0380_dev *dev)
 {
+	int alive;
+	int ret = 0;
+
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
 		pr_warn("%s: MST3367 bring-up skipped - firmware not ready\n",
 			dev->name);
 		return -ENODEV;
 	}
 
-	mz0380_mst3367_select_input(dev);
-	mz0380_mst3367_reset(dev);
+	mutex_lock(&mst3367_lock);
+	if (dev->mst3367_ready)
+		goto out;
+	dev->mst3367_ready = false;
+	/* A physical reset invalidates the cached mode and requires the latch pulse. */
+	dev->signal_locked = false;
+
+	ret = mz0380_mst3367_reset(dev);
+	if (ret)
+		goto failed;
 
 	/*
 	 * The reset above forces the driven pins to outputs, but the DIR data
@@ -593,42 +817,81 @@ int mz0380_mst3367_bringup(struct mz0380_dev *dev)
 	 * the state the M51 bit-bang probe left the card in. Detect that and
 	 * retry with the opposite sense, then remember which one worked.
 	 */
-	if (!mst_bus_alive(dev)) {
+	alive = mst_bus_alive(dev);
+	if (alive < 0) {
+		ret = alive;
+		goto failed;
+	}
+	if (!alive) {
 		pr_info("%s: MST3367 silent after reset (dir_invert=%u) - retrying with the opposite GPIO_DIR sense\n",
 			dev->name, mz0380_gpio_dir_invert);
 		mz0380_gpio_dir_invert = !mz0380_gpio_dir_invert;
-		mz0380_mst3367_reset(dev);
+		ret = mz0380_mst3367_reset(dev);
+		if (ret)
+			goto failed;
 
-		if (mst_bus_alive(dev)) {
+		alive = mst_bus_alive(dev);
+		if (alive < 0) {
+			ret = alive;
+			goto failed;
+		}
+		if (alive) {
 			pr_info("%s: MST3367 answering with dir_invert=%u - GPIO direction polarity now known\n",
 				dev->name, mz0380_gpio_dir_invert);
 		} else {
 			mz0380_gpio_dir_invert = !mz0380_gpio_dir_invert;
 			pr_warn("%s: MST3367 still silent under both GPIO_DIR senses - receiver held in reset or unpowered; a mains-off cold boot restores the card's own pin config\n",
 				dev->name);
+			ret = -ENODEV;
+			goto failed;
 		}
 	}
 
-	mz0380_mst3367_init_regs(dev);
+	ret = mz0380_mst3367_init_regs(dev);
+	if (ret)
+		goto failed;
 
 	/*
 	 * Present the card as a sink: EDID first, then HPD. Toggle HPD low
 	 * across the load so a source that was already attached re-reads the
 	 * EDID instead of keeping whatever it saw before.
 	 */
-	mz0380_mst3367_hpd(dev, false);
-	if (mz0380_mst3367_load_edid(dev) == 0) {
-		msleep(100);            /* let the source settle before the edge */
-		mz0380_mst3367_hpd(dev, true);
-	} else {
-		pr_warn("%s: continuing without EDID - the source will stay dark\n",
-			dev->name);
-	}
+	ret = mz0380_mst3367_hpd(dev, false);
+	if (ret)
+		goto failed;
+	/*
+	 * M61: an EDID failure must NOT abort the bring-up. Nothing on this
+	 * board has ever ACKed an EDID write - there is no EEPROM on the
+	 * receiver's bus (M43/M51) - so with a synchronous edid_timeout_ms
+	 * this returns -110 every single time. Gating on it left the receiver
+	 * un-reset, un-initialised and HPD-less, which is why a run could
+	 * produce no detect samples at all rather than merely no lock.
+	 *
+	 * The receiver locks perfectly well without an EDID: every lock this
+	 * project has ever recorded happened with the EDID push failing. EDID
+	 * only decides whether the SOURCE keeps transmitting.
+	 */
+	ret = mz0380_mst3367_load_edid(dev);
+	if (ret)
+		pr_warn("%s: EDID push failed (%d) - continuing; the receiver still detects, but the source will not hold its output\n",
+			dev->name, ret);
+	msleep(100);            /* let the source settle before the edge */
+	ret = mz0380_mst3367_hpd(dev, true);
+	if (ret)
+		goto failed;
 
 	dev->mst3367_ready = true;
 	pr_info("%s: MST3367 receiver brought up (reset released, init applied)\n",
 		dev->name);
-	return 0;
+	goto out;
+
+failed:
+	dev->mst3367_ready = false;
+	pr_warn("%s: MST3367 bring-up failed (%d); receiver remains not ready\n",
+		dev->name, ret);
+out:
+	mutex_unlock(&mst3367_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_bringup);
 
@@ -638,11 +901,18 @@ struct mst3367_measured {
 	u16 hperiod, vperiod;       /* scaled, comparable to the table */
 	u16 hperiod_raw, vperiod_raw;
 	u16 lines;                  /* hfreq/vfreq: lines per vertical period */
+	u8 detect;                   /* coherent post-snapshot R55 */
+	const char *reject;          /* M62: which gate rejected this pass */
+	bool interlace_from_geometry;/* M64: interlace decided by lines vs vtotal */
+	bool lock_ended_during_pass; /* M64: source stopped under the last reads */
 	u8 r5f;                     /* hdcapm's interlace register, logged raw */
 	bool interlaced;
 };
 
 static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out);
+static bool mst3367_measurements_agree(const struct mst3367_measured *a,
+				       const struct mst3367_measured *b);
+static int mst3367_set_auto_position(struct mz0380_dev *dev, bool enable);
 static const struct v4l2_dv_timings *
 mst3367_match_mode(const struct mst3367_measured *m, bool *scaled);
 
@@ -662,13 +932,15 @@ mst3367_match_mode(const struct mst3367_measured *m, bool *scaled);
 static int mz0380_gpio_get(struct mz0380_dev *dev, unsigned int pin, u32 *out)
 {
 	u32 params[1] = { 1u << pin };
-	int ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, params, 1,
-				      NULL, 500);
+	u32 reply[3] = { 0 };
+	int ret = mz0380_send_command_reply(dev, MZ0380_CMD_GPIO_READ,
+					     params, 1, NULL, 500,
+					     reply, ARRAY_SIZE(reply));
 
 	if (ret)
 		return ret;
 	/* op 0x14 returns the sampled bitmap in PARAM2 (BAR0+0x0c) */
-	*out = !!(mz_mmio_read(dev, MZ0380_MB_PARAM(2)) & (1u << pin));
+	*out = !!(reply[2] & (1u << pin));
 	return 0;
 }
 
@@ -694,9 +966,10 @@ int mz0380_mst3367_ramtest(struct mz0380_dev *dev)
 	if (dev->fw_state != MZ0380_FW_STATE_READY)
 		return -ENODEV;
 
+	mutex_lock(&mst3367_lock);
 	ret = mst_bank(dev, MST3367_BANK3);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
 	for (i = 0; i < ARRAY_SIZE(pattern); i++)
 		mst_wr(dev, 0x10 + i, pattern[i]);
@@ -727,7 +1000,10 @@ int mz0380_mst3367_ramtest(struct mz0380_dev *dev)
 		dev->name, hits, (unsigned int)ARRAY_SIZE(pattern) - 1,
 		hits ? "writable, this is a RAM window (EDID candidate)"
 		     : "not writable, bank3 is not the EDID store");
-	return hits ? 0 : -ENODEV;
+	ret = hits ? 0 : -ENODEV;
+out_unlock:
+	mutex_unlock(&mst3367_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_ramtest);
 
@@ -749,90 +1025,152 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_ramtest);
 int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 {
 	unsigned long end;
-	u8 last[8];
+	struct mst3367_measured last_m = { 0 };
+	u8 last_detect = 0;
+	int last_result = 0;
+	bool last_matched = false;
+	bool have_last_m = false;
+	bool have_last_result = false;
+	bool auto_position = false;
+	bool have_auto_position = false;
 	bool first = true;
+	int ret = 0;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY)
 		return -ENODEV;
-	if (!dev->mst3367_ready)
-		mz0380_mst3367_bringup(dev);
+	if (!dev->mst3367_ready) {
+		ret = mz0380_mst3367_bringup(dev);
+		if (ret)
+			return ret;
+	}
 
 	pr_info("%s: watching MST3367 detect for %us - plug/unplug or power-cycle the source now\n",
 		dev->name, secs);
+	have_auto_position = false;
 	end = jiffies + secs * HZ;
 
 	while (time_before(jiffies, end)) {
-		static const u8 regs[] = { 0x55, 0x5f, 0x57, 0x58, 0x59,
-					   0x5a, 0x6a, 0x6b };
-		u8 now[ARRAY_SIZE(regs)];
-		unsigned int i;
-		bool changed = false;
+		const struct v4l2_dv_timings *t = NULL;
+		struct mst3367_measured m = { 0 };
+		bool scaled = false;
+		bool locked;
+		bool changed;
+		u8 detect;
+		int sample_ret = 0;
 
-		if (mst_bank(dev, MST3367_BANK0))
+		mutex_lock(&mst3367_lock);
+		ret = mst_bank(dev, MST3367_BANK0);
+		if (!ret)
+			ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
+		if (ret) {
+			mutex_unlock(&mst3367_lock);
 			break;
-		for (i = 0; i < ARRAY_SIZE(regs); i++) {
-			now[i] = 0;
-			mst_rd(dev, regs[i], &now[i]);
-			if (first || now[i] != last[i])
-				changed = true;
 		}
 
-		if (changed) {
-			u8 lock = now[0] & MST3367_B0_DETECT_LOCK_MASK;
-			bool locked = lock == MST3367_B0_DETECT_LOCK_MASK;
+		locked = mst3367_status_locked(detect);
+		if (locked) {
+			sample_ret = mst3367_measure(dev, &m);
+			if (!sample_ret)
+				t = mst3367_match_mode(&m, &scaled);
+			else if (sample_ret != -ENOLCK && sample_ret != -EAGAIN) {
+				ret = sample_ret;
+				mutex_unlock(&mst3367_lock);
+				break;
+			}
+		}
 
-			/*
-			 * M57: only a FULL 0x3c is a usable lock. Partial
-			 * locks (0x20 alone) are the settling state, and the
-			 * timing block read during one is torn - that is where
-			 * vtot=5 and htot=656 came from.
-			 */
-			pr_info("%s: detect 55=%02x %s | 5f=%02x hper=%02x%02x vper=%02x%02x htot=%02x%02x\n",
-				dev->name, now[0],
-				locked ? "LOCKED" :
-					 lock ? "settling" : "no-lock",
-				now[1], now[2], now[3], now[4], now[5],
-				now[6], now[7]);
+		/*
+		 * Any non-mode state goes back to acquisition - but only on a
+		 * CHANGE. M63: this used to write AUTO_POSITION unconditionally
+		 * every 250 ms, and that register restarts position/phase
+		 * acquisition, so the watch was re-perturbing the very counters
+		 * it then read. A measurement that "moved mid-pass" can be the
+		 * driver's own doing.
+		 */
+		{
+			bool want_acq = !locked || sample_ret || !t;
 
-			/*
-			 * M56: on a locked sample also print the fields the
-			 * mode table is matched on, already scaled. A locked
-			 * source that matches nothing is then one grep away
-			 * from telling us which range is off, instead of
-			 * needing another run to find out.
-			 */
-			/*
-			 * M59: measure on ANY lock bit. The only usable sample
-			 * of that run sat at R55=0x5f, which is not a full
-			 * 0x3c, so gating the measurement on "LOCKED" hid the
-			 * very reading the table now matches.
-			 */
-			if (lock) {
-				struct mst3367_measured m;
-				bool scaled = false;
+			if (!have_auto_position || auto_position != want_acq) {
+				ret = mst3367_set_auto_position(dev, want_acq);
+				if (!ret) {
+					auto_position = want_acq;
+					have_auto_position = true;
+				}
+			} else {
+				ret = 0;
+			}
+		}
+		mutex_unlock(&mst3367_lock);
+		if (ret)
+			break;
 
-				if (!mst3367_measure(dev, &m)) {
-					const struct v4l2_dv_timings *t =
-						mst3367_match_mode(&m, &scaled);
-
-					pr_info("%s: detect   -> htot=%u vtot=%u hact=%u hper=%u vper=%u lines=%u 5f=%02x %s => %s%s\n",
-						dev->name, m.htotal, m.vtotal,
+		if (!locked) {
+			changed = first || !have_last_result || detect != last_detect ||
+				  last_result != -ENOLCK;
+			if (changed)
+				pr_info("%s: detect 55=%02x %s (auto-position on; timing not sampled)\n",
+					dev->name, detect,
+					(detect & MST3367_B0_DETECT_LOCK_MASK) ?
+					"settling" : "no-lock");
+			last_result = -ENOLCK;
+			last_detect = detect;
+			last_matched = false;
+			have_last_result = true;
+			have_last_m = false;
+		} else if (!t) {
+			if (!sample_ret) {
+				changed = first || !have_last_m || last_matched ||
+					  !mst3367_measurements_agree(&last_m, &m);
+				if (changed)
+					pr_info("%s: detect 55=%02x LOCKED coherent htot=%u vtot=%u hact=%u hper=%u vper=%u lines=%u 5f=%02x %s => UNSUPPORTED (auto-position on)\n",
+						dev->name, m.detect, m.htotal, m.vtotal,
 						m.hactive, m.hperiod, m.vperiod,
 						m.lines, m.r5f,
-						m.interlaced ? "i" : "p",
-						t ? "MATCHED" : "no table entry",
-						t && scaled ? " (host units)" : "");
-					mst_bank(dev, MST3367_BANK0);
-				}
+						m.interlaced ? "i" : "p");
+				last_m = m;
+				last_detect = m.detect;
+				last_result = -ERANGE;
+				last_matched = false;
+				have_last_m = true;
+				have_last_result = true;
+			} else {
+				changed = first || !have_last_result ||
+					  last_result != -EAGAIN ||
+					  detect != last_detect;
+				if (changed)
+					pr_info("%s: detect 55=%02x full lock but no coherent timing yet: %s (htot=%u vtot=%u hact=%u hper=%u vper=%u 5f=%02x) (auto-position on)\n",
+						dev->name, detect,
+						m.reject ? m.reject : "no reason recorded",
+						m.htotal, m.vtotal, m.hactive,
+						m.hperiod, m.vperiod, m.r5f);
+				last_result = -EAGAIN;
+				last_detect = detect;
+				last_matched = false;
+				have_last_result = true;
+				have_last_m = false;
 			}
-			memcpy(last, now, sizeof(last));
-			first = false;
+		} else {
+			changed = first || !have_last_m || !last_matched ||
+				  !mst3367_measurements_agree(&last_m, &m);
+			if (changed)
+				pr_info("%s: detect 55=%02x LOCKED coherent htot=%u vtot=%u hact=%u hper=%u vper=%u lines=%u 5f=%02x %s => MATCHED%s (auto-position off)\n",
+					dev->name, m.detect, m.htotal, m.vtotal,
+					m.hactive, m.hperiod, m.vperiod, m.lines,
+					m.r5f, m.interlaced ? "i" : "p",
+					scaled ? " (host units)" : "");
+			last_m = m;
+			last_detect = m.detect;
+			last_result = 0;
+			last_matched = true;
+			have_last_m = true;
+			have_last_result = true;
 		}
+		first = false;
 		msleep(250);
 	}
 
-	pr_info("%s: watch done\n", dev->name);
-	return 0;
+	pr_info("%s: watch done%s\n", dev->name, ret ? " (I/O error)" : "");
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_watch);
 
@@ -856,6 +1194,7 @@ void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m)
 		return;
 	}
 
+	mutex_lock(&mst3367_lock);
 	seq_puts(m, "  GPIO read-back (op 0x14):\n");
 	for (i = 0; i < ARRAY_SIZE(pins); i++) {
 		u32 level = 0;
@@ -993,7 +1332,7 @@ void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m)
 	seq_puts(m, "  MST3367 BANK0 regs (all-zero column = bus NAK, not real values):\n");
 	if (mst_bank(dev, MST3367_BANK0)) {
 		seq_puts(m, "    bank select failed - receiver I2C is dead\n");
-		return;
+		goto out_unlock;
 	}
 	{
 		static const u8 regs[] = { 0x55, 0x5f, 0x6a, 0x6b, 0x59, 0x5a,
@@ -1010,6 +1349,8 @@ void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m)
 	}
 	seq_puts(m, "  reg 0x55 & 0x3c == 0x3c means locked; 0x00 across the row means\n"
 		    "  the receiver is not answering at all (check reset/power, not EDID).\n");
+out_unlock:
+	mutex_unlock(&mst3367_lock);
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_diag);
 
@@ -1021,9 +1362,9 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_diag);
  * for the modes this HDMI capture card supports. The preset carries the exact
  * blanking/pixelclock the raw detect registers do not give us directly.
  *
- * fps100 (hundredths of frames/s) is derived from the vperiod counter, which
- * the hdcapm table shows is ~= frame_rate * 10 (e.g. ~600 => 60.00p, ~300 =>
- * 30.00 frames, i.e. 1080i60). Matching uses a +/-150 window on fps100.
+ * vperiod is vertical-update rate times ten: about 600 for either 60p frames
+ * or 60i fields. Interlace therefore comes from R5F bit3, not from halving
+ * vperiod, and every counter is matched against an explicit tolerance range.
  */
 struct mst3367_mode {
 	struct v4l2_dv_timings timings;
@@ -1036,12 +1377,12 @@ struct mst3367_mode {
 
 
 /*
- * M56: the hdcapm table, verbatim (GPL, same MST3367). Matching is on four
- * measured ranges plus interlace - NOT on hactive, which our own table used
- * and which is why a locked source came back "unmatched". Note htotal here
- * is the receiver's own counter, not the video horizontal total: the same
- * 720p60 source appears at ~2475 or ~1650 depending on the TMDS clock
- * domain, so both are listed.
+ * M56: the progressive rows below are hdcapm's table verbatim (GPL, same
+ * MST3367); the 1080i rows extend it from the corresponding CEA line/field
+ * rates. Matching is on four measured ranges plus interlace - NOT hactive.
+ * Note htotal here is the receiver's own counter, not always the video
+ * horizontal total: 720p60 appears at ~2475 or ~1650 depending on the TMDS
+ * clock domain, so both are listed.
  */
 static const struct mst3367_mode mst3367_modes[] = {
 	/*                          htot_min htot_max vtot_min vtot_max
@@ -1063,6 +1404,11 @@ static const struct mst3367_mode mst3367_modes[] = {
 					 270,  290,  240,  254, false },
 	{ V4L2_DV_BT_CEA_1920X1080P30,  2295, 3305, 1120, 1130,
 					 330,  345,  290,  310, false },
+	/* Interlaced totals count fields; I60 also represents 59.94 Hz. */
+	{ V4L2_DV_BT_CEA_1920X1080I50,  3950, 3970,  555,  570,
+					 270,  290,  490,  510, true  },
+	{ V4L2_DV_BT_CEA_1920X1080I60,  3290, 3310,  555,  570,
+					 330,  345,  590,  610, true  },
 	{ V4L2_DV_BT_CEA_1920X1080P50,  3950, 3970, 1120, 1130,
 					 550,  570,  480,  520, false },
 	{ V4L2_DV_BT_CEA_1920X1080P60,  3290, 3310, 1120, 1130,
@@ -1125,86 +1471,374 @@ mst3367_match_mode(const struct mst3367_measured *m, bool *scaled)
 	return NULL;
 }
 
-/*
- * Read every field hdcapm matches on, with its masks and scalings. The two
- * period registers are rate counters: the driver converts them to hdcapm's
- * units (1600000/raw and 1250000/raw) because the table is expressed there.
- */
-static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out)
+static int mst3367_set_auto_position(struct mz0380_dev *dev, bool enable)
 {
-	u8 hi, lo, r57, r58, r59, r5a, r5f;
+	int ret;
+
+	lockdep_assert_held(&mst3367_lock);
+	ret = mst_bank(dev, MST3367_BANK0);
+	if (ret)
+		return ret;
+	return mst_wr(dev, MST3367_B0_AUTO_POSITION,
+		      enable ? MST3367_B0_AUTO_POSITION_ON :
+			       MST3367_B0_AUTO_POSITION_OFF);
+}
+
+/*
+ * Commit the receiver's digital output after a mode has stabilized.  On the
+ * first accepted mode after init or lock loss, the HD60 Pro driver pulses
+ * BANK2:07 bit4 to latch the new timing.  It then gates output with AB[7],
+ * preserves B0's clock/polarity bits and selects 0x21 for ordinary modes.
+ * The one special timing in our advertised table is 1280x720p30: it writes
+ * BANK0:B2=3 and selects 0x20.  Treating every non-1080 mode as special was a
+ * sibling-board shortcut and misclocked 720p50/60 and SD input.
+ */
+static int
+mst3367_commit_digital_output(struct mz0380_dev *dev,
+			      const struct v4l2_dv_timings *timings)
+{
+	const struct v4l2_bt_timings *bt = &timings->bt;
+	u64 total = (u64)V4L2_DV_BT_FRAME_WIDTH(bt) *
+		    V4L2_DV_BT_FRAME_HEIGHT(bt);
+	u32 fps = total && bt->pixelclock ?
+		  div_u64(bt->pixelclock + total / 2, total) : 0;
+	bool special_720p30 = bt->width == 1280 && bt->height == 720 &&
+			      !bt->interlaced && fps == 30;
+	bool initial_acquisition = !dev->signal_locked;
+	u8 reg07;
+	u8 b0;
+	int clear_ret;
+	int ret;
+
+	lockdep_assert_held(&mst3367_lock);
+	if (initial_acquisition) {
+		ret = mst_bank(dev, MST3367_BANK2);
+		if (ret)
+			return ret;
+		ret = mst_rd(dev, 0x07, &reg07);
+		if (ret)
+			return ret;
+		ret = mst_wr(dev, 0x07, reg07 | 0x10);
+		if (ret)
+			return ret;
+		ret = mst_wr(dev, 0x07, reg07 & ~0x10);
+		if (ret)
+			return ret;
+	}
+
+	ret = mst_bank(dev, MST3367_BANK0);
+	if (ret)
+		return ret;
+	ret = mst_wr(dev, 0xb2, special_720p30 ? 0x03 : 0x00);
+	if (ret)
+		return ret;
+	ret = mst_set(dev, 0xab, 0x80);
+	if (ret)
+		return ret;
+	ret = mst_rd(dev, 0xb0, &b0);
+	if (!ret)
+		ret = mst_wr(dev, 0xb0, (b0 & 0xc2) |
+			     (special_720p30 ? 0x20 : 0x21));
+	clear_ret = mst_clr(dev, 0xab, 0x80);
+
+	return ret ? ret : clear_ret;
+}
+
+/*
+ * Read one complete timing snapshot.  The HD60 Pro Windows driver accepts a
+ * sample only with all four R55 lock bits, re-reads R5C, and verifies that the
+ * measured vertical rate agrees with hfreq / vtotal.  Those checks reject the
+ * partial-lock rows whose counters changed while mailbox reads were in flight.
+ * mst3367_lock must cover the whole banked transaction.
+ */
+static int mst3367_measure_once(struct mz0380_dev *dev,
+				struct mst3367_measured *out)
+{
+	u8 detect, detect_after, hi, lo, vtotal_hi_after, vtotal_lo_after;
+	u16 vtotal_after;
+	u8 r57, r58, r59, r5a, r5f;
 	u16 raw;
+	u32 converted, calculated_vperiod;
+	int ret;
 
 	memset(out, 0, sizeof(*out));
+	lockdep_assert_held(&mst3367_lock);
 
-	if (mst_bank(dev, MST3367_BANK0))
-		return -EIO;
-	if (mst_rd(dev, MST3367_B0_HTOTAL_HI, &hi) ||
-	    mst_rd(dev, MST3367_B0_HTOTAL_LO, &lo))
-		return -EIO;
+	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_DETECT, &detect));
+	out->detect = detect;   /* M63: so a REJECTED sample still reports R55 */
+	if (!mst3367_status_locked(detect)) {
+		out->reject = "no full lock at start of pass";
+		return -ENOLCK;
+	}
+
+	MST3367_TRY(mst_rd(dev, MST3367_B0_HTOTAL_HI, &hi));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_HTOTAL_LO, &lo));
 	out->htotal = (((u16)hi << 8) | lo) & 0xfff;
 
-	if (mst_rd(dev, MST3367_B0_VTOTAL_HI, &hi) ||
-	    mst_rd(dev, MST3367_B0_VTOTAL_LO, &lo))
-		return -EIO;
+	MST3367_TRY(mst_rd(dev, MST3367_B0_VTOTAL_HI, &hi));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_VTOTAL_LO, &lo));
 	out->vtotal = (((u16)hi << 8) | lo) & 0x7ff;
 
-	if (mst_rd(dev, MST3367_B0_HPERIOD_HI, &r57) ||
-	    mst_rd(dev, MST3367_B0_HPERIOD_LO, &r58) ||
-	    mst_rd(dev, MST3367_B0_VPERIOD_HI, &r59) ||
-	    mst_rd(dev, MST3367_B0_VPERIOD_LO, &r5a) ||
-	    mst_rd(dev, MST3367_B0_INTERLACE, &r5f))
-		return -EIO;
+	MST3367_TRY(mst_rd(dev, MST3367_B0_HPERIOD_HI, &r57));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_HPERIOD_LO, &r58));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_VPERIOD_HI, &r59));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_VPERIOD_LO, &r5a));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_INTERLACE, &r5f));
 
 	raw = ((u16)(r57 & 0x3f) << 8) | r58;
 	out->hperiod_raw = raw;
-	out->hperiod = raw ? 1600000u / raw : 0;
+	converted = raw ? 1600000u / raw : 0;
+	if (converted > U16_MAX) {
+		out->reject = "hperiod counter too small (rate overflowed u16)";
+		return -EAGAIN;
+	}
+	out->hperiod = converted;
 
 	raw = ((u16)(r59 & 0x3f) << 8) | r5a;
 	out->vperiod_raw = raw;
-	out->vperiod = raw ? 1250000u / raw : 0;
+	converted = raw ? 1250000u / raw : 0;
+	if (converted > U16_MAX) {
+		out->reject = "vperiod counter too small (rate overflowed u16)";
+		return -EAGAIN;
+	}
+	out->vperiod = converted;
 
 	/*
-	 * M58 (hardware): do NOT trust hdcapm's reg 0x5f bit1 here. A sample
-	 * that is unambiguously 1080p60 - hper=674 (67.4kHz), vtot=1125,
-	 * vper=599 (60.0Hz) - came back with 0x5f=0x17, bit1 set. 1080i60
-	 * would have to read hper=337, so the bit means something else on
-	 * this part; it is kept only for logging until a real interlaced
-	 * source pins it down.
+	 * The actual HD60 Pro binary uses R5F bit3.  This also explains the
+	 * known progressive R5F=0x17 sample: old hdcapm bit1 is set, bit3 is not.
 	 *
-	 * Derive interlace from the geometry instead. lines = hfreq/vfreq,
-	 * with hperiod in 100Hz units and vperiod in 0.1Hz units. That equals
-	 * vtotal for a progressive source and vtotal/2 for an interlaced one,
-	 * where the vertical counter measures fields, not frames.
+	 * M64 (hardware): but bit3 alone is not trustworthy either. A sample
+	 * measuring htot=2200 vtot=1120 hper=674 vper=602 - a textbook 1080p60,
+	 * and progressive beyond doubt - carried R5F=0x48, bit3 set. Note 0x40
+	 * is set in every torn sample we have ever logged, so R5F most likely
+	 * carries a validity flag and its other bits mean nothing while it is
+	 * raised.
+	 *
+	 * The geometry does not lie: lines = hfreq/vfreq is the number of lines
+	 * per VERTICAL period, which equals vtotal for a progressive source and
+	 * half of it when the vertical counter is timing fields. Decide on that
+	 * and keep the register bit only for the case where the geometry is too
+	 * degenerate to call.
 	 */
 	out->r5f = r5f;
 	out->lines = out->vperiod ?
 		(u16)((u32)out->hperiod * 1000u / out->vperiod) : 0;
-	out->interlaced = out->lines && out->vtotal &&
-		abs((int)out->lines - (int)out->vtotal) >
-		abs((int)out->lines - (int)out->vtotal / 2);
 
-	if (mst_bank(dev, MST3367_BANK2) ||
-	    mst_rd(dev, MST3367_B2_HACTIVE_HI, &hi) ||
-	    mst_rd(dev, MST3367_B2_HACTIVE_LO, &lo))
-		return -EIO;
-	out->hactive = (((u16)hi << 8) | lo) & 0x1fff;
+	if (out->lines && out->vtotal) {
+		int d_prog = abs((int)out->lines - (int)out->vtotal);
+		int d_int  = abs((int)out->lines - (int)out->vtotal / 2);
+
+		out->interlaced = d_int < d_prog;
+		out->interlace_from_geometry = true;
+	} else {
+		out->interlaced = !!(r5f & MST3367_B0_INTERLACE_BIT);
+		out->interlace_from_geometry = false;
+	}
+
+	/*
+	 * M64: prove the snapshot before spending anything else. hactive used
+	 * to be fetched here, costing a BANK2 switch, two reads and a switch
+	 * back - four mailbox round-trips, ~25ms of a ~300ms burst - ahead of
+	 * the checks that decide whether the sample is usable at all. Nothing
+	 * in mst3367_match_mode() reads hactive, so it is now collected after
+	 * the verdict, best-effort.
+	 */
+	MST3367_TRY(mst_rd(dev, MST3367_B0_VTOTAL_HI, &vtotal_hi_after));
+	MST3367_TRY(mst_rd(dev, MST3367_B0_VTOTAL_LO, &vtotal_lo_after));
+	vtotal_after = (((u16)vtotal_hi_after << 8) | vtotal_lo_after) & 0x7ff;
+	MST3367_TRY(mst_rd(dev, MST3367_B0_DETECT, &detect_after));
+	/*
+	 * M64: losing lock on this LAST read is not by itself a reason to throw
+	 * the sample away, so the verdict is deferred until the sample has been
+	 * checked on its own merits below. A bursty source (the microscope
+	 * transmits for ~300ms after a power-cycle) routinely stops during the
+	 * trailing round-trips, after the whole timing block has already been
+	 * read - and a block that re-reads identical and passes its internal
+	 * cross-check is good data no matter what the source did afterwards.
+	 */
+	/*
+	 * M63: compare the WHOLE vtotal as a number, with a tolerance.
+	 *
+	 * The previous gate was (vtotal_lo ^ vtotal_lo_after) & 0xfe on the low
+	 * byte alone, which is not a tolerance at all - it is a bit pattern:
+	 *
+	 *   1125 -> 1126 : 0x65 ^ 0x66 = 0x03, & 0xfe = 0x02 -> REJECTED
+	 *   1124 -> 1125 : 0x64 ^ 0x65 = 0x01, & 0xfe = 0x00 -> accepted
+	 *   1125 -> 1381 : low bytes identical                -> accepted (!)
+	 *
+	 * So a one-line wobble was rejected or accepted purely on the parity of
+	 * the low byte, while a 256-line jump - the exact corruption an
+	 * unlatched HI/LO pair produces - sailed through. Our own 1080p60
+	 * sample sits at vtotal=1125, low byte 0x65, on the rejecting side of
+	 * that coin: a settling source that moves one line is thrown away.
+	 */
+	if (abs((int)vtotal_after - (int)out->vtotal) > 2) {
+		out->reject = "vtotal moved during the pass";
+		return -EAGAIN;
+	}
+
+	/* Windows accepts 20.0--150.0 Hz and at most 0.5 Hz disagreement. */
+	if (!out->htotal || !out->hperiod ||
+	    out->vtotal < 150 || out->vperiod < 200 || out->vperiod > 1500) {
+		out->reject =
+			!out->htotal   ? "htotal is zero" :
+			!out->hperiod  ? "hperiod is zero" :
+			out->vtotal < 150 ? "vtotal below 150 lines" :
+			out->vperiod < 200 ? "vperiod below 20.0 Hz" :
+					 "vperiod above 150.0 Hz";
+		return -EAGAIN;
+	}
+	/*
+	 * M64: check the geometry, which covers both field orders.
+	 *
+	 * The old form was calculated_vperiod = hperiod*1000/(vtotal+1) against
+	 * vperiod within 5 (0.5Hz). That silently assumed progressive: for
+	 * 1080i60 the receiver reports vtotal as FRAME lines (1125) while
+	 * vperiod times fields (600), so it computed 299 against 600 and threw
+	 * every interlaced source away.
+	 *
+	 * lines (= hfreq/vfreq) is already the lines per vertical period, so
+	 * the honest test is that it lands near vtotal (progressive) or near
+	 * vtotal/2 (interlaced) - the same comparison that picked the field
+	 * order above. Tolerance is in lines: both inputs are truncated
+	 * integer divisions, so a couple of lines of slop is arithmetic, not
+	 * signal instability.
+	 */
+	calculated_vperiod = out->interlaced ? out->vtotal / 2u : out->vtotal;
+	if (abs((int)out->lines - (int)calculated_vperiod) > 8) {
+		out->reject = "line count disagrees with vtotal";
+		return -EAGAIN;
+	}
+
+	/*
+	 * M64: everything above passed - the block re-read identical and the
+	 * rate counters agree with the line total. Now, and only now, does the
+	 * trailing lock state matter, and it is worth no more than a note.
+	 */
+	if (!mst3367_status_locked(detect_after)) {
+		out->lock_ended_during_pass = true;
+		pr_info("%s: MST3367 source stopped during the trailing reads (R55 %02x -> %02x) but the sample is self-consistent - keeping it\n",
+			dev->name, detect, detect_after);
+	} else {
+		out->detect = detect_after;
+	}
+
+	/*
+	 * Diagnostic only, and deliberately last: a failure here does not
+	 * invalidate a sample that has already proved itself, and by now the
+	 * source may legitimately have stopped.
+	 */
+	if (!mst_bank(dev, MST3367_BANK2) &&
+	    !mst_rd(dev, MST3367_B2_HACTIVE_HI, &hi) &&
+	    !mst_rd(dev, MST3367_B2_HACTIVE_LO, &lo)) {
+		out->hactive = (((u16)hi << 8) | lo) & 0x1fff;
+		if (out->hactive & 1)
+			out->hactive++;
+	}
+	mst_bank(dev, MST3367_BANK0);
 
 	return 0;
 }
 
+static bool mst3367_measurements_agree(const struct mst3367_measured *a,
+				       const struct mst3367_measured *b)
+{
+	return abs((int)a->htotal - (int)b->htotal) <= 2 &&
+	       abs((int)a->vtotal - (int)b->vtotal) <= 2 &&
+	       abs((int)a->hactive - (int)b->hactive) <= 2 &&
+	       abs((int)a->hperiod - (int)b->hperiod) <= 2 &&
+	       abs((int)a->vperiod - (int)b->vperiod) <= 2 &&
+	       a->interlaced == b->interlaced;
+}
+
+static int mst3367_measure(struct mz0380_dev *dev, struct mst3367_measured *out)
+{
+	struct mst3367_measured first, second;
+	int ret;
+
+	lockdep_assert_held(&mst3367_lock);
+	ret = mst3367_measure_once(dev, &first);
+	if (ret) {
+		/*
+		 * M62: hand the rejected sample back too. Its numbers plus
+		 * ->reject are the only evidence of WHY a lock that really
+		 * happened produced no timing, and without them a failed run
+		 * says nothing more than "-EAGAIN".
+		 */
+		*out = first;
+		return ret;
+	}
+
+	/*
+	 * M62: the confirming pass is opt-in. See signal_confirm in core.c -
+	 * two agreeing passes need ~170ms of unbroken lock, which the only
+	 * source we have does not hold. measure_once already proves its own
+	 * snapshot did not move (detect + vtotal_lo re-read) and that the
+	 * fields are mutually consistent.
+	 */
+	if (!mz0380_signal_confirm) {
+		*out = first;
+		return 0;
+	}
+
+	usleep_range(10000, 12000);
+	ret = mst3367_measure_once(dev, &second);
+	if (ret) {
+		*out = second;
+		return ret;
+	}
+	if (!mst3367_measurements_agree(&first, &second)) {
+		second.reject = "the two confirming passes disagreed";
+		*out = second;
+		return -EAGAIN;
+	}
+
+	*out = second;
+	return 0;
+}
+
+static bool mst3367_force_is_safe_1080p60(const struct mst3367_measured *m)
+{
+	return !m->interlaced &&
+	       m->hactive >= 1918 && m->hactive <= 1924 &&
+	       m->vtotal >= 1120 && m->vtotal <= 1130 &&
+	       m->hperiod >= 665 && m->hperiod <= 685 &&
+	       m->vperiod >= 595 && m->vperiod <= 605 &&
+	       ((m->htotal >= 2190 && m->htotal <= 2210) ||
+		(m->htotal >= 3290 && m->htotal <= 3310));
+}
+
 /*
  * Read the MST3367 mode-detect block and fill *out. Returns 0 with a valid
- * timing when a signal is locked, -ENOLCK when no signal, or a negative errno
- * on an I2C failure. Runs the bring-up on first use if it hasn't happened yet.
+ * timing when a signal is locked, -ENOLCK when no coherent signal, -ERANGE
+ * for a coherent unsupported mode, or an I/O errno. Runs bring-up on first use.
  */
 int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			       struct v4l2_dv_timings *out)
 {
-	const struct v4l2_dv_timings *match;
-	struct mst3367_measured m;
+	static const struct v4l2_dv_timings forced_p60 =
+		V4L2_DV_BT_CEA_1920X1080P60;
+	const struct v4l2_dv_timings *match = NULL;
+	struct mst3367_measured m = { 0 };
+	/*
+	 * M63: m now also receives REJECTED samples (that is how the failure
+	 * path reports real numbers), so the last coherent-but-unsupported one
+	 * has to be kept separately or a later rejection overwrites it and the
+	 * -ERANGE report describes the wrong sample.
+	 */
+	struct mst3367_measured unsupported = { 0 };
 	bool scaled = false;
-	u8 detect;
+	bool acquisition_enabled = false;
+	bool forced = false;
+	bool have_sample = false;
+	bool saw_full_lock = false;
+	/* M62: m holds the last REJECTED sample too, so the failure path can
+	 * report the numbers that were actually read. */
+	unsigned int lock_samples = 0, sample_attempts = 0;
+	int last_sample_ret = 0;
+	unsigned long deadline;
+	u8 detect = 0;
 	int ret;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY)
@@ -1216,93 +1850,108 @@ int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 	}
 
 	/*
-	 * M54 (hardware): a real source does not hold lock steadily while it
-	 * is settling - the detect byte was seen walking 0x83 -> 0xa3 (locked)
-	 * -> 0x83 -> 0x03 within a second. A single read therefore reports
-	 * "no signal" for a source that is plainly transmitting, so sample
-	 * across a window rather than once.
-	 *
-	 * M59 (hardware): and do not try to rank sample quality by R55. The
-	 * one good sample of that run read R55=0x5f (only 0x1c of the 0x3c
-	 * lock bits), while the run before it produced a full 0x3c (0x7f)
-	 * carrying the bad 75Hz measurement. The bits that do correlate are
-	 * in reg 0x5f - every torn sample had 0x40 set and a vperiod counter
-	 * saturated (0x1fff) or near zero - but there is no need to guess at
-	 * a status bit when the mode table is itself the quality gate.
-	 *
-	 * So: measure on every sample that shows any lock, and return the
-	 * first one that MATCHES. Only if the window expires with no match do
-	 * we report what the last sample looked like.
+	 * The Windows driver gates timing reads on the complete R55 lock mask.
+	 * Partial masks are acquisition states, not lower-quality locks.  Keep
+	 * auto-position enabled while acquiring or after any unstable snapshot;
+	 * disable it only once two coherent samples identify a supported mode.
 	 */
-	{
-		unsigned long deadline = jiffies +
-			msecs_to_jiffies(mz0380_signal_poll_ms);
-		bool any_lock = false, have_sample = false;
+	mutex_lock(&mst3367_lock);
+	deadline = jiffies + msecs_to_jiffies(mz0380_signal_poll_ms);
+	for (;;) {
+		ret = mst_bank(dev, MST3367_BANK0);
+		if (ret)
+			goto out_unlock;
+		ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
+		if (ret)
+			goto out_unlock;
 
-		for (;;) {
-			ret = mst_bank(dev, MST3367_BANK0);
-			if (ret)
-				return ret;
-			ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
-			if (ret)
-				return ret;
-
-			if (detect & MST3367_B0_DETECT_LOCK_MASK) {
-				any_lock = true;
-				if (!mst3367_measure(dev, &m)) {
-					have_sample = true;
-					match = mst3367_match_mode(&m, &scaled);
-					if (match)
-						goto matched;
+		if (!mst3367_status_locked(detect)) {
+			if (!acquisition_enabled) {
+				ret = mst3367_set_auto_position(dev, true);
+				if (ret)
+					goto out_unlock;
+				acquisition_enabled = true;
+			}
+		} else {
+			saw_full_lock = true;
+			lock_samples++;
+			sample_attempts++;
+			ret = mst3367_measure(dev, &m);
+			last_sample_ret = ret;
+			if (!ret) {
+				have_sample = true;
+				unsupported = m;
+				match = mst3367_match_mode(&m, &scaled);
+				if (!match && mz0380_force_timings &&
+				    mst3367_force_is_safe_1080p60(&m)) {
+					match = &forced_p60;
+					forced = true;
+					scaled = false;
 				}
+				if (match)
+					goto matched;
+			} else if (ret != -ENOLCK && ret != -EAGAIN) {
+				goto out_unlock;
 			}
 
-			if (time_after_eq(jiffies, deadline))
-				break;
-			msleep(20);
+			/* Lost lock, incoherent, or coherent but unsupported. */
+			if (!acquisition_enabled) {
+				ret = mst3367_set_auto_position(dev, true);
+				if (ret)
+					goto out_unlock;
+				acquisition_enabled = true;
+			}
 		}
 
-		if (!any_lock)
-			return -ENOLCK;         /* receiver sees no signal */
-		if (!have_sample)
-			return -EIO;
-		match = NULL;
+		if (time_after_eq(jiffies, deadline))
+			break;
+		msleep(20);
 	}
 
-	if (!match) {
-		pr_info("%s: MST3367 locked but unmatched: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) lines=%u 5f=%02x %s [R55=0x%02x] - please report\n",
-			dev->name, m.htotal, m.vtotal, m.hactive,
-			m.hperiod, m.hperiod_raw, m.vperiod, m.vperiod_raw,
-			m.lines, m.r5f,
-			m.interlaced ? "i" : "p", detect);
-
-		/*
-		 * M54: rather than block the whole real-signal path on one
-		 * unmatched sample, let the caller opt into streaming a
-		 * plausible 1080p lock (2200 = the video horizontal total, or
-		 * the receiver counter's 1080p range) as 1080p60.
-		 */
-		if (mz0380_force_timings &&
-		    (m.htotal == 2200 || (m.htotal >= 3290 && m.htotal <= 3310))) {
-			static const struct v4l2_dv_timings p60 =
-				V4L2_DV_BT_CEA_1920X1080P60;
-
-			*out = p60;
-			pr_info("%s: force_timings: streaming as 1920x1080p60\n",
-				dev->name);
-			return 0;
-		}
-		return -ERANGE;
+	if (have_sample) {
+		pr_info("%s: MST3367 coherent but unsupported: htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) lines=%u 5f=%02x %s [R55=0x%02x] - please report\n",
+			dev->name, unsupported.htotal, unsupported.vtotal,
+			unsupported.hactive, unsupported.hperiod,
+			unsupported.hperiod_raw, unsupported.vperiod,
+			unsupported.vperiod_raw, unsupported.lines,
+			unsupported.r5f,
+			unsupported.interlaced ? "i" : "p", unsupported.detect);
+		ret = -ERANGE;
+	} else {
+		if (saw_full_lock)
+			pr_info("%s: MST3367 full lock appeared %u time(s), %u measurement attempt(s), none coherent (last %d: %s) - rejected sample was htot=%u vtot=%u hact=%u hper=%u(raw %u) vper=%u(raw %u) lines=%u 5f=%02x %s R55=%02x\n",
+				dev->name, lock_samples, sample_attempts,
+				last_sample_ret,
+				m.reject ? m.reject : "no reason recorded",
+				m.htotal, m.vtotal, m.hactive, m.hperiod,
+				m.hperiod_raw, m.vperiod, m.vperiod_raw,
+				m.lines, m.r5f, m.interlaced ? "i" : "p",
+				m.detect);
+		ret = -ENOLCK;
 	}
+	goto out_unlock;
 
 matched:
+	ret = mst3367_set_auto_position(dev, false);
+	if (ret)
+		goto out_unlock;
+	ret = mst3367_commit_digital_output(dev, match);
+	if (ret)
+		goto out_unlock;
 	*out = *match;
-	pr_info("%s: MST3367 signal: %ux%u%s%s (htot=%u vtot=%u hper=%u vper=%u hact=%u R55=0x%02x)\n",
+	pr_info("%s: MST3367 signal: %ux%u%s%s%s (htot=%u vtot=%u hper=%u vper=%u hact=%u R55=0x%02x)%s%s\n",
 		dev->name, out->bt.width, out->bt.height,
 		out->bt.interlaced ? "i" : "p",
-		scaled ? " [host units]" : "", m.htotal, m.vtotal,
-		m.hperiod, m.vperiod, m.hactive, detect);
-	return 0;
+		scaled ? " [host units]" : "",
+		forced ? " [strict forced fallback]" : "", m.htotal, m.vtotal,
+		m.hperiod, m.vperiod, m.hactive, m.detect,
+		m.interlace_from_geometry ? "" : " [interlace from R5F bit]",
+		m.lock_ended_during_pass ? " [source stopped mid-pass]" : "");
+	ret = 0;
+
+out_unlock:
+	mutex_unlock(&mst3367_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_read_signal);
 
@@ -1358,6 +2007,7 @@ static int mz0380_bb_dir(struct mz0380_dev *dev, u8 pin, bool output)
 int mz0380_gpio_dump(struct mz0380_dev *dev)
 {
 	u32 params[1] = { 0xffffffffu };
+	u32 reply[4] = { 0 };
 	u32 bitmap = 0;
 	unsigned int pin;
 	int ret;
@@ -1368,24 +2018,20 @@ int mz0380_gpio_dump(struct mz0380_dev *dev)
 		return -ENODEV;
 	}
 
-	ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, params, 1,
-				  NULL, 500);
+	ret = mz0380_send_command_reply(dev, MZ0380_CMD_GPIO_READ, params, 1,
+					 NULL, 500, reply, ARRAY_SIZE(reply));
 	pr_info("%s: gpiodump full-mask read ret=%d PARAM0=%08x PARAM1=%08x PARAM2=%08x PARAM3=%08x\n",
-		dev->name, ret,
-		mz_mmio_read(dev, MZ0380_MB_PARAM(0)),
-		mz_mmio_read(dev, MZ0380_MB_PARAM(1)),
-		mz_mmio_read(dev, MZ0380_MB_PARAM(2)),
-		mz_mmio_read(dev, MZ0380_MB_PARAM(3)));
+		dev->name, ret, reply[0], reply[1], reply[2], reply[3]);
 
 	for (pin = 0; pin < 32; pin++) {
 		u32 one[1] = { 1u << pin };
-		u32 v;
+		u32 one_reply[3] = { 0 };
 
-		if (mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, one, 1,
-					NULL, 500))
+		if (mz0380_send_command_reply(dev, MZ0380_CMD_GPIO_READ,
+					       one, 1, NULL, 500, one_reply,
+					       ARRAY_SIZE(one_reply)))
 			continue;
-		v = mz_mmio_read(dev, MZ0380_MB_PARAM(2));
-		if (v & (1u << pin))
+		if (one_reply[2] & (1u << pin))
 			bitmap |= 1u << pin;
 	}
 
@@ -1419,12 +2065,14 @@ static int mz0380_bb_drive_low(struct mz0380_dev *dev, u8 pin)
 static int mz0380_bb_read(struct mz0380_dev *dev, u8 pin, u8 *val)
 {
 	u32 params[1] = { 1u << pin };
-	int ret = mz0380_send_command(dev, MZ0380_CMD_GPIO_READ, params, 1,
-				      NULL, 500);
+	u32 reply[3] = { 0 };
+	int ret = mz0380_send_command_reply(dev, MZ0380_CMD_GPIO_READ,
+					     params, 1, NULL, 500,
+					     reply, ARRAY_SIZE(reply));
 
 	if (ret)
 		return ret;
-	*val = !!(mz_mmio_read(dev, MZ0380_MB_PARAM(2)) & (1u << pin));
+	*val = !!(reply[2] & (1u << pin));
 	return 0;
 }
 
@@ -1701,6 +2349,7 @@ int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 {
 	unsigned int bank, hits = 0, probe;
 	bool answered = false;
+	int ret;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
 		pr_info("%s: edidhunt: firmware not READY (state %s)\n",
@@ -1714,9 +2363,13 @@ int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 	 * 0x00 result byte, so an un-brought-up bus looks exactly like a chip
 	 * whose registers are all read-only. Bring it up first.
 	 */
-	if (!dev->mst3367_ready)
-		mz0380_mst3367_bringup(dev);
+	if (!dev->mst3367_ready) {
+		ret = mz0380_mst3367_bringup(dev);
+		if (ret)
+			return ret;
+	}
 
+	mutex_lock(&mst3367_lock);
 	/*
 	 * Then prove the bus is alive before believing any negative: read a
 	 * spread of bank0 registers and require at least one non-zero. All
@@ -1733,7 +2386,8 @@ int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 	if (!answered) {
 		pr_info("%s: edidhunt ABORTED: every register reads 0x00 - the receiver is not answering I2C (NAK), so this run would prove nothing. Check the bring-up (reset pin9) first\n",
 			dev->name);
-		return -ENXIO;
+		ret = -ENXIO;
+		goto out_unlock;
 	}
 
 	pr_info("%s: edidhunt: receiver answering; looking for an indirect address/data port (up to %u candidates per bank)\n",
@@ -1802,6 +2456,9 @@ int mz0380_mst3367_edidhunt(struct mz0380_dev *dev)
 	else
 		pr_info("%s: edidhunt done: NO indirect port found. The receiver holds no host-writable EDID storage, so the EDID must come from elsewhere on the DDC lines (card-side bus) - static RE is exhausted, a live Windows trace is the remaining route\n",
 			dev->name);
-	return 0;
+	ret = 0;
+out_unlock:
+	mutex_unlock(&mst3367_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_edidhunt);

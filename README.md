@@ -3,10 +3,11 @@
 PCIe capture card driver for the Elgato Game Capture **HD60 Pro** family
 (YUAN MZ0380 chipset, PCI `12ab:0380` / `12ab:0381`). The card has an
 onboard ARM SoC that runs its own embedded Linux and performs HDMI
-receive, signal detect (MST3367), and H.264 encoding (TP2834 +
-tinyvenc). The host driver uploads firmware, manages two DMA rings,
-and exposes the result as a V4L2 H.264 capture device plus an ALSA
-PCM audio device.
+receive, signal detect (MST3367), and H.264 encoding (tinyvenc). The host
+driver uploads firmware, configures the receiver and
+encoder, and exposes the encoded result as a V4L2 H.264 capture device.
+An ALSA scaffold exists, but PCM DMA is not implemented and must remain
+disabled for normal use.
 
 > Legacy note: this repo started as a reverse-engineering project for
 > the Elgato 4K60 Pro Mk.2 (`sc0710-*.c`). That code is preserved but
@@ -39,7 +40,7 @@ sudo cp /tmp/hd60pro_extract/MZ0381.HD.HEX /lib/firmware/mz0380/
 ```
 
 The blob is a gzipped tar with a full mini-Linux for the card; the
-host driver pushes it byte-for-byte through a BAR5 scratch window
+host driver pushes it byte-for-byte through the BAR0 firmware aperture
 and the onboard bootloader untars and boots.
 
 ## Build
@@ -63,9 +64,9 @@ sudo insmod ./mz0380.ko procfs_verbosity=2 enable_video=1
 # 2. firmware: upload the blob to the card, leave DMA off
 sudo insmod ./mz0380.ko procfs_verbosity=2 enable_video=1 firmware_upload=1
 
-# 3. full streaming: firmware + DMA rings + MSI + ALSA
+# 3. full video streaming: firmware + MSI + 4GiB-aligned IOVA buffers
 sudo insmod ./mz0380.ko procfs_verbosity=2 \
-    enable_video=1 firmware_upload=1 enable_dma=1 enable_audio=1
+    enable_video=1 firmware_upload=1 enable_dma=1 dma_iova_remap=1
 # or:
 make load-streaming
 ```
@@ -74,26 +75,28 @@ make load-streaming
 
 | param                      | default | meaning                                   |
 |---                         |---      |---                                        |
-| `enable_video`             | 0       | register `/dev/video0`                    |
+| `enable_video`             | 0       | register an `mz0380 H.264` `/dev/video*` node |
 | `firmware_upload`          | 0       | upload `MZ0380.HD.HEX` to the card        |
-| `enable_dma`               | 0       | alloc rings, request MSI, set bus master  |
-| `enable_audio`             | 0       | register an ALSA snd_card                 |
-| `video_ring_entries`       | 16      | video DMA ring slot count                 |
-| `video_ring_entry_size`    | 524288  | bytes per video ring slot                 |
-| `audio_ring_entries`       | 8       | audio DMA ring slot count                 |
-| `audio_ring_entry_size`    | 32768   | bytes per audio ring slot                 |
+| `enable_dma`               | 0       | allocate stream buffers, request MSI, set bus master |
+| `dma_iova_remap`           | 1       | map four stream buffers at required 4GiB IOVAs |
+| `stream_nosg`              | 0       | diagnostic card-generated NV12; not HDMI capture |
+| `enable_audio`             | 0       | experimental inert ALSA scaffold; leave disabled |
 | `procfs_verbosity`         | 1       | debug-richness of `/proc/mz0380-*`        |
 | `debug`                    | 0       | dprintk gate                              |
 
 ## Capture
 
-```bash
-# H.264 elementary stream
-ffmpeg -f v4l2 -pixel_format h264 -i /dev/video0 -t 10 -c copy out.h264
+Use the hardware-validation harness. It resolves the actual `/dev/video*`
+node, reloads the module, verifies a coherent HDMI timing, and captures an
+H.264 elementary stream:
 
-# PCM audio
-arecord -D hw:CARD=mz0380,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 out.wav
+```bash
+sudo ./mz0380-m55-real-capture.sh 6 45
 ```
+
+Power-cycle or reconnect the source when prompted. The machine needs a
+translating IOMMU domain; the card cannot address ordinary, unaligned DMA
+buffers. Output is written to `/tmp/cap-m55.h264`.
 
 ## Diagnostics
 
@@ -112,10 +115,12 @@ This is a bring-up driver. Phases:
 - [x] PCI probe, BAR map, V4L2 node registered (probe-safe)
 - [x] 7 H.264 encoder controls correlated to BAR5 mailbox slots
 - [x] Firmware loader + upload state machine (offsets `CHECKME`)
-- [x] DMA ring alloc + MSI IRQ handler + ring drain (offsets `CHECKME`)
+- [x] Four-buffer SET_BUF path + pre-ACK MSI event FIFO and vb2 delivery
 - [x] vb2 streaming: REQBUFS/QBUF/DQBUF/STREAMON/STREAMOFF
-- [x] HDMI signal detect via mailbox + V4L2 DV_TIMINGS
-- [x] ALSA HDMI audio capture (PCM S16_LE)
+- [x] coherent MST3367 HDMI timing detect + V4L2 DV_TIMINGS
+- [x] exact EDID, SET_VIC, encoder-parameter and start/stop mailbox framing
+- [ ] hardware validation of the real BT.1120 -> H.264 completion path
+- [ ] ALSA PCM DMA/ownership protocol
 - [ ] Mainline `linux-media` submission
 
 Register offsets marked `CHECKME` in `mz0380-reg.h` are working

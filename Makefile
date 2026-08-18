@@ -84,12 +84,12 @@ load: all
 load-streaming: all fw-install
 	sudo modprobe videobuf2-common
 	sudo modprobe videodev
-	sudo modprobe snd-pcm
 	sudo insmod ./mz0380.ko procfs_verbosity=2 \
 		enable_video=1 \
 		firmware_upload=1 \
 		enable_dma=1 \
-		enable_audio=1
+		dma_iova_remap=1 \
+		aic_on=1
 
 unload:
 	sudo rmmod mz0380 || true
@@ -103,14 +103,13 @@ tarball:
 #
 list:
 	v4l2-ctl --list-devices
-	v4l2-ctl --device=/dev/video0 --all
 
 probe:
-	v4l2-ctl --device=/dev/video0 --query-dv-timings
+	@echo "Use: sudo ./mz0380-m55-real-capture.sh 6 45"
 
 capture-h264:
-	ffmpeg -y -f v4l2 -pixel_format h264 -i /dev/video0 -t 10 -c copy /tmp/mz0380-test.h264
-	ffprobe /tmp/mz0380-test.h264
+	sudo ./mz0380-m55-real-capture.sh 6 45
 
 capture-audio:
-	arecord -D hw:CARD=mz0380,DEV=0 -f S16_LE -r 48000 -c 2 -d 10 /tmp/mz0380-test.wav
+	@echo "ALSA PCM DMA is not implemented; enable_audio must remain disabled."
+	@false

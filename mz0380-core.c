@@ -8,6 +8,16 @@
 
 #include "mz0380.h"
 
+/*
+ * BAR0+0x04 is command word 0 (the opcode), followed by at most ten
+ * argument words.  Word 10 / BAR0+0x2c is deliberately shared with the
+ * completion latch.  A command which uses that tenth argument therefore owns
+ * the latch and must use EVENT-only completion instead of STATUS polling.
+ * BAR0+0x30 is the EVENT word and is never command payload.
+ */
+#define MZ0380_MB_MAX_ARGS		10U
+#define MZ0380_MB_COMMAND_WORDS		(MZ0380_MB_MAX_ARGS + 1U)
+
 MODULE_DESCRIPTION("Driver for MZ0380 based capture cards");
 MODULE_AUTHOR("OpenAI");
 MODULE_LICENSE("GPL");
@@ -396,16 +406,11 @@ MODULE_PARM_DESC(probe_windows,
  * DMAC chunks, but zeros beyond it were invisible).
  */
 /*
- * M47. The EDID push with the combo opcode returned -110 (our own timeout)
- * while every following command still worked, so the mailbox was not wedged -
- * the card simply never posted a completion for it. That is the same
- * fire-and-forget shape as START_STREAMING (op 6, M22), where waiting for a
- * cmd-done that the firmware never sends produced a bogus -ETIMEDOUT.
- *
- * Since we cannot verify the EDID by read-back (nothing answers at the DDC
- * address on this bus), the real oracle is the source itself: a camera
- * switches to HDMI output once it can read a valid EDID. So make the opcode
- * and the wait tunable and let a sweep find the combination that wakes it.
+ * EDID command framing is confirmed by both sides of the shipped stack:
+ * Windows sends opcode 0x1f with nine parameters and waits for STATUS; the
+ * card handler interprets byte 5 as the EEPROM offset and writes the payload
+ * in retrying <=8-byte I2C chunks.  Keep the knobs visible for diagnostics,
+ * but use that known-good transaction by default.
  */
 /*
  * M51b. Data-bit polarity of GPIO_DIR (op 0x17): 0 = data bit 1 means
@@ -452,15 +457,15 @@ module_param_named(gpio_dir_invert, mz0380_gpio_dir_invert, bool, 0644);
 MODULE_PARM_DESC(gpio_dir_invert,
 		 "M51: invert the GPIO_DIR (op 0x17) data-bit sense used by the bit-banged I2C (def:0 = 1 means output)");
 
-unsigned int mz0380_edid_opcode = MZ0380_CMD_I2C_COMBO;
+unsigned int mz0380_edid_opcode = MZ0380_CMD_I2C_WRITE_S;
 module_param_named(edid_opcode, mz0380_edid_opcode, uint, 0644);
 MODULE_PARM_DESC(edid_opcode,
-		 "M47: mailbox opcode used to push the EDID (def 0x20 combo; try 0x1f/0x1e write_s variants)");
+		 "mailbox opcode used to push EDID (def: 0x1f, confirmed Windows/card bulk-write handler)");
 
-unsigned int mz0380_edid_timeout_ms;
+unsigned int mz0380_edid_timeout_ms = 100;
 module_param_named(edid_timeout_ms, mz0380_edid_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(edid_timeout_ms,
-		 "M47: ms to wait for an EDID chunk to complete; 0 = fire-and-forget (default, the card posts no completion for this op)");
+		 "ms to wait for each synchronous EDID chunk (def:100; 0 is unsafe fire-and-forget)");
 
 bool mz0380_buf_poison = true;
 module_param_named(buf_poison, mz0380_buf_poison, bool, 0644);
@@ -504,6 +509,38 @@ MODULE_PARM_DESC(aic_on,
  * frame is most likely pure waste; sending it once per streaming session may
  * stretch the budget. Set aic_every_frame=1 to go back if frames stop landing.
  */
+/*
+ * M62: require a second agreeing measurement pass before trusting a mode.
+ *
+ * Off by default, because it costs more time than the source gives us. One
+ * pass is ~17 mailbox round-trips (~80ms) and demanding two agreeing passes
+ * 10ms apart needs ~170ms of unbroken lock, while the only source available
+ * transmits in bursts of roughly 300ms starting at an arbitrary moment - so
+ * the pair rarely fits and the run reports "no coherent timing snapshot
+ * survived" despite a real full lock.
+ *
+ * A single pass is not an unchecked one: it re-reads detect and vtotal_lo
+ * after the block and rejects the sample if either moved, then cross-checks
+ * vperiod against hperiod/(vtotal+1) within 0.5Hz. Set this when a source
+ * holds lock continuously and the extra redundancy is free.
+ */
+/*
+ * M65: how long a successful HDMI detection may be reused to arm the encoder
+ * after the source has stopped transmitting. The only source available bursts
+ * for roughly 300ms per power-cycle, so requiring a live lock at STREAMON
+ * makes capture unreachable even though the mode is known. 0 disables the
+ * fallback and restores "live lock or nothing".
+ */
+unsigned int mz0380_signal_cache_ms = 30000;
+module_param_named(signal_cache_ms, mz0380_signal_cache_ms, uint, 0644);
+MODULE_PARM_DESC(signal_cache_ms,
+		 "M65: reuse the last good HDMI detection for this long when arming the stream (def:30000, 0=require a live lock)");
+
+bool mz0380_signal_confirm;
+module_param_named(signal_confirm, mz0380_signal_confirm, bool, 0644);
+MODULE_PARM_DESC(signal_confirm,
+		 "M62: require two agreeing measurement passes per mode detect (def:0 - a short-burst source cannot supply the window)");
+
 bool mz0380_aic_every_frame;
 module_param_named(aic_every_frame, mz0380_aic_every_frame, bool, 0644);
 MODULE_PARM_DESC(aic_every_frame,
@@ -521,9 +558,10 @@ unsigned int mz0380_aic_freq = 48000;
 module_param_named(aic_freq, mz0380_aic_freq, uint, 0644);
 MODULE_PARM_DESC(aic_freq, "M33: SET_AIC sample rate (def:48000)");
 
-unsigned int mz0380_aic_period_frames = 1024;
+unsigned int mz0380_aic_period_frames = 256;
 module_param_named(aic_period_frames, mz0380_aic_period_frames, uint, 0644);
-MODULE_PARM_DESC(aic_period_frames, "M33: SET_AIC frame_num_of_period (def:1024)");
+MODULE_PARM_DESC(aic_period_frames,
+		 "SET_AIC frames per period (def:256; Windows/card default, 256x4=1024-frame mover)");
 
 unsigned int mz0380_aic_periods = 4;
 module_param_named(aic_periods, mz0380_aic_periods, uint, 0644);
@@ -543,31 +581,31 @@ MODULE_PARM_DESC(dma_handshake,
 bool mz0380_enable_audio;
 module_param_named(enable_audio, mz0380_enable_audio, bool, 0444);
 MODULE_PARM_DESC(enable_audio,
-		 "register an ALSA HDMI audio capture device; off by default");
+		 "register the experimental ALSA scaffold (PCM DMA is not implemented; def:0)");
 
 unsigned int mz0380_video_ring_entries = 16;
 module_param_named(video_ring_entries, mz0380_video_ring_entries,
 		   uint, 0444);
 MODULE_PARM_DESC(video_ring_entries,
-		 "number of video DMA ring entries (default 16)");
+		 "reserved legacy ring knob; real video uses four SET_BUF slots (default 16)");
 
 unsigned int mz0380_video_ring_entry_size = (512 * 1024);
 module_param_named(video_ring_entry_size, mz0380_video_ring_entry_size,
 		   uint, 0444);
 MODULE_PARM_DESC(video_ring_entry_size,
-		 "size in bytes of each video DMA ring entry (default 512 KiB)");
+		 "reserved legacy ring knob, not used by SET_BUF video (default 512 KiB)");
 
 unsigned int mz0380_audio_ring_entries = 8;
 module_param_named(audio_ring_entries, mz0380_audio_ring_entries,
 		   uint, 0444);
 MODULE_PARM_DESC(audio_ring_entries,
-		 "number of audio DMA ring entries (default 8)");
+		 "reserved until the audio DMA ABI is implemented (default 8)");
 
 unsigned int mz0380_audio_ring_entry_size = 32768;
 module_param_named(audio_ring_entry_size, mz0380_audio_ring_entry_size,
 		   uint, 0444);
 MODULE_PARM_DESC(audio_ring_entry_size,
-		 "size in bytes of each audio DMA ring entry (default 32 KiB)");
+		 "reserved until the audio DMA ABI is implemented (default 32 KiB)");
 
 #define dprintk(level, fmt, arg...) \
 	do { if (debug >= level) \
@@ -2384,6 +2422,7 @@ static int mz0380_dev_setup(struct mz0380_dev *dev)
 	init_waitqueue_head(&dev->cmd_wait);
 	spin_lock_init(&dev->buf_lock);
 	spin_lock_init(&dev->event_lock);
+	spin_lock_init(&dev->frame_event_lock);
 	INIT_LIST_HEAD(&dev->buf_list);
 	dev->fw_state = MZ0380_FW_STATE_NONE;
 	atomic_set(&dev->irq_count, 0);
@@ -3307,9 +3346,10 @@ static void mz0380_dump_periph_scan(struct seq_file *m, struct mz0380_dev *dev)
 	 * (periph_read() reads PARAM3). If a bridge scan returns all-zero, the
 	 * card may be writing the value into a different slot. Issue REG_READ
 	 * for the first few registers and dump every candidate return word so
-	 * the real result slot is visible. send_command() has already snapshotted
-	 * all PARAM slots into cmd_last_param[]; STATUS/EVENT/payload are re-read
-	 * (all within the safe 0x00..0x5c mailbox aperture).
+	 * the real result slot is visible. The transaction helper snapshots the
+	 * opcode plus the ten real command words and copies them while cmd_lock is
+	 * still held. EVENT/payload are re-read separately (all within the safe
+	 * mailbox aperture).
 	 */
 	if (periph_probe) {
 		unsigned int n = min(periph_count, 4u);
@@ -3320,16 +3360,17 @@ static void mz0380_dump_periph_scan(struct seq_file *m, struct mz0380_dev *dev)
 			   chip, n ? n : 1);
 		for (reg = start; reg < start + (n ? n : 1); reg++) {
 			u32 params[3] = { chip, reg, 0 };
+			u32 reply[MZ0380_MB_COMMAND_WORDS] = { 0 };
 			u32 status = 0;
-			int ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ,
-						      params, 3, &status, 500);
+			int ret = mz0380_send_command_reply(
+				dev, MZ0380_CMD_REG_READ, params, 3,
+				&status, 500, reply, ARRAY_SIZE(reply));
 
 			seq_printf(m, "  --- reg 0x%02x: send ret=%d STATUS[0x2c]=%08x ---\n",
 				   reg, ret, status);
-			for (i = 0; i < MZ0380_REG_PARAM_MAX; i++)
+			for (i = 0; i < MZ0380_MB_COMMAND_WORDS; i++)
 				seq_printf(m, "    PARAM(%2u)[bar0+0x%02x] = %08x%s\n",
-					   i, MZ0380_MB_PARAM(i),
-					   dev->cmd_last_param[i],
+					   i, MZ0380_MB_PARAM(i), reply[i],
 					   i == 0 ? "  <- opcode echo" :
 					   i == 1 ? "  <- RESULT slot"  :
 					   i == 3 ? "  <- periph_read() reads here" : "");
@@ -3354,9 +3395,8 @@ static void mz0380_dump_periph_scan(struct seq_file *m, struct mz0380_dev *dev)
 		   " [dma not armed - reads may fail; load dma_handshake=1]");
 
 	for (reg = start; reg < end; reg++) {
-		u32 params[3] = { chip, reg, 0 };
-		int ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ,
-					      params, 3, NULL, 200);
+		u32 value = 0;
+		int ret = mz0380_periph_read(dev, chip, reg, &value);
 
 		if (ret)
 			seq_printf(m,
@@ -3364,7 +3404,7 @@ static void mz0380_dump_periph_scan(struct seq_file *m, struct mz0380_dev *dev)
 				   chip, reg, ret);
 		else
 			seq_printf(m, "  periph[0x%02x][0x%02x] = %08x\n",
-				   chip, reg, dev->cmd_last_param[3]);
+				   chip, reg, value);
 	}
 }
 
@@ -3633,39 +3673,33 @@ static ssize_t mz0380_proc_events_write(struct file *file,
 }
 
 /*
- * HDMI activation (RE_FINDINGS.md M7). The card only presents itself as an HDMI
- * sink - asserting HPD and serving EDID so the source starts outputting - after
- * the host selects the input and declares the video standard. The QCAP SDK does
- * this via SET_VIDEO_INPUT(HDMI)+RUN; the mailbox equivalent is SET_VIC_PARAMS
- * (op41). Firing it here is the minimal probe for "does the source wake?".
- *
- * Field packing: the mailbox writes opcode->0x04 and params[i]->0x08+4i, and the
- * firmware reads the buffer as bytes with cmd[N] == mailbox(0x04+N). So
- * params[0] carries cmd[5]=fps (byte1) and cmd[6]=input (byte2); params[1]
- * carries cmd[8:9]=width (low u16) and cmd[10:11]=height (high u16). params[7]
- * covers cmd[0x22]=int_reduce, left 0.
+ * Select the real HDMI front end without spawning the encoder.  The old proc
+ * command packed an unverified raw input code and geometry into SET_VIC; that
+ * opcode configures/spawns tinyvenc and belongs only in stream start.  Property
+ * 201 uses the V4L2 input index instead, where HDMI is confirmed as index 0.
+ * Refreshing the MST3367 sink then drives HPD low, reloads EDID, and raises HPD
+ * so the source sees a coherent sink transition.
  */
-static int mz0380_activate_hdmi_locked(struct mz0380_dev *dev, u32 input,
-				       u32 width, u32 height, u32 fps)
+static int mz0380_activate_hdmi_sink(struct mz0380_dev *dev)
 {
-	u32 params[8] = { 0 };
-	u32 status = 0;
 	int ret;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
-		pr_warn("%s: HDMI activate skipped - firmware not ready (load firmware_upload=1 dma_handshake=1)\n",
+		pr_warn("%s: HDMI sink refresh skipped - firmware not ready (load firmware_upload=1 dma_handshake=1)\n",
 			dev->name);
 		return -ENODEV;
 	}
 
-	params[0] = ((input & 0xff) << 16) | ((fps & 0xff) << 8);
-	params[1] = ((height & 0xffff) << 16) | (width & 0xffff);
+	ret = mz0380_request_input_select(dev, 0, "hdmi-proc");
+	if (ret) {
+		pr_warn("%s: HDMI property-%u index-0 select failed (%d)\n",
+			dev->name, MZ0380_INPUT_SELECT_PROPERTY, ret);
+		return ret;
+	}
 
-	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
-				  ARRAY_SIZE(params), &status, 500);
-	pr_info("%s: HDMI activate: SET_VIC_PARAMS(input=%u %ux%u@%u) ret=%d status=0x%08x result=0x%08x - now check the OUT port / source\n",
-		dev->name, input, width, height, fps, ret, status,
-		dev->cmd_last_param[0]);
+	ret = mz0380_mst3367_reload_edid(dev);
+	pr_info("%s: HDMI property-%u index 0 selected; MST3367 EDID/HPD refresh ret=%d (SET_VIC deferred to stream start)\n",
+		dev->name, MZ0380_INPUT_SELECT_PROPERTY, ret);
 	return ret;
 }
 
@@ -3673,10 +3707,11 @@ static int mz0380_proc_hdmi_show(struct seq_file *m, void *v)
 {
 	struct mz0380_dev *dev;
 
-	seq_puts(m, "usage: echo \"[input] [width] [height] [fps]\" > /proc/mz0380-hdmi\n");
-	seq_puts(m, "  defaults: 2 1920 1080 60   input codes: HDMI=2 DVI=3 COMPONENT=4 SDI=6 AUTO=7\n");
-	seq_puts(m, "  fires SET_VIC_PARAMS (op41): host declares input + standard so the\n");
-	seq_puts(m, "  card asserts HPD/EDID and the HDMI source wakes. Watch dmesg + OUT port.\n");
+	seq_puts(m, "usage: echo hdmi > /proc/mz0380-hdmi\n");
+	seq_puts(m, "  selects confirmed V4L2/property-201 HDMI index 0, reloads EDID, and pulses HPD.\n");
+	seq_puts(m, "  It does not send SET_VIC or start the encoder; those happen only at stream start.\n");
+	seq_puts(m, "  Legacy numeric forms accept property index 0 or raw HDMI code 2 only; geometry is ignored.\n");
+	seq_puts(m, "  Raw DVI/component/SDI/auto input codes are rejected. Other commands: edid, hpd, watch, ramtest, wscan, edidhunt, gpiodump, i2cscan, edidburn.\n");
 	seq_puts(m, "\nsink chain read-back (M43: write returns prove nothing - the\n"
 		    "firmware forces the I2C result to 0 on a NAK, so verify by reading):\n");
 	mutex_lock(&devlist);
@@ -3691,7 +3726,7 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 				      size_t count, loff_t *ppos)
 {
 	struct mz0380_dev *dev;
-	u32 input = MZ0380_INPUT_CODE_HDMI, width = 1920, height = 1080, fps = 60;
+	u32 input = 0, width = 1920, height = 1080, fps = 60;
 	char *cmd;
 
 	if (!count || *ppos != 0)
@@ -3703,6 +3738,8 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 	if (IS_ERR(cmd))
 		return PTR_ERR(cmd);
 	strim(cmd);
+	if (!strcmp(cmd, "hdmi"))
+		goto activate_hdmi;
 
 	/* M44: "ramtest" probes whether MST3367 BANK3 is writable RAM */
 	if (!strcmp(cmd, "ramtest")) {
@@ -3823,27 +3860,84 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 	}
 
 	/*
-	 * Anything left must be the numeric "input width height fps" form. A
-	 * word that matched no command above is a typo - or, more usefully, a
+	 * Anything left must be the deprecated numeric "input width height fps"
+	 * form. A word that matched no command above is a typo - or, more usefully,
+	 * a
 	 * command this module is too old to know, which is what a stale
 	 * insmod looks like. Falling through would silently run an HDMI
 	 * activation with default geometry and log nothing about the real
 	 * request, so reject it and name the vocabulary instead.
 	 */
 	if (*cmd && !(*cmd >= '0' && *cmd <= '9')) {
-		pr_info("mz0380: unknown /proc/mz0380-hdmi command '%s' - known: ramtest, wscan, edidhunt, gpiodump, i2cscan, edidburn, hpd, edid, watch, or '<input> <w> <h> <fps>' (a rejected command you expected to work means the loaded module predates it - rmmod and insmod the fresh build)\n",
+		pr_info("mz0380: unknown /proc/mz0380-hdmi command '%s' - known: hdmi, ramtest, wscan, edidhunt, gpiodump, i2cscan, edidburn, hpd, edid, watch, or legacy '0|2 [w h fps]'\n",
 			cmd);
 		kfree(cmd);
 		return -EINVAL;
 	}
 
-	sscanf(cmd, "%u %u %u %u", &input, &width, &height, &fps);
+	{
+		u32 values[4];
+		unsigned int n = 0;
+		char *p = cmd;
+		char *tok;
+
+		while ((tok = strsep(&p, " \t")) != NULL) {
+			if (!*tok)
+				continue;
+			if (n == ARRAY_SIZE(values) ||
+			    kstrtou32(tok, 0, &values[n])) {
+				pr_warn("mz0380: malformed legacy HDMI request; use 'hdmi'\n");
+				kfree(cmd);
+				return -EINVAL;
+			}
+			n++;
+		}
+		if (!n) {
+			kfree(cmd);
+			return -EINVAL;
+		}
+
+		input = values[0];
+		if (n > 1)
+			width = values[1];
+		if (n > 2)
+			height = values[2];
+		if (n > 3)
+			fps = values[3];
+	}
+
+	/* 0 is property-201 HDMI; 2 is accepted only as the old raw HDMI code. */
+	if (input != 0 && input != MZ0380_INPUT_CODE_HDMI) {
+		pr_warn("mz0380: rejected non-HDMI raw input code %u; use 'hdmi' (property-201 index 0)\n",
+			input);
+		kfree(cmd);
+		return -EINVAL;
+	}
+	pr_warn("mz0380: legacy HDMI request '%u %u %u %u': geometry is ignored; selecting property-201 index 0 and refreshing EDID/HPD\n",
+		input, width, height, fps);
+
+activate_hdmi:
 	kfree(cmd);
 
-	mutex_lock(&devlist);
-	list_for_each_entry(dev, &mz0380_devlist, devlist)
-		mz0380_activate_hdmi_locked(dev, input, width, height, fps);
-	mutex_unlock(&devlist);
+	{
+		ssize_t ret = count;
+		bool found = false;
+
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist) {
+			int err;
+
+			found = true;
+			err = mz0380_activate_hdmi_sink(dev);
+			if (err && ret > 0)
+				ret = err;
+		}
+		mutex_unlock(&devlist);
+		if (!found)
+			return -ENODEV;
+		if (ret < 0)
+			return ret;
+	}
 
 	*ppos += count;
 	return count;
@@ -3859,6 +3953,7 @@ static ssize_t mz0380_proc_hdmi_write(struct file *file,
 static int mz0380_raw_command_locked(struct mz0380_dev *dev, u32 opcode,
 				     const u32 *params, unsigned int nparams)
 {
+	u32 reply[4] = { 0 };
 	u32 status = 0;
 	int ret;
 
@@ -3866,14 +3961,15 @@ static int mz0380_raw_command_locked(struct mz0380_dev *dev, u32 opcode,
 		pr_warn("%s: raw cmd skipped - firmware not ready\n", dev->name);
 		return -ENODEV;
 	}
-	if (nparams + 1 > MZ0380_REG_PARAM_MAX)
-		nparams = MZ0380_REG_PARAM_MAX - 1;
+	if (nparams > MZ0380_MB_MAX_ARGS)
+		return -E2BIG;
 
-	ret = mz0380_send_command(dev, opcode, params, nparams, &status, 500);
+	ret = mz0380_send_command_reply(dev, opcode, params, nparams,
+					   &status, 500, reply,
+					   ARRAY_SIZE(reply));
 	pr_info("%s: raw cmd op=0x%02x n=%u ret=%d status=0x%08x out=%08x %08x %08x %08x\n",
 		dev->name, opcode, nparams, ret, status,
-		dev->cmd_last_param[0], dev->cmd_last_param[1],
-		dev->cmd_last_param[2], dev->cmd_last_param[3]);
+		reply[0], reply[1], reply[2], reply[3]);
 	return ret;
 }
 
@@ -3896,7 +3992,7 @@ static ssize_t mz0380_proc_cmd_write(struct file *file,
 				     const char __user *buffer,
 				     size_t count, loff_t *ppos)
 {
-	u32 vals[MZ0380_REG_PARAM_MAX] = { 0 };
+	u32 vals[MZ0380_MB_COMMAND_WORDS] = { 0 };
 	struct mz0380_dev *dev;
 	unsigned int n = 0;
 	char *cmd, *p, *tok;
@@ -3912,9 +4008,13 @@ static ssize_t mz0380_proc_cmd_write(struct file *file,
 	strim(cmd);
 
 	p = cmd;
-	while ((tok = strsep(&p, " \t")) != NULL && n < ARRAY_SIZE(vals)) {
+	while ((tok = strsep(&p, " \t")) != NULL) {
 		if (!*tok)
 			continue;
+		if (n == ARRAY_SIZE(vals)) {
+			kfree(cmd);
+			return -E2BIG;
+		}
 		if (kstrtou32(tok, 0, &vals[n])) {
 			kfree(cmd);
 			return -EINVAL;
@@ -4514,19 +4614,15 @@ static int mz0380_proc_create(void)
 /*
  * Mailbox command send.
  *
- * Protocol (inferred from the on-card ep.ko sysfs surface):
- *   1. host writes parameter words 0..nparams-1 into PARAM(i)
- *   2. host writes opcode into COMMAND
- *   3. host waits on cmd_wait until ISR sets cmd_complete on
- *      MZ0380_IRQ_CMD_COMPLETE, with timeout
- *   4. host reads STATUS and optionally PARAM(i) for return values
+ * Protocol confirmed against both the Windows transport and ep.ko:
+ *   1. clear the shared PARAM10/STATUS word before installing payload
+ *   2. write opcode to PARAM0 and up to ten arguments to PARAM1..PARAM10
+ *   3. ring BAR0+0x00 with 0x800
+ *   4. unless explicitly asynchronous, wait for STATUS or EVENT completion;
+ *      a full-width command can wait only for EVENT because STATUS is payload
  *
- * Until the actual command/status registers are confirmed by .sys
- * disasm or runtime correlation, this function still pokes the
- * mailbox but treats absence of an IRQ-driven completion as a
- * timeout (NOT a hard error) so caller can decide.
- *
- * Caller must serialise via dev->cmd_lock.
+ * The public helper serialises transactions with dev->cmd_lock. Peripheral
+ * reads use the internal locked form so the lock also covers their late result.
  */
 /*
  * Ack/rearm one card event, exact write order of the Windows event
@@ -4591,85 +4687,144 @@ void mz0380_mailbox_scan(struct mz0380_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mz0380_mailbox_scan);
 
+static void mz0380_mb_snapshot_reply(struct mz0380_dev *dev)
+{
+	unsigned int i;
+
+	BUILD_BUG_ON(MZ0380_MB_COMMAND_WORDS > MZ0380_REG_PARAM_MAX);
+	memset(dev->cmd_last_param, 0, sizeof(dev->cmd_last_param));
+	for (i = 0; i < MZ0380_MB_COMMAND_WORDS; i++)
+		dev->cmd_last_param[i] =
+			mz_mmio_read(dev, MZ0380_MB_PARAM(i));
+}
+
 void mz0380_mb_ack_event(struct mz0380_dev *dev)
 {
+	unsigned long flags;
+	u32 event;
+
+	/*
+	 * ACK re-arms the endpoint and permits it to overwrite TOKEN/PAYLOAD.
+	 * Capture their frame-bearing state first, regardless of whether the ACK
+	 * came from the MSI ISR, command poller, boot waiter, or stale-event drain.
+	 * The poller and ISR can observe the same one-shot EVENT concurrently, so
+	 * serialize the complete snapshot/rearm sequence.  Otherwise one context
+	 * could clear and rearm the mailbox while the other is still reading the
+	 * old event's payload.
+	 */
+	spin_lock_irqsave(&dev->event_lock, flags);
+	event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+	if (event && event != U32_MAX) {
+		/*
+		 * Keep the command reply paired with the same EVENT as the frame
+		 * payload.  Reading these in the ISR before taking event_lock lets a
+		 * polling CPU ACK/rearm between EVENT and the reply snapshot.
+		 */
+		if (event & MZ0380_MB_EVENT_CMD_DONE) {
+			dev->cmd_last_status =
+				mz_mmio_read(dev, MZ0380_MB_STATUS);
+			mz0380_mb_snapshot_reply(dev);
+			smp_store_release(&dev->cmd_complete, true);
+			wake_up_all(&dev->cmd_wait);
+		}
+		mz0380_handle_event_snapshot(dev, event);
+	}
 	mz_cfg_write(dev, MZ0380_CFG_INT_FLAG, MZ0380_CFG_INT_ACK_VAL);
 	mz_mmio_write(dev, MZ0380_MB_EVENT, 0);
 	wmb();
 	mz_mmio_write(dev, MZ0380_MB_DOORBELL, MZ0380_MB_INT_ACK);
+	spin_unlock_irqrestore(&dev->event_lock, flags);
 }
 
-int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
-			const u32 *params, unsigned int nparams,
-			u32 *status_out, unsigned int timeout_ms)
+/* dev->cmd_lock must remain held until any opcode-specific late reply is read. */
+static int mz0380_send_command_locked(struct mz0380_dev *dev, u32 opcode,
+				       const u32 *params,
+				       unsigned int nparams,
+				       u32 *status_out,
+				       unsigned int timeout_ms)
 {
 	unsigned int i;
-	u32 status;
+	u32 status = 0;
+	bool ack_slot_is_payload;
 	int ret = 0;
 
 	/*
 	 * RE-confirmed mailbox model (BAR0). SEND_COMMAND writes the opcode to
 	 * the PARAM0 slot (BAR0+0x04), the arguments to the following slots,
-	 * then fires the doorbell (BAR0+0x00 = 0x800). Completion is signalled
-	 * either by MSI (ISR sets cmd_complete) or by MZ0380_MB_STATUS bit0.
-	 * The opcode occupies one param slot, so nparams args plus the opcode
-	 * must fit the tracked slot count.
+	 * then fires the doorbell (BAR0+0x00 = 0x800). BAR0+0x2c is both PARAM10
+	 * and STATUS; Windows sends commands which use all ten arguments through
+	 * its EVENT-wait path, which skips only the overlapping STATUS poll.
+	 * PARAM11 would be EVENT and must never be written as payload.
 	 */
-	if (nparams + 1 > MZ0380_REG_PARAM_MAX)
+	BUILD_BUG_ON(MZ0380_MB_PARAM(MZ0380_MB_MAX_ARGS) !=
+		     MZ0380_MB_STATUS);
+	BUILD_BUG_ON(MZ0380_MB_PARAM(MZ0380_MB_MAX_ARGS + 1) !=
+		     MZ0380_MB_EVENT);
+
+	lockdep_assert_held(&dev->cmd_lock);
+	if (nparams > MZ0380_MB_MAX_ARGS || (nparams && !params))
 		return -EINVAL;
+	ack_slot_is_payload = nparams == MZ0380_MB_MAX_ARGS;
+	if (status_out)
+		*status_out = 0;
 
-	mutex_lock(&dev->cmd_lock);
-
-	/* drain a stale unacked event (e.g. from a previous module life) */
+	/*
+	 * Drain a stale unacked event (e.g. from a previous module life) before
+	 * assigning a new command to cmd_complete. mz0380_mb_ack_event() takes
+	 * the frame/token snapshot before it clears EVENT, so this cannot discard
+	 * a late frame completion.
+	 */
 	{
 		u32 stale = mz_mmio_read(dev, MZ0380_MB_EVENT);
 
-		if (stale || mz_cfg_read(dev, MZ0380_CFG_INT_FLAG) == 1) {
+		WRITE_ONCE(dev->cmd_complete, false);
+		if ((stale && stale != U32_MAX) ||
+		    mz_cfg_read(dev, MZ0380_CFG_INT_FLAG) == 1) {
 			mz0380_mb_ack_event(dev);
 			pr_info("%s: drained stale EVENT=0x%08x before command 0x%x\n",
 				dev->name, stale, opcode);
 		}
+		/* Retire an ISR which observed the old EVENT before the drain. */
+		if (dev->irq_requested)
+			synchronize_irq(dev->irq);
 	}
 
-	/* opcode -> PARAM0 (BAR0+0x04), args -> PARAM1.. (BAR0+0x08..) */
+	/*
+	 * Clear the completion latch before any command words are installed.
+	 * In particular, do not clear it after PARAM10: for a full-width command
+	 * that same write would destroy its final payload word. The firmware's
+	 * 0xaaaaaaaa/0xdddddddd values are replies/initial state, not immutable
+	 * stamps; retaining an old one would falsely complete the next command.
+	 */
+	mz_mmio_write(dev, MZ0380_MB_STATUS, 0);
+	WRITE_ONCE(dev->cmd_complete, false);
+	smp_wmb();
+
+	/* opcode -> PARAM0 (BAR0+0x04), args -> PARAM1..PARAM10 */
 	mz_mmio_write(dev, MZ0380_MB_OPCODE, opcode);
 	for (i = 0; i < nparams; i++)
 		mz_mmio_write(dev, MZ0380_MB_PARAM(i + 1), params[i]);
 
-	dev->cmd_complete = false;
-	smp_wmb();
-
-	/*
-	 * Clear the status latch - but never stomp the firmware's stamp
-	 * values (Windows only clears STATUS in its poll path; the IRQ path
-	 * used for INIT/fw-download leaves it alone entirely).
-	 */
-	status = mz_mmio_read(dev, MZ0380_MB_STATUS);
-	if (status != MZ0380_MB_STATUS_BOOT_STAMP &&
-	    status != MZ0380_MB_STATUS_OK_STAMP)
-		mz_mmio_write(dev, MZ0380_MB_STATUS, 0);
 	wmb();
 	mz_mmio_write(dev, MZ0380_MB_DOORBELL, MZ0380_MB_FIRE);
 
 	/*
-	 * timeout_ms == 0 means fire-and-forget (Windows SEND_COMMAND does
-	 * the same): commands like COMMIT_FW reboot the card and never post
-	 * a completion, so there is nothing to wait for here.
+	 * timeout_ms == 0 is the only fire-and-forget form. A command occupying
+	 * PARAM10 cannot poll that shared word, but a non-zero timeout still waits
+	 * for EVENT CMD_DONE, matching Windows' semaphore path for SET_BUF.
 	 */
-	if (timeout_ms == 0)
-		goto out;
+	if (!timeout_ms)
+		return 0;
 
 	{
 		/*
-		 * Command completion is ALWAYS polled, even when MSI is enabled
-		 * for the frame-delivery path. This card signals short-command
-		 * completion via MZ0380_MB_STATUS bit0 with NO interrupt, so
-		 * waiting on an MSI that never arrives times every command out
-		 * (the bug that stalled the whole bring-up once enable_dma was
-		 * set). We additionally honour dev->cmd_complete, which the ISR
-		 * sets if it happens to catch an EVENT-bit11 (command-done)
-		 * interrupt first. Ack only when a real event is pending; the
-		 * old ack-every-tick scheme aborted STATUS-completing commands.
+		 * Short commands poll STATUS even when MSI is enabled: they can finish
+		 * through bit0 without an interrupt. Full-width commands skip STATUS
+		 * because it is PARAM10 and wait exclusively for EVENT CMD_DONE.
+		 * dev->cmd_complete covers an event consumed first by the ISR; this
+		 * loop also consumes live events so it works without IRQ delivery.
+		 * Ack only a real event—the old ack-every-tick scheme could abort a
+		 * STATUS-completing command.
 		 */
 		unsigned int waited = 0;
 		unsigned int max_wait = max(timeout_ms,
@@ -4678,28 +4833,32 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 		u32 event;
 
 		do {
-			if (dev->cmd_complete) {
-				status = dev->cmd_last_status;
+			if (smp_load_acquire(&dev->cmd_complete)) {
+				if (!ack_slot_is_payload)
+					status = dev->cmd_last_status;
 				done = true;
 				break;
 			}
-			status = mz_mmio_read(dev, MZ0380_MB_STATUS);
+			if (!ack_slot_is_payload)
+				status = mz_mmio_read(dev, MZ0380_MB_STATUS);
 			/*
 			 * Completion = bit0, or the firmware's 0xaaaaaaaa
 			 * success stamp (GET_BOARD_VERSION/INIT). The
 			 * 0xdddddddd boot stamp also has bit0 set but is NOT a
 			 * completion.
 			 */
-			if (status == MZ0380_MB_STATUS_OK_STAMP ||
-			    ((status & MZ0380_MB_STATUS_DONE) &&
-			     status != MZ0380_MB_STATUS_BOOT_STAMP)) {
+			if (!ack_slot_is_payload &&
+			    (status == MZ0380_MB_STATUS_OK_STAMP ||
+			     ((status & MZ0380_MB_STATUS_DONE) &&
+			      status != MZ0380_MB_STATUS_BOOT_STAMP))) {
 				done = true;
 				break;
 			}
 			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
-			if (event) {
+			if (event && event != U32_MAX) {
 				bool cmd_done = event & MZ0380_MB_EVENT_CMD_DONE;
 
+				/* Snapshot frame-bearing lanes before the ACK clears EVENT. */
 				mz0380_mb_ack_event(dev);
 				pr_info("%s: EVENT=0x%08x during command 0x%x (%s), acked\n",
 					dev->name, event, opcode,
@@ -4713,36 +4872,101 @@ int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
 			waited += 1;
 		} while (waited < max_wait);
 
-		if (!done) {
+		if (!done)
 			ret = -ETIMEDOUT;
-			goto out;
-		}
 
 		/*
 		 * A command that completed via STATUS bit0 may still post a
-		 * trailing completion event a moment later; give it a few ms
-		 * and ack it so the card is not left with INTx asserted.
+		 * trailing completion event a moment later. Give it a few ms and
+		 * snapshot every frame-bearing event before ACKing; a frame-only
+		 * event does not end this short trailing-command-event window.
 		 */
-		for (waited = 0; waited < 10; waited++) {
-			event = mz_mmio_read(dev, MZ0380_MB_EVENT);
-			if (event ||
-			    mz_cfg_read(dev, MZ0380_CFG_INT_FLAG) == 1) {
-				mz0380_mb_ack_event(dev);
-				break;
+		if (done) {
+			for (waited = 0; waited < 10; waited++) {
+				bool cmd_done;
+
+				event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+				cmd_done = event && event != U32_MAX &&
+					   (event & MZ0380_MB_EVENT_CMD_DONE);
+				if (event && event != U32_MAX) {
+					mz0380_mb_ack_event(dev);
+					if (cmd_done)
+						break;
+				} else if (mz_cfg_read(dev,
+						       MZ0380_CFG_INT_FLAG) == 1) {
+					/* No EVENT payload is live; only rearm INTx. */
+					mz0380_mb_ack_event(dev);
+					break;
+				}
+				usleep_range(300, 500);
 			}
-			usleep_range(300, 500);
 		}
 
-		/* capture the result/param slots for the caller */
-		for (i = 0; i < MZ0380_REG_PARAM_MAX; i++)
-			dev->cmd_last_param[i] =
-				mz_mmio_read(dev, MZ0380_MB_PARAM(i));
+		/*
+		 * Preserve a reply already paired with CMD_DONE by
+		 * mz0380_mb_ack_event().  Once that ACK rearms the endpoint, a live
+		 * reread is no longer tied to the event we just consumed.  STATUS-only
+		 * completions have no such snapshot, so take one while excluding the
+		 * ISR's EVENT snapshot/ACK sequence.
+		 */
+		{
+			unsigned long flags;
+
+			spin_lock_irqsave(&dev->event_lock, flags);
+			if (!smp_load_acquire(&dev->cmd_complete))
+				mz0380_mb_snapshot_reply(dev);
+			spin_unlock_irqrestore(&dev->event_lock, flags);
+		}
 	}
 
 	if (status_out)
 		*status_out = status;
+	return ret;
+}
 
-out:
+/* Copy shared reply storage before cmd_lock permits another transaction. */
+int mz0380_send_command_reply(struct mz0380_dev *dev, u32 opcode,
+			       const u32 *params, unsigned int nparams,
+			       u32 *status_out, unsigned int timeout_ms,
+			       u32 *reply, unsigned int reply_words)
+{
+	int ret;
+
+	if (reply_words > MZ0380_MB_COMMAND_WORDS ||
+	    (reply_words && !reply))
+		return -EINVAL;
+	if (status_out)
+		*status_out = 0;
+	if (reply_words)
+		memset(reply, 0, reply_words * sizeof(*reply));
+	if (nparams > MZ0380_MB_MAX_ARGS || (nparams && !params))
+		return -EINVAL;
+
+	mutex_lock(&dev->cmd_lock);
+	ret = mz0380_send_command_locked(dev, opcode, params, nparams,
+					 status_out, timeout_ms);
+	if (reply_words) {
+		if (timeout_ms && nparams != MZ0380_MB_MAX_ARGS)
+			memcpy(reply, dev->cmd_last_param,
+			       reply_words * sizeof(*reply));
+	}
+	mutex_unlock(&dev->cmd_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mz0380_send_command_reply);
+
+int mz0380_send_command(struct mz0380_dev *dev, u32 opcode,
+			const u32 *params, unsigned int nparams,
+			u32 *status_out, unsigned int timeout_ms)
+{
+	int ret;
+
+	if (nparams > MZ0380_MB_MAX_ARGS || (nparams && !params))
+		return -EINVAL;
+
+	mutex_lock(&dev->cmd_lock);
+	ret = mz0380_send_command_locked(dev, opcode, params, nparams,
+					 status_out, timeout_ms);
 	mutex_unlock(&dev->cmd_lock);
 	return ret;
 }
@@ -4760,6 +4984,7 @@ int mz0380_card_init(struct mz0380_dev *dev)
 {
 	resource_size_t bar0 = pci_resource_start(dev->pci, 0);
 	unsigned int attempt;
+	u32 init_reply[2] = { 0 };
 	u32 status = 0;
 	int ret = -ETIMEDOUT;
 
@@ -4769,14 +4994,15 @@ int mz0380_card_init(struct mz0380_dev *dev)
 	mz0380_mb_ack_event(dev);
 
 	for (attempt = 0; attempt < 10 && ret; attempt++)
-		ret = mz0380_send_command(dev, MZ0380_CMD_INIT, NULL, 0,
-					  &status, 600);
+		ret = mz0380_send_command_reply(
+			dev, MZ0380_CMD_INIT, NULL, 0, &status, 600,
+			init_reply, ARRAY_SIZE(init_reply));
 	if (ret) {
 		pr_warn("%s: CMD_INIT got no answer (%d), STATUS=%08x EVENT=%08x RESULT=%08x bar5[dc]=%08x bar5[30]=%08x bar5[38]=%08x\n",
 			dev->name, ret,
-			mz_mmio_read(dev, MZ0380_MB_STATUS),
+			status,
 			mz_mmio_read(dev, MZ0380_MB_EVENT),
-			mz_mmio_read(dev, MZ0380_MB_RESULT),
+			init_reply[1],
 			mz_cfg_read(dev, MZ0380_CFG_INT_FLAG),
 			mz_cfg_read(dev, MZ0380_CFG_NOTIFY_PTR0),
 			mz_cfg_read(dev, MZ0380_CFG_NOTIFY_PTR1));
@@ -4790,11 +5016,27 @@ int mz0380_card_init(struct mz0380_dev *dev)
 	{
 		u32 params[2] = { 0, 0 };
 
+		/*
+		 * The version words can settle after command completion. Keep the
+		 * mailbox transaction locked through that delay and extraction so a
+		 * concurrent GPIO/I2C command cannot replace PARAM1/PARAM2.
+		 */
+		mutex_lock(&dev->cmd_lock);
 		ret = -ETIMEDOUT;
 		for (attempt = 0; attempt < 10 && ret; attempt++)
-			ret = mz0380_send_command(dev,
-						  MZ0380_CMD_GET_BOARD_VERSION,
-						  params, 2, &status, 5000);
+			ret = mz0380_send_command_locked(
+				dev, MZ0380_CMD_GET_BOARD_VERSION, params, 2,
+				&status, 5000);
+		if (!ret) {
+			msleep(100);
+			dev->fw_version_major =
+				mz_mmio_read(dev, MZ0380_MB_PARAM(1));
+			dev->fw_version_minor =
+				mz_mmio_read(dev, MZ0380_MB_PARAM(2));
+			dev->cmd_last_param[1] = dev->fw_version_major;
+			dev->cmd_last_param[2] = dev->fw_version_minor;
+		}
+		mutex_unlock(&dev->cmd_lock);
 	}
 	if (ret) {
 		pr_warn("%s: GET_BOARD_VERSION got no answer (%d)\n",
@@ -4802,9 +5044,6 @@ int mz0380_card_init(struct mz0380_dev *dev)
 		return ret;
 	}
 
-	msleep(100);
-	dev->fw_version_major = mz_mmio_read(dev, MZ0380_MB_PARAM(1));
-	dev->fw_version_minor = mz_mmio_read(dev, MZ0380_MB_PARAM(2));
 	pr_info("%s: board reports running firmware %u.%u (status=0x%08x)\n",
 		dev->name, dev->fw_version_major, dev->fw_version_minor,
 		status);
@@ -4824,44 +5063,73 @@ EXPORT_SYMBOL_GPL(mz0380_card_init);
  * command's result (off-by-one on back-to-back reads). The firmware writes only
  * the low BYTE of that slot, so we pre-load a distinctive sentinel byte and
  * poll the low byte until the firmware replaces it (NAK -> 0x00, ACK -> value).
- * If the real value happens to equal the sentinel we simply return it after the
- * poll budget rather than failing.
+ * A real register may itself equal one sentinel.  Retry once with its inverse;
+ * no byte can equal both values, so a legitimate 0xa5/0x5a reply is not
+ * misreported as a timeout.
  */
-#define MZ0380_PERIPH_READ_SENTINEL	0xa5u	/* low-byte sentinel */
+#define MZ0380_PERIPH_READ_SENTINEL0	0xa5u
+#define MZ0380_PERIPH_READ_SENTINEL1	0x5au
 #define MZ0380_PERIPH_READ_POLL_US	500
 #define MZ0380_PERIPH_READ_POLL_ITERS	60	/* ~30 ms budget for the result */
 
 int mz0380_periph_read(struct mz0380_dev *dev, u8 chip, u8 reg, u32 *val)
 {
-	u32 params[3] = { chip, reg, MZ0380_PERIPH_READ_SENTINEL };
-	u32 result;
-	unsigned int i;
-	int ret;
+	static const u8 sentinels[] = {
+		MZ0380_PERIPH_READ_SENTINEL0,
+		MZ0380_PERIPH_READ_SENTINEL1,
+	};
+	u32 params[3] = { chip, reg, 0 };
+	u32 result = 0;
+	unsigned int attempt, i;
+	int ret = -ETIMEDOUT;
 
-	ret = mz0380_send_command(dev, MZ0380_CMD_REG_READ, params, 3,
-				  NULL, 1000);
-	if (ret) {
-		pr_info("%s: REG_READ chip=0x%02x reg=0x%02x failed (%d), STATUS=%08x EVENT=%08x RESULT=%08x P3=%08x\n",
-			dev->name, chip, reg, ret,
-			mz_mmio_read(dev, MZ0380_MB_STATUS),
-			mz_mmio_read(dev, MZ0380_MB_EVENT),
-			mz_mmio_read(dev, MZ0380_MB_RESULT),
-			mz_mmio_read(dev, MZ0380_MB_PARAM(3)));
-		return ret;
+	/*
+	 * Keep cmd_lock across both command completion and the proxy's late
+	 * low-byte store. Otherwise a second mailbox command may replace PARAM3
+	 * between send_command() unlocking and this result poll.
+	 */
+	mutex_lock(&dev->cmd_lock);
+	for (attempt = 0; attempt < ARRAY_SIZE(sentinels); attempt++) {
+		params[2] = sentinels[attempt];
+		ret = mz0380_send_command_locked(dev, MZ0380_CMD_REG_READ,
+						 params, ARRAY_SIZE(params),
+						 NULL, 1000);
+		if (ret) {
+			pr_info("%s: REG_READ chip=0x%02x reg=0x%02x failed (%d), STATUS=%08x EVENT=%08x RESULT=%08x P3=%08x\n",
+				dev->name, chip, reg, ret,
+				mz_mmio_read(dev, MZ0380_MB_STATUS),
+				mz_mmio_read(dev, MZ0380_MB_EVENT),
+				mz_mmio_read(dev, MZ0380_MB_RESULT),
+				mz_mmio_read(dev, MZ0380_MB_PARAM(3)));
+			goto out_unlock;
+		}
+
+		for (i = 0; i < MZ0380_PERIPH_READ_POLL_ITERS; i++) {
+			result = mz_mmio_read(dev, MZ0380_MB_PARAM(3));
+			if ((result & 0xff) != sentinels[attempt]) {
+				ret = 0;
+				goto have_result;
+			}
+			usleep_range(MZ0380_PERIPH_READ_POLL_US,
+				     MZ0380_PERIPH_READ_POLL_US * 2);
+		}
 	}
 
-	/* wait for the firmware to replace the sentinel byte with the result */
-	for (i = 0; i < MZ0380_PERIPH_READ_POLL_ITERS; i++) {
-		result = mz_mmio_read(dev, MZ0380_MB_PARAM(3));
-		if ((result & 0xff) != MZ0380_PERIPH_READ_SENTINEL)
-			break;
-		usleep_range(MZ0380_PERIPH_READ_POLL_US,
-			     MZ0380_PERIPH_READ_POLL_US * 2);
-	}
+	ret = -ETIMEDOUT;
+	pr_warn("%s: REG_READ chip=0x%02x reg=0x%02x result timed out with both sentinels after %u polls each (P3=%08x STATUS=%08x EVENT=%08x)\n",
+		dev->name, chip, reg, MZ0380_PERIPH_READ_POLL_ITERS,
+		result, mz_mmio_read(dev, MZ0380_MB_STATUS),
+		mz_mmio_read(dev, MZ0380_MB_EVENT));
+	goto out_unlock;
 
+have_result:
+	dev->cmd_last_param[3] = result;
 	if (val)
 		*val = result & 0xff;
-	return 0;
+
+out_unlock:
+	mutex_unlock(&dev->cmd_lock);
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_periph_read);
 
@@ -4975,8 +5243,8 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 	return 0;
 
 fail_dma:
-	mz0380_dma_teardown(dev);
 	mz0380_irq_release(dev);
+	mz0380_dma_teardown(dev);
 	mz0380_firmware_release(dev);
 	mz0380_dev_unregister(dev);
 fail_disable:
@@ -5002,8 +5270,8 @@ static void mz0380_finidev(struct pci_dev *pci_dev)
 	mz0380_nosg_capture_stop(dev);	/* join before the bufs it polls die */
 	mz0380_dma_stop(dev);
 	mz0380_dev_unregister(dev);
-	mz0380_dma_teardown(dev);
 	mz0380_irq_release(dev);
+	mz0380_dma_teardown(dev);
 	mz0380_firmware_release(dev);
 	pci_clear_master(pci_dev);
 	pci_disable_device(pci_dev);

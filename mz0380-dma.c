@@ -5,15 +5,15 @@
  *
  *  The card DMAs encoded H.264 frames into host-allocated buffers via a
  *  PCIe iATU outbound window it programs from the physical addresses we
- *  hand it with the buffer-setter mailbox opcodes. It arms on SET_VIC and
- *  signals a finished frame with an EVENT (BAR0+0x30) whose token
+ *  hand it with the buffer-setter mailbox opcodes. SET_VIC configures the
+ *  encoder, START_STREAMING arms it, and a finished frame signals an EVENT
+ *  (BAR0+0x30) whose token
  *  (BAR0+0x40, low 3 bits) names the completed buffer.
  *
- *  FIRST CUT - unverified on hardware. Three things are still open (M17):
- *  whether SET_VIC alone starts frames, the exact frame byte-length
- *  register, and the op->stream mapping. The ISR/drain therefore logs the
- *  candidate status registers and the head of each delivered buffer so a
- *  live run can resolve them.
+ *  The endpoint does not mirror its card-side encoded-byte count to a verified
+ *  host register: BAR0 payload words are packed slot counters, not lengths.
+ *  Delivery therefore snapshots each one-shot event before ACK and infers a
+ *  bounded, aligned extent from a per-buffer poison suffix before copying.
  */
 
 #include <linux/delay.h>	/* msleep() for the SET_VIC -> START_STREAMING gap */
@@ -24,6 +24,18 @@
 
 /* forward */
 static void mz0380_drain_work_fn(struct work_struct *w);
+static void mz0380_enc_stat_ack(struct mz0380_dev *dev);
+static void mz0380_frame_buffer_repoison(struct mz0380_dev *dev, u32 idx);
+
+/* SET_VIC below configures video channel zero; channel_done sets its EVENT bit. */
+#define MZ0380_VIDEO_EVENT_BIT BIT(MZ0380_STREAM_VIDEO_CHANNEL)
+
+#define MZ0380_ENC_VALID_FPS	BIT(0)
+#define MZ0380_ENC_VALID_GOP	BIT(1)
+#define MZ0380_ENC_VALID_BITRATE	BIT(6)
+#define MZ0380_ENC_SAFE_FPS	60
+#define MZ0380_ENC_SAFE_GOP	60
+#define MZ0380_ENC_SAFE_BITRATE	(4 * 1024 * 1024)
 
 int mz0380_dma_ring_alloc(struct mz0380_dev *dev, struct mz0380_ring *r,
 			  u32 nr_entries, u32 entry_size)
@@ -186,10 +198,12 @@ static int mz0380_stream_bufs_alloc(struct mz0380_dev *dev)
 		ret = mz0380_stream_bufs_alloc_iova(dev);
 		if (!ret)
 			return 0;
-		pr_warn("%s: 4GiB-aligned IOVA setup failed (%d) - falling back to dma_alloc_coherent; the card's DMA will NOT reach these buffers (M25/M26)\n",
+		pr_err("%s: 4GiB-aligned IOVA setup failed (%d); refusing to arm unreachable stream buffers\n",
 			dev->name, ret);
+		return ret;
 	}
 
+	/* Explicit diagnostic opt-out; normal hardware requires the IOVA path. */
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
 		dev->stream_bufs[i].va =
 			dma_alloc_coherent(&dev->pci->dev,
@@ -316,10 +330,15 @@ static int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 }
 
 /*
- * MSI ISR. The interrupt cause is the EVENT word (BAR0+0x30): bit11 =
- * command-done (snapshot the mailbox params and wake the command waiter),
- * any other non-zero value = a per-channel frame-done (defer to the drain
- * work). Ack via the standard event ack (INT_FLAG=2, EVENT=0, doorbell 0x400).
+ * MSI ISR. The interrupt cause is the EVENT word (BAR0+0x30).  The central ACK
+ * primitive snapshots command replies and frame payloads together under its
+ * event lock before clearing this one-shot mailbox.
+ *
+ * Frame completion is deliberately not an else branch here.  EVENT may carry
+ * command and frame bits together, and the command-poll path can consume the
+ * same one-shot mailbox without entering this ISR.  mz0380_mb_ack_event()
+ * invokes mz0380_handle_event_snapshot() before every ACK, which is the single
+ * place that snapshots frame TOKEN/PAYLOAD and queues drain work.
  */
 static irqreturn_t mz0380_isr(int irq, void *data)
 {
@@ -331,22 +350,6 @@ static irqreturn_t mz0380_isr(int irq, void *data)
 		return IRQ_NONE;
 
 	atomic_inc(&dev->irq_count);
-
-	if (event & MZ0380_MB_EVENT_CMD_DONE) {
-		unsigned int i;
-
-		dev->cmd_last_status = mz_mmio_read(dev, MZ0380_MB_STATUS);
-		for (i = 0; i < MZ0380_REG_PARAM_MAX; i++)
-			dev->cmd_last_param[i] =
-				mz_mmio_read(dev, MZ0380_MB_PARAM(i));
-		smp_wmb();
-		dev->cmd_complete = true;
-		wake_up_all(&dev->cmd_wait);
-	} else {
-		/* frame-done lane(s) - hand off to the drain worker */
-		atomic_inc(&dev->irq_video_count);
-		schedule_work(&dev->drain_work);
-	}
 
 	mz0380_mb_ack_event(dev);
 	return IRQ_HANDLED;
@@ -380,6 +383,15 @@ int mz0380_irq_request(struct mz0380_dev *dev)
 	dev->msi_enabled = (nvec >= 1) && dev->pci->msi_enabled;
 	dev->irq = pci_irq_vector(dev->pci, 0);
 
+	dev->frame_event_head = 0;
+	dev->frame_event_tail = 0;
+	dev->frame_event_drain_scheduled = false;
+	dev->frame_events_accepting = false;
+	dev->frame_event_ack_deferred = false;
+	dev->frame_event_drop_tokens = 0;
+	dev->frame_event_drops = 0;
+	dev->video_sequence = 0;
+	dev->frame_poison_active = false;
 	INIT_WORK(&dev->drain_work, mz0380_drain_work_fn);
 
 	ret = request_irq(dev->irq, mz0380_isr,
@@ -405,9 +417,9 @@ void mz0380_irq_release(struct mz0380_dev *dev)
 	if (!dev->irq_requested)
 		return;
 
+	mz0380_dma_flush_events(dev);
 	free_irq(dev->irq, dev);
 	pci_free_irq_vectors(dev->pci);
-	cancel_work_sync(&dev->drain_work);
 	dev->irq_requested = false;
 	dev->msi_enabled = false;
 }
@@ -454,6 +466,165 @@ static void mz0380_enc_stat_ack(struct mz0380_dev *dev)
 	wmb();
 }
 
+/*
+ * Snapshot the frame mailbox while it still belongs to @event.  The endpoint
+ * event channel is a one-shot ping-pong: ACK re-arms it and TOKEN/PAYLOAD may
+ * then be overwritten immediately.  This hook is called centrally by
+ * mz0380_mb_ack_event(), not just by the ISR, because command polling can win
+ * the race and ACK a combined CMD_DONE|frame event itself.
+ *
+ * The helper is IRQ-safe and does not sleep.  Before IRQ/work setup and outside
+ * a real stream frame_events_accepting is false, so early firmware ACKs are a
+ * cheap no-op here.
+ */
+void mz0380_handle_event_snapshot(struct mz0380_dev *dev, u32 event)
+{
+	struct mz0380_frame_event snapshot;
+	unsigned long flags;
+	u16 next;
+	bool dropped = false;
+	bool ack_now = false;
+
+	if (!(event & MZ0380_VIDEO_EVENT_BIT) ||
+	    !READ_ONCE(dev->frame_events_accepting))
+		return;
+
+	snapshot.timestamp_ns = ktime_get_ns();
+	snapshot.event = event;
+	snapshot.token = mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN);
+	snapshot.payload[0] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1);
+	snapshot.payload[1] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2);
+	snapshot.payload[2] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3);
+	snapshot.enc_status = mz_mmio_read(dev, MZ0380_MB_ENC_STATUS);
+	/* Pair the endpoint's completion notification with its coherent DMA. */
+	dma_rmb();
+
+	atomic_inc(&dev->irq_video_count);
+
+	spin_lock_irqsave(&dev->frame_event_lock, flags);
+	if (!dev->frame_events_accepting) {
+		dev->frame_event_drops++;
+		dropped = true;
+	} else {
+		next = (dev->frame_event_head + 1) %
+		       MZ0380_FRAME_EVENT_FIFO_SIZE;
+		if (next == dev->frame_event_tail) {
+			dev->frame_event_drops++;
+			dropped = true;
+		} else {
+			dev->frame_events[dev->frame_event_head] = snapshot;
+			dev->frame_event_head = next;
+			if (!dev->frame_event_drain_scheduled) {
+				dev->frame_event_drain_scheduled = true;
+				/*
+				 * Publish and queue atomically with respect to streamoff:
+				 * cancel_work_sync() must not miss a not-yet-queued kick.
+				 */
+				schedule_work(&dev->drain_work);
+			}
+		}
+	}
+	if (dropped) {
+		/*
+		 * Do not free the encoder while an older snapshot is queued or
+		 * being copied: it could immediately reuse and overwrite that
+		 * token.  The drain batch (or streamoff flush) ACKs after all
+		 * older buffers have been consumed/re-poisoned.
+		 */
+		ack_now = !dev->frame_event_drain_scheduled &&
+			  dev->frame_event_head == dev->frame_event_tail;
+		if (!ack_now) {
+			dev->frame_event_ack_deferred = true;
+			if ((snapshot.token & 7) < MZ0380_STREAM_NR_BUFS)
+				dev->frame_event_drop_tokens |=
+					BIT(snapshot.token & 7);
+		}
+	}
+	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
+
+	if (dropped) {
+		if (ack_now)
+			mz0380_enc_stat_ack(dev);
+		pr_warn_ratelimited("%s: frame event dropped before drain (event=%08x token=%08x payload=%08x/%08x/%08x enc=%08x); enc_stat ACK %s\n",
+				    dev->name, snapshot.event, snapshot.token,
+				    snapshot.payload[0], snapshot.payload[1],
+				    snapshot.payload[2], snapshot.enc_status,
+				    ack_now ? "sent" : "deferred until older snapshots drain");
+		return;
+	}
+
+}
+EXPORT_SYMBOL_GPL(mz0380_handle_event_snapshot);
+
+static void mz0380_frame_events_start(struct mz0380_dev *dev)
+{
+	unsigned long flags;
+
+	if (!dev->irq_requested)
+		return;
+
+	/* Flush also resolves an ACK deferred by a full FIFO. */
+	mz0380_dma_flush_events(dev);
+
+	spin_lock_irqsave(&dev->frame_event_lock, flags);
+	dev->frame_event_head = 0;
+	dev->frame_event_tail = 0;
+	dev->frame_event_drain_scheduled = false;
+	dev->frame_event_ack_deferred = false;
+	dev->frame_event_drop_tokens = 0;
+	dev->frame_event_drops = 0;
+	dev->video_sequence = 0;
+	dev->frame_events_accepting = true;
+	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
+}
+
+void mz0380_dma_flush_events(struct mz0380_dev *dev)
+{
+	unsigned long flags;
+	unsigned int pending = 0;
+	unsigned int i;
+	bool ack_deferred;
+	u8 drop_tokens;
+
+	if (!dev->irq_requested)
+		return;
+
+	spin_lock_irqsave(&dev->frame_event_lock, flags);
+	dev->frame_events_accepting = false;
+	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
+
+	/* Process-context API: synchronize before vb2 buffers or DMA memory go away. */
+	cancel_work_sync(&dev->drain_work);
+
+	spin_lock_irqsave(&dev->frame_event_lock, flags);
+	while (dev->frame_event_tail != dev->frame_event_head) {
+		u32 token = dev->frame_events[dev->frame_event_tail].token & 7;
+
+		if (token < MZ0380_STREAM_NR_BUFS)
+			dev->frame_event_drop_tokens |= BIT(token);
+		dev->frame_event_tail = (dev->frame_event_tail + 1) %
+					MZ0380_FRAME_EVENT_FIFO_SIZE;
+		pending++;
+	}
+	dev->frame_event_head = 0;
+	dev->frame_event_tail = 0;
+	dev->frame_event_drain_scheduled = false;
+	ack_deferred = dev->frame_event_ack_deferred;
+	dev->frame_event_ack_deferred = false;
+	drop_tokens = dev->frame_event_drop_tokens;
+	dev->frame_event_drop_tokens = 0;
+	dev->frame_event_drops += pending;
+	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
+
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++)
+		if (drop_tokens & BIT(i))
+			mz0380_frame_buffer_repoison(dev, i);
+
+	if (pending || ack_deferred || drop_tokens)
+		mz0380_enc_stat_ack(dev);
+}
+EXPORT_SYMBOL_GPL(mz0380_dma_flush_events);
+
 /* --- M36 write-extent watch ---------------------------------------------- */
 
 /* M37: poison value is a module param so a collision can be ruled out */
@@ -465,6 +636,54 @@ static inline u8 mz0380_poison_b(void)
 static inline u32 mz0380_poison_w(void)
 {
 	return 0x01010101u * mz0380_poison_b();
+}
+
+static inline u32 mz0380_frame_poison_w(const struct mz0380_dev *dev)
+{
+	return 0x01010101u * dev->frame_poison_byte;
+}
+
+static inline u64 mz0380_frame_poison_q(const struct mz0380_dev *dev)
+{
+	return 0x0101010101010101ULL * dev->frame_poison_byte;
+}
+
+/*
+ * Real H.264 completion uses the untouched poison suffix as the only
+ * host-visible length delimiter.  Re-poisoning happens while enc_stat is still
+ * owned by the host, before its ACK permits the endpoint to reuse the slot.
+ */
+static void mz0380_frame_buffer_repoison(struct mz0380_dev *dev, u32 idx)
+{
+	if (idx >= MZ0380_STREAM_NR_BUFS || !dev->stream_bufs[idx].va ||
+	    !smp_load_acquire(&dev->frame_poison_active))
+		return;
+
+	memset(dev->stream_bufs[idx].va, dev->frame_poison_byte,
+	       MZ0380_STREAM_BUF_SIZE);
+	dev->extent_last[idx] = 0;
+	dma_wmb();
+}
+
+static void mz0380_frame_buffers_poison_start(struct mz0380_dev *dev)
+{
+	unsigned int i;
+
+	/* The diagnostic scanner and per-frame ownership must never race. */
+	mz0380_extent_watch_stop(dev);
+	dev->frame_poison_byte = mz0380_poison_b();
+	WRITE_ONCE(dev->frame_poison_active, false);
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		if (dev->stream_bufs[i].va)
+			memset(dev->stream_bufs[i].va,
+			       dev->frame_poison_byte,
+			       MZ0380_STREAM_BUF_SIZE);
+		dev->extent_last[i] = 0;
+	}
+	dma_wmb();
+	smp_store_release(&dev->frame_poison_active, true);
+	pr_info("%s: real-frame buffers primed with 0x%02x poison; H.264 payload size will be inferred from the bounded changed prefix because firmware does not expose its byte count\n",
+		dev->name, dev->frame_poison_byte);
 }
 
 /*
@@ -636,7 +855,9 @@ static void mz0380_stream_bufs_dump(struct mz0380_dev *dev, const char *tag)
 		 * to the old non-zero test.
 		 */
 		for (off = 0; off < MZ0380_STREAM_BUF_SIZE; off += 4096) {
-			u8 untouched = mz0380_buf_poison ? mz0380_poison_b() : 0x00;
+			u8 untouched = dev->frame_poison_active ?
+				       dev->frame_poison_byte :
+				       (mz0380_buf_poison ? mz0380_poison_b() : 0x00);
 
 			if (p[off] != untouched) {
 				nonzero++;
@@ -679,6 +900,53 @@ static u8 mz0380_timings_fps(const struct v4l2_dv_timings *t)
 }
 
 /*
+ * Windows sends opcode 0x2d as opcode plus ten arguments and waits for its
+ * EVENT completion (PARAM10 overlaps the short-command STATUS word).  The
+ * bundled tinyvenc5 independently verifies the fields selected below:
+ *
+ *   arg0 / card+0x04: validity mask
+ *   arg1 / card+0x08: gop<<24 | fps<<16 | main_or_sub<<8 | channel
+ *   arg3 / card+0x10: bitrate
+ *
+ * Mask bits 0, 1 and 6 select exactly FPS, GOP and bitrate.  Leave profile,
+ * QP and geometry masked out until their userspace enum/range ABI is proven.
+ */
+static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps)
+{
+	u32 enc[10] = { 0 };
+	u32 gop = dev->capture.gop_size;
+	u32 bitrate = dev->capture.bitrate;
+	bool fallback = false;
+	int ret;
+
+	if (!fps || fps > U8_MAX) {
+		fps = MZ0380_ENC_SAFE_FPS;
+		fallback = true;
+	}
+	if (!gop || gop > U8_MAX) {
+		gop = MZ0380_ENC_SAFE_GOP;
+		fallback = true;
+	}
+	if (bitrate < MZ0380_MIN_BITRATE || bitrate > MZ0380_MAX_BITRATE) {
+		bitrate = MZ0380_ENC_SAFE_BITRATE;
+		fallback = true;
+	}
+
+	enc[0] = MZ0380_ENC_VALID_FPS | MZ0380_ENC_VALID_GOP |
+		 MZ0380_ENC_VALID_BITRATE;
+	enc[1] = (gop << 24) | (fps << 16); /* main stream, channel zero */
+	enc[3] = bitrate;
+
+	/* Match Windows' EVENT-wait path; timeout 0 would permit mailbox reuse. */
+	ret = mz0380_send_command(dev, MZ0380_CMD_SET_ENC_PARAMS, enc,
+				  ARRAY_SIZE(enc), NULL, 5000);
+	pr_info("%s: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x%02x, main ch0, fps=%u, gop=%u, bitrate=%u%s) ret=%d\n",
+		dev->name, enc[0], fps, gop, bitrate,
+		fallback ? ", conservative fallback applied" : "", ret);
+	return ret;
+}
+
+/*
  * Start streaming: program the buffer physaddrs into the card, then arm the
  * encoder with SET_VIC_PARAMS (the same op 0x29 path input-select uses). Per
  * M17 the card's own userspace flips its internal enables in response, so no
@@ -686,26 +954,40 @@ static u8 mz0380_timings_fps(const struct v4l2_dv_timings *t)
  */
 int mz0380_dma_start(struct mz0380_dev *dev)
 {
-	u32 params[8] = { 0 };
-	u32 w = dev->capture.width, h = dev->capture.height;
-	bool interlaced = dev->detected_timings.bt.interlaced;
+	u32 params[9] = { 0 };
+	u32 out_w = dev->capture.width, out_h = dev->capture.height;
+	u32 in_w = dev->capture.source_width ?: dev->detected_timings.bt.width;
+	u32 in_h = dev->capture.source_height ?: dev->detected_timings.bt.height;
+	bool interlaced = dev->capture.source_interlaced;
+	u32 fps = dev->capture.source_fps ?:
+		  mz0380_timings_fps(&dev->detected_timings);
 	u32 fmt = interlaced ? 3 : 2;   /* byte6: venc5 H.264, 2=prog 3=interlaced */
+	u32 input_bus = interlaced ? 7 : 6; /* byte7: 6=BT1120p, 7=BT1120i */
+	bool aic_newly_armed = false;
+	bool vic_fired = false;
 	int ret;
 
 	if (!dev->dma_armed)
 		return -ENODEV;
+	if (!in_w)
+		in_w = out_w;
+	if (!in_h)
+		in_h = out_h;
 
 	/*
 	 * SET_VIC_PARAMS 44-byte struct - byte offsets VERIFIED by disassembling
 	 * video_capture_mgr's op-41 handler (RE_FINDINGS.md M23). The mailbox puts
 	 * the opcode at struct[0..3]; our params[i] lands at struct[4+4i..7+4i]
 	 * (params[0]=struct[4..7]). Authoritative field map:
-	 *   [4]=ch  [5]=fps  [6]=fw/format(2 prog|3 interlaced)  [7]=interlace
+	 *   [4]=ch  [5]=fps  [6]=fw/format(2 prog|3 interlaced)
+	 *   [7]=input bus (6 BT1120 progressive | 7 BT1120 interlaced)
 	 *   [8..9]=width  [10..11]=height  [12]=m  [16..19]=color_info
 	 *   [20..21]=x_start  [22..23]=y_start
 	 *   [24..25]=input_frame_width  [26..27]=input_frame_height
 	 *   [28]=bitstream_num(MUST be >=1)  [29]=osd_en  [30]=osd_size
 	 *   [31]=is_nosg  [35]=is_slave  [36..39]=nosg back/y/u/v
+	 * params[8] explicitly clears those final no-signal colour bytes; the
+	 * following struct word is PARAM10/STATUS and is never SET_VIC payload.
 	 * The old M20/M22 packing put input_w/input_h/bitstream_num two bytes early,
 	 * so the firmware read bitstream_num=0 (byte28 unset) and garbage input dims
 	 * -> tinyvenc5 spawned but silent. This is the corrected layout.
@@ -719,18 +1001,25 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * fake-frame generator paced itself, but the real capture path derives
 	 * its frame cadence from it, so send the rate we actually detected.
 	 */
-	params[0] = ((u32)mz0380_timings_fps(&dev->detected_timings) << 8) |
-		    (fmt << 16);                           /* [5]=fps [6]=fw/format */
-	params[1] = ((h & 0xffff) << 16) | (w & 0xffff);   /* [8..9]=w [10..11]=h    */
-	params[5] = ((h & 0xffff) << 16) | (w & 0xffff);   /* [24..25]=in_w [26..27]=in_h */
+	params[0] = (fps << 8) | (fmt << 16) | (input_bus << 24);
+	params[1] = ((out_h & 0xffff) << 16) | (out_w & 0xffff);
+	params[5] = ((in_h & 0xffff) << 16) | (in_w & 0xffff);
 	params[6] = 1u | ((mz0380_stream_nosg ? 1u : 0u) << 24); /* [28]=bitstream_num=1, [31]=is_nosg */
 
+	/* Even a timed-out transaction may already have spawned tinyvenc5. */
+	vic_fired = true;
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
 				  ARRAY_SIZE(params), NULL, 2000);
-	pr_info("%s: stream start: SET_VIC(%ux%u %s H.264, bitstreams=1) ret=%d\n",
-		dev->name, w, h, interlaced ? "i" : "p", ret);
+	if (mz0380_stream_nosg)
+		pr_info("%s: stream start: SET_VIC(synthetic no-signal source %ux%u@%u, bus=BT1120%s; host output is polled NV12, not live HDMI/H.264) ret=%d\n",
+			dev->name, in_w, in_h, fps,
+			interlaced ? "i" : "p", ret);
+	else
+		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u BT1120%s -> H.264 output=%ux%u, bitstreams=1) ret=%d\n",
+			dev->name, in_w, in_h, interlaced ? "i" : "p",
+			fps, interlaced ? "i" : "p", out_w, out_h, ret);
 	if (ret)
-		return ret;
+		goto err_events;
 
 	/*
 	 * SET_VIC only spawns the encoder (via video_capture_mgr) and clears
@@ -746,6 +1035,20 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	msleep(mz0380_start_delay_ms);
 
 	/*
+	 * SET_VIC launches tinyvenc5, but opcode 0x2d is the host-owned encoder
+	 * configuration transaction.  Send it only after tinyvenc5 has consumed
+	 * its mandatory first SET_VIC read.  Its non-zero timeout serializes the
+	 * full-width mailbox packet through the command EVENT before SET_BUF can
+	 * overwrite the shared words.  The NOSG diagnostic emits raw synthetic
+	 * NV12 and deliberately skips H.264 configuration/spawn work.
+	 */
+	if (!mz0380_stream_nosg) {
+		ret = mz0380_stream_configure_encoder(dev, fps);
+		if (ret)
+			goto err_events;
+	}
+
+	/*
 	 * NOW program the buffer physaddrs into channels[] - AFTER the SET_VIC spawn
 	 * settled and BEFORE op6. START(op6) makes vpl_dmac latch channels[] into
 	 * the outbound iATU; doing SET_BUF here (not before SET_VIC) guarantees our
@@ -757,12 +1060,24 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	if (ret) {
 		pr_warn("%s: SET_BUF failed (%d) - frames will not flow\n",
 			dev->name, ret);
-		return ret;
+		goto err_events;
 	}
+	if (!mz0380_stream_nosg)
+		pr_info("%s: SET_BUF_2 provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8\n",
+			dev->name);
 
-	/* M36: poison the buffers and watch the card's write extent live */
-	if (mz0380_buf_poison)
+	/*
+	 * Real H.264 needs an owned poison suffix for bounded length inference.
+	 * NOSG keeps the older live extent diagnostic; its fixed raw size does not
+	 * use the completion FIFO or inferred-length path.
+	 */
+	if (!mz0380_stream_nosg) {
+		mz0380_frame_buffers_poison_start(dev);
+		/* Accept completions only after every token has a poison baseline. */
+		mz0380_frame_events_start(dev);
+	} else if (mz0380_buf_poison) {
 		mz0380_extent_watch_start(dev);
+	}
 
 	/*
 	 * M40: declare every bitstream slot free before the encoder starts.
@@ -784,6 +1099,7 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * the state M30-M32 left us in: data in the buffer, no completion.
 	 */
 	if (mz0380_aic_on && (mz0380_aic_every_frame || !dev->aic_armed)) {
+		bool was_armed = dev->aic_armed;
 		u32 aic[4] = {
 			/* cmd+4 channel_num | cmd+5 mono<<8 | cmd+6 bits<<16 */
 			(mz0380_aic_channels & 0xff) |
@@ -801,8 +1117,13 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 			dev->name, mz0380_aic_channels, mz0380_aic_bits,
 			mz0380_aic_freq, mz0380_aic_period_frames,
 			mz0380_aic_periods, ret);
-		if (!ret)
+		if (!ret) {
 			dev->aic_armed = true;
+			aic_newly_armed = !was_armed;
+		} else {
+			/* Without audio_ready, tinyvenc5 never completes video frames. */
+			goto err_events;
+		}
 	}
 
 	/*
@@ -820,24 +1141,65 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
 		dev->name, ret);
 	dev->stream_head = 0;
+	if (ret)
+		goto err_events;
+	return 0;
+
+err_events:
+	if (!mz0380_stream_nosg)
+		WRITE_ONCE(dev->streaming, false);
+
+	/*
+	 * SET_VIC forks an encoder process before it replies.  Every failure after
+	 * the doorbell therefore owes the card a STOP, including SET_VIC timeout
+	 * itself; otherwise retries permanently consume the small spawn budget.
+	 * Keep NOSG's normal successful stop/respawn loop unchanged--this is only
+	 * the failed-start unwind.
+	 */
+	if (vic_fired) {
+		int stop_ret = mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
+						NULL, 0, NULL, 2000);
+
+		pr_warn("%s: stream start failed (%d) after SET_VIC; best-effort STOP_STREAMING ret=%d\n",
+			dev->name, ret, stop_ret);
+	}
+	if (aic_newly_armed) {
+		u32 aic_off[4] = { 0 };
+		int aic_ret;
+
+		aic_ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS,
+					       aic_off, ARRAY_SIZE(aic_off),
+					       NULL, 2000);
+		pr_warn("%s: failed-start unwind: SET_AIC(on=0) ret=%d\n",
+			dev->name, aic_ret);
+		dev->aic_armed = false;
+	}
+	if (!mz0380_stream_nosg) {
+		mz0380_dma_flush_events(dev);
+		WRITE_ONCE(dev->frame_poison_active, false);
+	}
 	return ret;
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_start);
 
 static void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 {
-	if (verbose) {
-		/* M36: freeze + report the write extents before stopping */
+	if (verbose)
+		/* Freeze the diagnostic reader before changing buffer ownership. */
 		mz0380_extent_watch_stop(dev);
 
+	if (dev->dma_armed)
+		mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
+				    NULL, 0, NULL, 2000);
+
+	if (verbose) {
 		/*
-		 * M30: dump the buffers BEFORE telling the card to stop, and
-		 * the card's status words with them. This is the only view we
-		 * have left now that the DMA no longer faults - successful
-		 * writes are invisible to the IOMMU, so the buffer contents
-		 * are the evidence.
+		 * STOP first, then cancel/drain completion work before inspecting
+		 * memory.  This makes streamoff safe against a worker copying or
+		 * re-poisoning while the diagnostic dump walks the same buffer.
 		 */
-		pr_info("%s: stream stop: EVENT[0x30]=%08x token[0x40]=%08x 0x44=%08x 0x48=%08x 0x4c=%08x enc[0x50]=%08x irqs=%d/%d\n",
+		mz0380_dma_flush_events(dev);
+		pr_info("%s: stream stop: EVENT[0x30]=%08x token[0x40]=%08x 0x44=%08x 0x48=%08x 0x4c=%08x enc[0x50]=%08x irq_total=%d frame_events=%d fifo_drops=%llu\n",
 			dev->name,
 			mz_mmio_read(dev, MZ0380_MB_EVENT),
 			mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN),
@@ -846,13 +1208,11 @@ static void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3),
 			mz_mmio_read(dev, MZ0380_MB_ENC_STATUS),
 			atomic_read(&dev->irq_count),
-			atomic_read(&dev->irq_video_count));
+			atomic_read(&dev->irq_video_count),
+			(unsigned long long)READ_ONCE(dev->frame_event_drops));
 		mz0380_stream_bufs_dump(dev, "stop");
+		WRITE_ONCE(dev->frame_poison_active, false);
 	}
-
-	if (dev->dma_armed)
-		mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
-				    NULL, 0, NULL, 2000);
 }
 
 void mz0380_dma_stop(struct mz0380_dev *dev)
@@ -862,46 +1222,118 @@ void mz0380_dma_stop(struct mz0380_dev *dev)
 EXPORT_SYMBOL_GPL(mz0380_dma_stop);
 
 /*
- * Deliver completed frames. The EVENT told us a frame is ready; the token at
- * BAR0+0x40 names the buffer (low 3 bits). FIRST CUT: we don't yet know the
- * authoritative byte-length register, so we log the candidates + the head of
- * the buffer (H.264 access units start with 00 00 00 01) and deliver using the
- * best length candidate, clamped to the buffer size.
+ * The true encoded-byte count exists in a card-side enc_stat structure, but
+ * ep.ko discards it and exposes only packed slot counters at 0x40/0x44/0x48.
+ * Infer a bounded length from buffer ownership instead: every slot is filled
+ * with a repeated poison dword before the endpoint may use it, and completion
+ * holds enc_stat until this worker copies/drops and re-poisons it.  Scan from
+ * the end for the last changed dword.  A compressed final dword colliding with
+ * the poison can undercount by four bytes (probability 2^-32); unlike the old
+ * 4 MiB fallback, the result is bounded by an observed DMA write boundary.
  */
-void mz0380_dma_drain_video(struct mz0380_dev *dev)
+static int mz0380_infer_frame_length(struct mz0380_dev *dev, u32 idx,
+				     size_t *length)
+{
+	const u64 *qwords;
+	const u32 *dwords;
+	u64 poison_q;
+	u32 poison_w;
+	size_t i;
+
+	*length = 0;
+	if (idx >= MZ0380_STREAM_NR_BUFS || !dev->stream_bufs[idx].va ||
+	    !smp_load_acquire(&dev->frame_poison_active))
+		return -EINVAL;
+
+	qwords = dev->stream_bufs[idx].va;
+	dwords = dev->stream_bufs[idx].va;
+	poison_q = mz0380_frame_poison_q(dev);
+	poison_w = mz0380_frame_poison_w(dev);
+	dma_rmb();
+
+	for (i = MZ0380_STREAM_BUF_SIZE / sizeof(*qwords); i; i--) {
+		size_t dword = (i - 1) * 2;
+
+		if (READ_ONCE(qwords[i - 1]) == poison_q)
+			continue;
+
+		if (READ_ONCE(dwords[dword + 1]) != poison_w)
+			*length = (dword + 2) * sizeof(*dwords);
+		else
+			*length = (dword + 1) * sizeof(*dwords);
+
+		/* No untouched suffix means truncation, not a proven frame end. */
+		if (*length == MZ0380_STREAM_BUF_SIZE)
+			return -ENOSPC;
+		return 0;
+	}
+
+	return -ENODATA;
+}
+
+static bool mz0380_frame_event_pop(struct mz0380_dev *dev,
+				   struct mz0380_frame_event *snapshot)
+{
+	unsigned long flags;
+	bool have_event = false;
+
+	spin_lock_irqsave(&dev->frame_event_lock, flags);
+	if (dev->frame_event_tail != dev->frame_event_head) {
+		*snapshot = dev->frame_events[dev->frame_event_tail];
+		dev->frame_event_tail = (dev->frame_event_tail + 1) %
+					MZ0380_FRAME_EVENT_FIFO_SIZE;
+		have_event = true;
+	}
+	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
+
+	return have_event;
+}
+
+static void
+mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
+			    const struct mz0380_frame_event *snapshot)
 {
 	struct mz0380_vb_buffer *vbuf;
 	unsigned long flags;
-	u32 token, idx, cand0, cand1, cand2, encstat;
+	u32 idx = snapshot->token & 7;
 	u8 *payload;
 	size_t len;
-
-	token   = mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN);
-	cand0   = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1);   /* 0x44 */
-	cand1   = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2);   /* 0x48 */
-	cand2   = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3);   /* 0x4c */
-	encstat = mz_mmio_read(dev, MZ0380_MB_ENC_STATUS);     /* 0x50 */
-	idx     = token & 7;
+	int ret;
 
 	if (idx >= MZ0380_STREAM_NR_BUFS) {
-		pr_info_ratelimited("%s: frame token=0x%08x idx=%u out of range (0x44=%08x 0x48=%08x 0x4c=%08x enc=%08x)\n",
-				    dev->name, token, idx, cand0, cand1, cand2,
-				    encstat);
+		pr_warn_ratelimited("%s: frame dropped: 3-bit token=%08x selects unprogrammed slot %u (only 0..%u are backed; SET_BUF_8 second set not allocated), event=%08x payload=%08x/%08x/%08x enc=%08x\n",
+				    dev->name, snapshot->token, idx,
+				    MZ0380_STREAM_NR_BUFS - 1, snapshot->event,
+				    snapshot->payload[0], snapshot->payload[1],
+				    snapshot->payload[2], snapshot->enc_status);
 		return;
 	}
 
 	payload = dev->stream_bufs[idx].va;
+	if (!payload) {
+		pr_warn_ratelimited("%s: frame dropped: token %u has no DMA buffer; enc_stat ACK follows drain batch\n",
+				    dev->name, idx);
+		return;
+	}
+	if (!READ_ONCE(dev->streaming)) {
+		pr_info_ratelimited("%s: frame token %u arrived during streamoff; dropped, re-poisoned and acknowledged\n",
+				    dev->name, idx);
+		goto repoison;
+	}
 
-	/* length candidate: prefer a plausible non-zero payload word */
-	len = cand0 && cand0 <= MZ0380_STREAM_BUF_SIZE ? cand0 :
-	      cand1 && cand1 <= MZ0380_STREAM_BUF_SIZE ? cand1 :
-	      MZ0380_STREAM_BUF_SIZE;
+	ret = mz0380_infer_frame_length(dev, idx, &len);
+	if (ret || !len || len >= MZ0380_STREAM_BUF_SIZE) {
+		pr_warn_ratelimited("%s: frame dropped: no bounded poison-suffix length (ret=%d event=%08x token=%08x payload counters=%08x/%08x/%08x enc=%08x head=%02x %02x %02x %02x); mailbox counters are not byte lengths\n",
+				    dev->name, ret, snapshot->event, snapshot->token,
+				    snapshot->payload[0], snapshot->payload[1],
+				    snapshot->payload[2], snapshot->enc_status,
+				    payload[0], payload[1], payload[2], payload[3]);
+		goto repoison;
+	}
 
-	pr_info_ratelimited("%s: frame token=0x%08x idx=%u len~%zu head=%02x %02x %02x %02x %02x %02x %02x %02x (0x44=%08x 0x48=%08x 0x4c=%08x enc=%08x)\n",
-			    dev->name, token, idx, len,
-			    payload[0], payload[1], payload[2], payload[3],
-			    payload[4], payload[5], payload[6], payload[7],
-			    cand0, cand1, cand2, encstat);
+	pr_info_ratelimited("%s: frame token %u inferred H.264 length=%zu from 4-byte poison boundary (tail collision risk 2^-32; payload counters %08x/%08x/%08x were not used)\n",
+				    dev->name, idx, len, snapshot->payload[0],
+				    snapshot->payload[1], snapshot->payload[2]);
 
 	spin_lock_irqsave(&dev->buf_lock, flags);
 	vbuf = list_first_entry_or_null(&dev->buf_list,
@@ -909,31 +1341,101 @@ void mz0380_dma_drain_video(struct mz0380_dev *dev)
 	if (vbuf)
 		list_del(&vbuf->list);
 	spin_unlock_irqrestore(&dev->buf_lock, flags);
-
-	if (!vbuf)
-		return;   /* no consumer ready - drop */
+	if (!vbuf) {
+		pr_info_ratelimited("%s: frame token %u length=%zu has no queued vb2 buffer; dropped and re-poisoned\n",
+				    dev->name, idx, len);
+		goto repoison;
+	}
 
 	{
 		void *dst = vb2_plane_vaddr(&vbuf->vb.vb2_buf, 0);
 		size_t plane = vb2_plane_size(&vbuf->vb.vb2_buf, 0);
-		size_t cpy = min(len, plane);
 
-		if (dst)
-			memcpy(dst, payload, cpy);
-		vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, cpy);
+		if (!dst || len > plane) {
+			pr_warn_ratelimited("%s: inferred frame %zu bytes does not fit vb2 plane %zu; buffer failed\n",
+					    dev->name, len, plane);
+			vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, 0);
+			vb2_buffer_done(&vbuf->vb.vb2_buf,
+					VB2_BUF_STATE_ERROR);
+			goto repoison;
+		}
+		dma_rmb();
+		memcpy(dst, payload, len);
+		vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, len);
 	}
 
-	vbuf->vb.vb2_buf.timestamp = ktime_get_ns();
+	vbuf->vb.vb2_buf.timestamp = snapshot->timestamp_ns;
 	vbuf->vb.field = V4L2_FIELD_NONE;
+	vbuf->vb.sequence = dev->video_sequence++;
 	vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 
+repoison:
+	mz0380_frame_buffer_repoison(dev, idx);
+}
+
+void mz0380_dma_drain_video(struct mz0380_dev *dev)
+{
+	struct mz0380_frame_event snapshot;
+	unsigned long event_flags, flags;
+	unsigned int i;
+	bool handled = false;
+
 	/*
-	 * M40: the payload is copied out, so the card's bitstream buffer is
-	 * free again - clear enc_stat, which is the only thing that lets the
-	 * encoder produce another frame (it sets the byte to 1 itself after
-	 * each bitstream DMA and never clears it).
+	 * Keep drain_scheduled asserted until the queue-empty observation and the
+	 * ownership ACK are one transaction.  Merely clearing it in event_pop()
+	 * leaves a window where the ACK can free a token that the pre-ACK hook has
+	 * just snapshotted but this worker has not copied yet.
 	 */
-	mz0380_enc_stat_ack(dev);
+	for (;;) {
+		bool ack_deferred;
+		u8 drop_tokens;
+
+		/*
+		 * Drain/copy/re-poison the complete batch before the one ownership
+		 * ACK.  An overflowed newest event therefore cannot release the
+		 * endpoint early and overwrite an older queued token before its copy.
+		 */
+		while (mz0380_frame_event_pop(dev, &snapshot)) {
+			handled = true;
+			mz0380_drain_frame_snapshot(dev, &snapshot);
+		}
+
+		spin_lock_irqsave(&dev->frame_event_lock, flags);
+		ack_deferred = dev->frame_event_ack_deferred;
+		dev->frame_event_ack_deferred = false;
+		drop_tokens = dev->frame_event_drop_tokens;
+		dev->frame_event_drop_tokens = 0;
+		spin_unlock_irqrestore(&dev->frame_event_lock, flags);
+
+		for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++)
+			if (drop_tokens & BIT(i))
+				mz0380_frame_buffer_repoison(dev, i);
+		handled |= ack_deferred || drop_tokens;
+
+		/*
+		 * The core calls our snapshot hook while holding event_lock, and the
+		 * hook then takes frame_event_lock.  Take the same lock order here so
+		 * no snapshot can sit between the final empty check and the whole-word
+		 * enc_stat ACK.  If an event arrived while we copied/re-poisoned, loop
+		 * without clearing drain_scheduled; schedule_work() coalescing is then
+		 * harmless because this invocation owns the retry.
+		 */
+		spin_lock_irqsave(&dev->event_lock, event_flags);
+		spin_lock(&dev->frame_event_lock);
+		if (dev->frame_event_tail != dev->frame_event_head ||
+		    dev->frame_event_ack_deferred ||
+		    dev->frame_event_drop_tokens) {
+			spin_unlock(&dev->frame_event_lock);
+			spin_unlock_irqrestore(&dev->event_lock, event_flags);
+			continue;
+		}
+		dev->frame_event_drain_scheduled = false;
+		if (handled)
+			mz0380_enc_stat_ack(dev);
+		spin_unlock(&dev->frame_event_lock);
+		spin_unlock_irqrestore(&dev->event_lock, event_flags);
+		return;
+	}
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_drain_video);
 
@@ -982,6 +1484,9 @@ static void mz0380_nosg_deliver(struct mz0380_dev *dev)
 {
 	struct mz0380_vb_buffer *vbuf;
 	unsigned long flags;
+
+	if (!READ_ONCE(dev->streaming))
+		return;
 
 	spin_lock_irqsave(&dev->buf_lock, flags);
 	vbuf = list_first_entry_or_null(&dev->buf_list,
@@ -1097,8 +1602,9 @@ int mz0380_nosg_capture_start(struct mz0380_dev *dev)
 		return PTR_ERR(task);
 	dev->nosg_task = task;
 
-	pr_info("%s: nosg polling capture started (NV12 %ux%u; cadence ~= start_delay_ms + 450 ms per frame - lower start_delay_ms for more fps)\n",
-		dev->name, MZ0380_NOSG_NV12_WIDTH, MZ0380_NOSG_NV12_HEIGHT);
+	pr_info("%s: nosg synthetic/no-signal polling started (NV12 %ux%u generated on-card; not HDMI input; diagnostic path spawns one encoder process per frame and is not real-time)\n",
+		dev->name, MZ0380_NOSG_NV12_WIDTH,
+		MZ0380_NOSG_NV12_HEIGHT);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mz0380_nosg_capture_start);

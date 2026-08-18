@@ -1,22 +1,13 @@
 /*
  *  Driver for MZ0380 based capture cards.
  *
- *  ALSA HDMI audio capture.
+ *  Experimental ALSA HDMI audio scaffold.
  *
- *  The card extracts PCM from the HDMI input (audio sample rate is
- *  derived on the card from the HDMI dot-clock; see the Windows .sys
- *  string "GetHDMIDotClock => audio sample freq = %d"). PCM samples
- *  land in dev->audio_ring; each ring entry is one ALSA period.
- *
- *  Design: a single capture substream, S16_LE stereo, with the buffer
- *  pages aliased onto the DMA-coherent audio ring. We expose a small
- *  set of sample rates (32k/44.1k/48k) - the card auto-selects based
- *  on the source; mismatched user setting is corrected silently by
- *  resampling on the card side.
- *
- *  Skeleton-quality: hook up snd_pcm + ring drain, defer fine-grained
- *  underrun handling and rate negotiation until the actual ring
- *  format is verified.
+ *  The card can extract PCM from HDMI, but the host address, ownership and
+ *  completion protocol for that PCM is not yet proven.  dev->audio_ring is
+ *  therefore never allocated or programmed and enable_audio remains off by
+ *  default.  SET_AIC in the video path is separate: it releases tinyvenc's
+ *  audio_ready gate and is required even when no ALSA device is registered.
  */
 
 #include "mz0380.h"

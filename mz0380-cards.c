@@ -101,6 +101,18 @@ int mz0380_card_setup(struct mz0380_dev *dev)
 	}
 
 	/*
+	 * These boards have one physical capture connector: HDMI is V4L2 input
+	 * zero.  BAR5 property 201 survives warm reloads, so merely inheriting its
+	 * previous value can leave the VIC routed to an unrelated front end while
+	 * the MST3367 is correctly receiving HDMI.  Select the route explicitly
+	 * before releasing the receiver and raising HPD.
+	 */
+	ret = mz0380_request_input_select(dev, 0, "HD60 Pro bring-up");
+	if (ret)
+		pr_warn("%s: could not select the HDMI VIC route (%d)\n",
+			dev->name, ret);
+
+	/*
 	 * Release the MST3367 from reset and apply its init now (non-fatal if the
 	 * firmware is not ready yet). This wakes the HDMI input at probe; a later
 	 * VIDIOC_QUERY_DV_TIMINGS re-runs it lazily if it was skipped here.
