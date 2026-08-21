@@ -7928,3 +7928,141 @@ the VIC: SET_VIC geometry, the receiver's BT1120 output, and the GPIO/reset
 lines. The geometry gate above makes the first of those newly interesting - not
 as a drop cause (it would drop frame 1 too) but because `cfg[ch]+0x0c/0x0e` are
 the only host-settable values the source layer actually reads.
+
+## M139 (hardware, 2026-08-21): the encoder never reported a single frame - `store_channel_done` has never run
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+
+    stream start: frame-token sentinel a5a5a5a5 seeded into BAR0 40/44/48/4c;
+                  readback a5a5a5a5/a5a5a5a5/a5a5a5a5/a5a5a5a5
+    producer watch: baseline 40=a5a5a5a5 44=a5a5a5a5 48=a5a5a5a5
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+    poll-drain stopped after 1 deliveries, 0 kicks; producer watch saw 0 change(s),
+                  final 40=a5a5a5a5 44=a5a5a5a5 48=a5a5a5a5
+    stream stop: EVENT[0x30]=00000000 token[0x40]=a5a5a5a5 0x44=a5a5a5a5
+                 0x48=a5a5a5a5 0x4c=a5a5a5a5 enc[0x50]=00000000
+                 irq_total=6 frame_events=0 fifo_drops=0
+
+**The sentinel is intact in all four registers after 56 seconds of streaming.**
+The readback line proves BAR0 0x40 is host-writable, so the test is valid, and
+`store_channel_done()` read-modify-writes one nibble per channel into exactly
+these words *before* its credit test - so a single call would have left
+`a5a5a5a0`.
+
+### `store_channel_done()` has never run. Not once. Video or audio.
+
+That is stronger than M138's reading and it corrects it. M138 concluded
+"`encode_handler` writes `channel_done` once and then blocks". It **never
+writes it at all**:
+
+- `token[0x40]` = sentinel: no video channel ever reported.
+- `token[0x4c]` = sentinel: no audio channel ever reported either.
+- `enc[0x50] = 0`: per M40 the card writes 1 there after DMAing a bitstream.
+  It never did. **The H.264 encoder produced nothing.**
+- `frame_events = 0` with `irq_total = 6`: the six interrupts are command
+  completions, every one of which the host ACKed. The completion credit was
+  therefore restored repeatedly and was available; nothing was waiting to use
+  it. The accumulator argument closes the last hole - a frame bit parked in
+  `state[0x634]` would have ridden out on the next raised EVENT, and none ever
+  carried one.
+
+### And yet one full, real frame reached buffer 0
+
+3110400 bytes of correctly-coloured planar I420, landing ~1.2 s after
+START_STREAMING, with **no** `channel_done`, **no** `enc_stat`, and **no**
+EVENT. Buffers 1, 2 and 3 were never touched (`0/1024 sampled pages`).
+
+So the frame this project has been calling "the capture" since M129 does not
+come from the SDK's frame path at all. `channel_done` is that path's only
+notification and it never fired. The pixels arrive over `vpl_dmac`'s PCIe
+outbound transfer - `pcie_set_outbound` is exported by `ep.ko` and
+**`vpl_dmac.ko` is its only importer**, called from `VPL_DMAC_StartTail`
+(0xc94) and re-armed from `VPL_DMAC_ISRTail` (0xf70). One transfer completed
+and the chain was never re-armed.
+
+### `encode_handler` IS running - it is parked with zero frames received
+
+The thread is not missing. `EncodingGroup::init_func` (0x109cc) creates it
+**unconditionally**:
+
+    10a98  mov  r3, #1
+    10a9c  strb r3, [r5,#0x38]        <- the run flag encode_handler tests at 0x12f04
+    10aa8  ldr  r2, =0x12b00           encode_handler
+    10ab0  bl   pthread_create@plt
+
+(`fake_frame_process` is the *other* create, at 0x10c08, and it is the gated
+one - that is the splash `fake_frame_off=1` suppresses.)
+
+So the thread exists, its run flag is set, and M138 established that the first
+call of every loop iteration is `SSM_ReleaseAndReceive`. Combining that with
+the sentinel: **`encode_handler` never got past its first `SSM_ReleaseAndReceive`,
+because the SSM ring was never fed.** `img_handler` published **zero** frames -
+not one, not one-then-stop.
+
+`img_handler` publishes zero frames in exactly two cases (M138 enumerated its
+only two early-outs):
+
+1. it is never called - the VIC delivers nothing to `libtk_video_capture`'s
+   `process()` loop, which then spins on `VideoCap_Sleep` timeouts forever; or
+2. its **width gate** rejects every frame:
+   `VIC_Get.width != Tiny_Set.width` -> drop, silently, with the banner going
+   to a console we cannot read.
+
+### Why (2) is now the leading candidate, and why M76/M127g did not test it
+
+`Tiny_Set.width` is `cfg[ch]+0x0c`, read once by `EncodingGroup::Start`
+(0x11014) and fed by the card's cfg patcher from **SET_VIC bytes 8..9** - the
+`width` field, which the driver has always filled from the v4l2 capture width,
+1920. It has never been settable on its own.
+
+M76 and M127g both swept **3840**, but through `vic_in_w` - SET_VIC bytes
+24..27 - which is the VIC's own width *register* and **not** the value the gate
+compares. The gate's input has never been moved.
+
+Three independent things point at 3840:
+
+- **BANK0 `0xb0 = 0x21`** - M100 decoded bit0 = embedded sync, bit2 = 10/8-bit.
+  0x21 is embedded-sync **8-bit** BT1120, so a 1920-pixel line crosses the bus
+  as 3840 8-bit samples.
+- **The receiver's own detect flaps by exactly a factor of two**: this run
+  logged `hper=674 vper=599 lines=1125` and `hper=337 vper=299 lines=1127`
+  alternately, both at `55=7f LOCKED coherent`. Two clock domains, 2:1.
+- M100 already established that **embedded sync is required** for VIC init
+  (`0x20`/`0x14`, external sync, render nothing at all), so the 8-bit
+  double-rate framing is not optional - it is the only mode that works.
+
+### The test, and how to run it without an overrun
+
+`vic_out_w` / `vic_out_h` now override SET_VIC bytes 8..9 / 10..11
+independently of the v4l2 format (default 0 = use the capture geometry).
+
+**Width alone would overrun.** The cfg patcher rewrites every 1920-valued line,
+so the card would capture 3840x1080 = 6220800 bytes into a 4 MiB buffer - the
+exact overrun that produced every IOMMU fault from M26 to M29. Halving the
+height compensates: 3840 x 540 x 3/2 = **3110400 bytes**, identical to today,
+so the buffer, the SET_BUF geometry and `mz0380_infer_frame_length()`'s
+hardcoded `w*h*3/2` all stay correct.
+
+```bash
+sudo POLLDRAIN=20 EXTRA="vic_out_w=3840 vic_out_h=540" ./mz0380-m55-real-capture.sh 5
+```
+
+Only the width is compared (`img_handler` reads bss offset 0; offset 2, the
+height, appears in the drop banner only), so this moves one gate input and
+nothing else the gate can see.
+
+    token[0x40] leaves a5a5a5a5   -> the gate was not the blocker; the VIC is not
+                                     calling img_handler at all, and the target is
+                                     vpl_vic's ISR / VideoCap_Sleep.
+    token[0x40] becomes a5a5a5aN  -> the gate WAS the blocker. The encoder is
+                                     running. Then walk the width back toward the
+                                     true value and fix the geometry properly.
+
+### Method note
+
+The first producer-watch run reported "0 changes, final 40/44/48 = 0" and that
+was **not** evidence of anything: `store_channel_done` writes `report[N] - 1`,
+so a single report of buffer 1 writes zero over a register that was already
+zero. The sentinel is what made the measurement mean something. Method rule 1
+again - a null result is only informative once every other value in it is known
+to be distinguishable.

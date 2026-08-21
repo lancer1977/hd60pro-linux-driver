@@ -1222,6 +1222,16 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	if (mz0380_vic_saturation != MZ0380_VIC_SATURATION_UNSET)
 		params[3] = (params[3] & ~0x00ff0000u) |
 			    ((mz0380_vic_saturation & 0xff) << 16);
+	/*
+	 * M139: bytes 8..9 / 10..11.  The cfg patcher turns these into the
+	 * card's capture geometry AND into m_vic_width, which is the value
+	 * img_handler's frame gate tests.  Overridable so the gate can be
+	 * moved without moving the v4l2 format.
+	 */
+	if (mz0380_vic_out_w)
+		out_w = mz0380_vic_out_w;
+	if (mz0380_vic_out_h)
+		out_h = mz0380_vic_out_h;
 	params[1] = ((out_h & 0xffff) << 16) | (out_w & 0xffff);
 	/*
 	 * M76: bytes 24..27 are the VIC's own width/height register, patched

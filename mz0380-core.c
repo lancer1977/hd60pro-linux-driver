@@ -337,6 +337,39 @@ MODULE_PARM_DESC(kick_opcode,
  * registers; store_channel_done() only read-modify-writes one nibble per
  * channel into them.  Set 0 to leave them alone.
  */
+/*
+ * M139: SET_VIC bytes 8..9 / 10..11 overrides.
+ *
+ * These are the bytes the card's cfg patcher (video_capture_mgr 0xa290)
+ * rewrites every 1920- and 1080-valued cfg line with, which is where
+ * EncodingGroup::Start reads m_vic_width from - and m_vic_width is the ONE
+ * value libtkmf_video_source's img_handler compares the VIC's own measured
+ * width against before it will publish a frame (M138).  A mismatch drops
+ * every frame silently, which is exactly the state M139 measured.
+ *
+ * They have never been settable independently of the v4l2 capture geometry.
+ * The point of splitting them out is the 8-bit double-rate reading: BANK0
+ * 0xb0 = 0x21 is embedded-sync 8-bit BT1120, so a 1920-wide picture crosses
+ * the bus as 3840 8-bit samples, and the receiver's own detect flaps between
+ * hper=674 and hper=337 - a factor of two.  If the VIC measures 3840, 1920
+ * can never match.
+ *
+ * Pair 3840 with height 540 to keep w*h*3/2 at 3110400 bytes: the cfg patcher
+ * rewrites both, so the frame stays exactly the size of the existing 4 MiB
+ * buffer and mz0380_infer_frame_length()'s hardcoded want. Changing width
+ * alone would make the card write 6220800 bytes into a 4 MiB buffer, which is
+ * the overrun that caused every IOMMU fault from M26 to M29.
+ */
+unsigned int mz0380_vic_out_w;
+module_param_named(vic_out_w, mz0380_vic_out_w, uint, 0644);
+MODULE_PARM_DESC(vic_out_w,
+		 "M139: SET_VIC bytes 8..9 override - the width img_handler's frame gate compares the VIC's measurement against. 0 = use the v4l2 capture width (def:0). Pair 3840 with vic_out_h=540 to keep the frame 3110400 bytes.");
+
+unsigned int mz0380_vic_out_h;
+module_param_named(vic_out_h, mz0380_vic_out_h, uint, 0644);
+MODULE_PARM_DESC(vic_out_h,
+		 "M139: SET_VIC bytes 10..11 override. 0 = use the v4l2 capture height (def:0)");
+
 unsigned int mz0380_token_seed = 0xa5a5a5a5;
 module_param_named(token_seed, mz0380_token_seed, uint, 0644);
 MODULE_PARM_DESC(token_seed,
