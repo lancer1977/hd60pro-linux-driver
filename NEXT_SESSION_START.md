@@ -376,42 +376,77 @@ applies retroactively to M76 and every other width sweep in `RE_FINDINGS.md`.
 The cfg also documents the enums inline: output format `1:YUV420 2:YUV422`,
 input format `6:BT1120p 7:BT1120i`. `in_fmt=6` is confirmed right.
 
-### Ranked next steps
+### START HERE: run the Windows ordering. One spawn, three distinguishable answers.
 
-Everything host-side that touches *reporting* is now proven irrelevant - it is
-all downstream of a capture that only ever happens once. Aim upstream.
+```bash
+sudo POLLDRAIN=20 EXTRA="win_seq=1" ./mz0380-m55-real-capture.sh 5
+```
 
-1. **Read `vpl_vic.ko`'s buffer lifecycle. Free, and it is the whole question.**
-   The re-arm path is `VideoCap_ReleaseBufVIC` = `ioctl(fd, 0x4004e304, idx)`,
-   dispatched at **vpl_vic 0x29d4** (the tree builds the constant inline from
+**Why this and not more RE.** Windows streams continuously off this exact card
+with the exact same on-card firmware - the card boots its own flash, so nothing
+about it differs between hosts. Whatever makes the VIC capture more than once is
+therefore in the host->card sequence, and that sequence is already decoded.
+`win_seq=1` assembles it, and every field inside it is byte-matched from
+M82/M127/M128:
+
+1. pre-**STOP** (op 0x07, all channels). Windows precedes *every*
+   reconfiguration with this; we have only ever sent STOP on the unwind path.
+2. **1900 ms settle** (`stop_settle_ms`, default 1900 - Windows measures
+   1.84-1.91 s between that stop and the SET_VIC that follows).
+3. **SET_BUF first** (`win_bufs_first`, default true). Windows registers its
+   capture buffers when the pin opens, i.e. before the reconfiguration.
+4. SET_VIC -> SET_AIC -> 0x2d -> 0x31.
+5. **No op 0x06.** Windows never sends START_STREAMING on the capture path;
+   ep.ko routes 0x2d and 0x31 to the same bare `sysfs_notify("epint")` that
+   0x06 performs, so the tail *is* the kick. (`win_start_op6=1` adds it back.)
+
+**It has never been run.** Until M135a the `0x31` in this path carried
+`post_mask=0x1f`, which truncates the DMA to 16 bytes and made the whole
+ordering unscoreable - that is the entire content of M90/M91's "win_seq renders
+nothing". Mask is 0 by default since M131.
+
+**Read the result off `token[0x40]`, not off the frame count.** The M139
+sentinel turned the card's own encoder into a host-visible oracle that is
+independent of the DMA, the notification path and the poll-drain:
+
+| `token[0x40]` at stop | meaning |
+|---|---|
+| moves off `a5a5a5a5` | **The encoder ran.** The Windows ordering is the fix. Chase cadence from there with a live pipeline instead of a dead one. |
+| `a5a5a5a5`, 0 frames | Ordering is not it, and the no-0x06 variant is eliminated with it. Retry once with `win_seq=1 win_start_op6=1` before abandoning. |
+| `a5a5a5a5`, 1 frame | Same one-shot as baseline; ordering is neutral. Host-side is then genuinely exhausted - go to step 2. |
+
+### Then, in order
+
+2. **`vpl_vic.ko`'s buffer lifecycle - free, but only worth it after step 1.**
+   The release path is `VideoCap_ReleaseBufVIC` = `ioctl(fd, 0x4004e304, idx)`,
+   dispatched at **vpl_vic 0x29d4** (the tree builds that constant inline from
    the pooled `0x4020e305`, which is why grepping for `4004e304` finds nothing).
-   `libtk_video_capture`'s `process()` calls it after every callback. Find what
-   it requeues and what the ISR (0xfd8) needs to see before it will set
-   `frame_ready` at `[r8,#0x4c]` and `__wake_up` (0x1788/0x17a8) a second time.
-   The arming logic at ISR 0x1040-0x1058 - bit 8 of the per-channel control
-   register at `[r2,#0x10]`, plus status bits 1/2/4 - is where a one-shot would
-   live.
+   It dequeues from the file's list and decrements a per-buffer refcount at
+   `[buf+0x64]`; the `[file+0x1c]==1` branch at 0x4754 is the *force-release*
+   path (it matches libvideocap's "[yuan][Sleep] Force Release Done"), not the
+   normal one. The ISR's ready gate is `[chan+0x1c]`, set to **0xffff** by the
+   `0x4028e302` setup ioctl at 0x3394.
+   **Warning from experience:** `+0x1c` is a generic offset reused across a
+   dozen structs in this module and there is no VIC register datasheet in the
+   tree. This search did not converge in one sitting. Time-box it.
 
-2. **A second capture may need a buffer the card never gets back.** The VIC
-   ring is card-side, but SET_BUF gives it the host's four addresses. If the
-   card treats a host buffer as still-owned until something acknowledges it,
-   that acknowledgement is host-side and we have never sent it. `enc_stat` is
-   the *encoder's* handshake (M40) and the encoder never ran; the DMAC's is a
-   different one. Look for it in `ep.ko`'s `livectrl` ioctl and `epint_store`.
+3. **`out_fmt` / `fw`.** The card's own cfg documents the enum inline -
+   `output format (1:YUV420, 2:YUV422)` - but M79 found SET_VIC byte 12 never
+   reaches the cfg (vcm passes it on tinyvenc's argv) and M82 settled it as a
+   fractional-rate flag Windows sends 0 for. The cfg's output format comes from
+   byte 6 (`fw`), where M88 established 5 is the only value that works. Both
+   already worked; listed so nobody re-derives them.
 
-3. **Do NOT sweep SET_VIC geometry again** without first working out how to hold
-   the ISP allocation fixed. See the method rule above.
+4. **Possible mirror.** The "Boss" logo at top-left of
+   `m130-colour-correct-frame.raw` looks mirrored. Check against the physical
+   scene before touching `mirror`/`flip` - the camera may simply be pointed
+   that way.
 
-4. **`win_seq=1 post_mask=0`, one spawn.** Still untested and still unblocked by
-   M135a. Cheap, and it is the last untried ordering.
-
-5. **Possible mirror.** The "Boss" logo at top-left of `m130-colour-correct-frame.raw`
-   looks mirrored. Check against the physical scene before touching
-   `mirror`/`flip` - the camera may simply be pointed that way.
-
-Dropped for good: **every remaining completion/reporting handshake** (credit,
-enc_stat, kicks, `vic_int_mode`, EVENT), and **`fw=6` as a capture fix**. The
-reporting path is proven correct end to end and is not reached.
+**Do NOT** sweep SET_VIC geometry again without first solving the ISP-allocation
+problem (see the method rule above), and do NOT spend another spawn on any
+completion or reporting handshake - credit, `enc_stat`, kicks, `vic_int_mode`,
+EVENT. All of them are downstream of a capture that only ever happens once, and
+M138/M139 proved the reporting path correct end to end and never reached.
 
 ## Tools
 
