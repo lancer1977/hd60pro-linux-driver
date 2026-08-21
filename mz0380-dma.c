@@ -1776,11 +1776,50 @@ static int mz0380_poll_drain_thread(void *data)
 	unsigned long next_kick = jiffies;
 	unsigned int delivered = 0;
 	unsigned int kicks = 0;
+	u32 tok[3] = {};
+	bool tok_seeded = false;
+	unsigned int tok_changes = 0;
 
 	while (!kthread_should_stop()) {
 		bool handled = false;
 		bool kick_due = false;
 		unsigned int idx;
+
+		/*
+		 * M138: the producer watch.  BAR0 0x40/0x44/0x48 are updated by
+		 * the card's store_channel_done() before its credit test, so
+		 * they advance on every card-side frame completion even when no
+		 * EVENT is raised.  Until now they were only sampled from
+		 * mz0380_handle_event_snapshot(), which never runs after the
+		 * first frame - so nobody has ever watched them over time.
+		 *
+		 *   stays put  -> the encoder wrote channel_done ONCE and is
+		 *                 parked in SSM_ReleaseAndReceive; the card's
+		 *                 producer is stalled, upstream of tinyvenc5.
+		 *   ticks      -> the producer is fine and the loss is ours.
+		 *
+		 * Three MMIO reads per poll interval, no mailbox traffic, no
+		 * I2C: this cannot perturb capture the way M74's watch did.
+		 */
+		if (READ_ONCE(dev->streaming)) {
+			u32 now[3];
+
+			now[0] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD0);
+			now[1] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1);
+			now[2] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2);
+
+			if (!tok_seeded) {
+				tok_seeded = true;
+				pr_info("%s: producer watch: baseline 40=%08x 44=%08x 48=%08x\n",
+					dev->name, now[0], now[1], now[2]);
+			} else if (memcmp(now, tok, sizeof(tok))) {
+				tok_changes++;
+				pr_info("%s: producer watch: change #%u 40=%08x 44=%08x 48=%08x (was %08x/%08x/%08x)\n",
+					dev->name, tok_changes, now[0], now[1],
+					now[2], tok[0], tok[1], tok[2]);
+			}
+			memcpy(tok, now, sizeof(tok));
+		}
 
 
 		for (idx = 0; idx < MZ0380_STREAM_NR_BUFS; idx++) {
@@ -1912,8 +1951,9 @@ static int mz0380_poll_drain_thread(void *data)
 					   mz0380_poll_drain_ms));
 	}
 
-	pr_info("%s: poll-drain stopped after %u deliveries, %u kicks (op 0x%02x)\n",
-		dev->name, delivered, kicks, mz0380_kick_opcode & 0xff);
+	pr_info("%s: poll-drain stopped after %u deliveries, %u kicks (op 0x%02x); producer watch saw %u change(s), final 40=%08x 44=%08x 48=%08x\n",
+		dev->name, delivered, kicks, mz0380_kick_opcode & 0xff,
+		tok_changes, tok[0], tok[1], tok[2]);
 	return 0;
 }
 

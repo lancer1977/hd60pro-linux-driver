@@ -95,6 +95,21 @@
 #define MZ0380_MB_PARAM(i)             (0x04 + ((i) * 4)) /* i=0 -> opcode slot   */
 #define MZ0380_MB_STATUS               0x2c    /* bit0 = command done             */
 #define MZ0380_MB_EVENT                0x30    /* interrupt/event status word      */
+/*
+ * M138: these four are written by ep.ko's store_channel_done() - the sysfs
+ * attribute the CARD's encoder thread writes when it finishes a frame - and
+ * they are written UNCONDITIONALLY, before the completion-credit test that
+ * decides whether an EVENT is raised at all.  Each holds one nibble per
+ * channel taken from the encoder's 24-byte report:
+ *
+ *   0x40 <- report[1] - 1     0x44 <- report[2] - 1
+ *   0x48 <- report[3] - 1     0x4c <- report[4] - 1  (audio channels)
+ *
+ * So they tick on every card-side frame completion whether or not the host
+ * ever hears about it, which makes them the only host-visible proof that the
+ * card's producer is still running.  The poll-drain watches 0x40/0x44/0x48
+ * for exactly that reason.
+ */
 #define MZ0380_MB_EVT_PAYLOAD0         0x40    /* event payload words (DPC args)   */
 #define MZ0380_MB_EVT_PAYLOAD1         0x44
 #define MZ0380_MB_EVT_PAYLOAD2         0x48
