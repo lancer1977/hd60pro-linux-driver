@@ -1,14 +1,15 @@
 # NEXT SESSION START
 
 _Last updated 2026-08-21. Full history in **RE_FINDINGS.md**; the most recent
-milestones are **M129 - the card captures real video** and **M138 - the
-producer chain read end to end**. This file is the handoff only. Everything
+milestones are **M129 - the card captures real video** and **M140 - the VIC
+captures exactly one frame, which explains everything else**. This file is the handoff only. Everything
 below was verified on hardware unless it says otherwise._
 
 **If you read one thing:** the "no signal" story that dominated this project was
-wrong (`## STATE after M129`), and the surviving one-frame defect is **on the
-card, upstream of tinyvenc5** (`## Where to go next`). No host-side handshake
-remains untried or unexplained.
+wrong (`## STATE after M129`), and the surviving defect is **the card's VIC
+captures a single frame and stops** (`## Where to go next`). The card's encoder
+has never reported a frame at all, and the one frame that reaches the host does
+not come from the SDK's frame path.
 
 ---
 
@@ -328,48 +329,89 @@ be what kills frame 2 while letting frame 1 through. But `cfg[ch]+0x0c/0x0e` are
 now known to be the **only** host-settable values the source layer reads at all,
 which is what makes SET_VIC geometry worth a look.
 
+### M139/M140 settled it further - read this before planning anything
+
+**`store_channel_done()` has never run.** A sentinel seeded into BAR0
+0x40/0x44/0x48/0x4c survived 56 s of streaming untouched, with the readback line
+proving the registers are host-writable. No video channel and no audio channel
+has ever reported a frame. `enc[0x50]=0` says no bitstream was ever DMA'd
+either. M138's "writes once then blocks" is **wrong**: `encode_handler` never
+writes at all.
+
+`encode_handler` is nonetheless alive - `EncodingGroup::init_func` creates it
+unconditionally at **0x10ab0**, with its run flag set one instruction earlier at
+0x10a9c. (The gated `pthread_create` at 0x10c08 is `fake_frame_process`, the
+splash.) So it is parked on its first `SSM_ReleaseAndReceive`, having received
+zero frames.
+
+**The single frame that reaches the host is not from the SDK's frame path at
+all.** It arrives with no `channel_done`, no `enc_stat` and no EVENT, over
+`vpl_dmac`'s PCIe outbound transfer (`ep.ko` exports `pcie_set_outbound`;
+`vpl_dmac.ko` is its only importer, `VPL_DMAC_StartTail` 0xc94 /
+`VPL_DMAC_ISRTail` 0xf70).
+
+**One model explains every observation, and nothing else needs to be true: the
+card's VIC captures a single frame and stops.** `img_handler`'s *first* call is
+the init path - `SSM_Writer`, a prime `SSM_DeliverAndAllocate` with a NULL
+descriptor that does not advance `wr_idx`, `TK_ImgProc_Init`, return - so it
+publishes nothing. With no second call the ring stays empty forever, the encoder
+parks, `channel_done` never fires, and the one captured frame is pushed to the
+host by the DMAC. Buffers 1-3 are never touched because there was never a second
+capture.
+
+### HARD METHOD RULE, new and expensive: SET_VIC geometry is never one variable
+
+`re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg` - the card's own capture
+config, in the tree - has **twelve lines valued 1920 and twelve valued 1080**:
+maximum frame w/h (the ISP allocation), captured frame w/h, input frame w/h, and
+nine AE HardwareCtl window w/h pairs. `video_capture_mgr`'s patcher rewrites
+every one of them blindly.
+
+So `vic_out_w=3840 vic_out_h=540` (M140) did not move `img_handler`'s gate
+input; it moved the ISP allocation and all nine auto-exposure windows too, and
+the capture path did not come up at all - **zero** frames, one worse than
+baseline. That result says nothing about the gate, and the same objection
+applies retroactively to M76 and every other width sweep in `RE_FINDINGS.md`.
+
+The cfg also documents the enums inline: output format `1:YUV420 2:YUV422`,
+input format `6:BT1120p 7:BT1120i`. `in_fmt=6` is confirmed right.
+
 ### Ranked next steps
 
-1. **Distinguish parked from dead, one spawn.** `encode_handler`'s two exits
-   differ observably: on a clean exit (run flag cleared, reader NULL, or
-   `SSM_ReleaseAndReceive < 0`) it **`close()`s the `channel_done` fd** at
-   0x12fc0 and releases both `TK_MMA` handles; while merely starved it holds
-   them open. Anything the host can read that reflects the card's fd/handle
-   state separates "the encoder died" from "the encoder is waiting", and only
-   the second sends us to the VIC. Check what `epint_show` / the `/sys` mirrors
-   expose before spending the spawn.
+Everything host-side that touches *reporting* is now proven irrelevant - it is
+all downstream of a capture that only ever happens once. Aim upstream.
 
-2. **SET_VIC geometry as the source-layer lever.** Bytes 8..11 are already known
-   to drive captured geometry (M127's cfg-patcher finding). They are now also
-   known to be the values `img_handler` compares against. A run where
-   `Tiny_Set != VIC_Get` should deliver **zero** frames, not one - so a
-   deliberate mismatch is a cheap positive control that proves the source layer
-   is alive and being called repeatedly. If a mismatched run still delivers
-   exactly one frame, `img_handler` is not being called at all and the VIC is
-   confirmed dead after frame 1.
+1. **Read `vpl_vic.ko`'s buffer lifecycle. Free, and it is the whole question.**
+   The re-arm path is `VideoCap_ReleaseBufVIC` = `ioctl(fd, 0x4004e304, idx)`,
+   dispatched at **vpl_vic 0x29d4** (the tree builds the constant inline from
+   the pooled `0x4020e305`, which is why grepping for `4004e304` finds nothing).
+   `libtk_video_capture`'s `process()` calls it after every callback. Find what
+   it requeues and what the ISR (0xfd8) needs to see before it will set
+   `frame_ready` at `[r8,#0x4c]` and `__wake_up` (0x1788/0x17a8) a second time.
+   The arming logic at ISR 0x1040-0x1058 - bit 8 of the per-channel control
+   register at `[r2,#0x10]`, plus status bits 1/2/4 - is where a one-shot would
+   live.
 
-3. **`win_seq=1 post_mask=0`, one spawn.** Unchanged from M137's list and still
-   untested. M135a completed the mask bisect: bit 0 (skip) truncates because it
-   makes tinyvenc5 skip `tiny_calculate_skip_fps()`; **die_en (bit 4) is safe**
-   (`post_mask=0x10` gives a full frame). So `win_seq=1` "renders nothing"
-   (M90/M91) only because it sends `0x31` with mask 0x1f. The Windows ordering
-   is now testable.
+2. **A second capture may need a buffer the card never gets back.** The VIC
+   ring is card-side, but SET_BUF gives it the host's four addresses. If the
+   card treats a host buffer as still-owned until something acknowledges it,
+   that acknowledgement is host-side and we have never sent it. `enc_stat` is
+   the *encoder's* handshake (M40) and the encoder never ran; the DMAC's is a
+   different one. Look for it in `ep.ko`'s `livectrl` ioctl and `epint_store`.
 
-4. **`out_fmt`.** SET_VIC byte 12 is the output format and we still send **0**,
-   which M72 flagged as not a legal value - the card falls back to the cfg. Now
-   that the picture is right, setting it deliberately is worth one spawn.
-   **Warning:** `fw=6`/YUY2 makes frames 4:2:2 = 4147200 bytes and
-   `mz0380_infer_frame_length`'s `want` is hardcoded `w*h*3/2`; fix that first
-   or poll-drain will never see a complete frame.
+3. **Do NOT sweep SET_VIC geometry again** without first working out how to hold
+   the ISP allocation fixed. See the method rule above.
 
-5. **Possible mirror.** The "Boss" logo at top-left of the captured frame looks
-   mirrored. Check against the physical scene before touching `mirror`/`flip`
-   (SET_VIC bytes 13/14, SET_PREVIEW_PARAMS bytes 0x10/0x11) - the camera may
-   simply be pointed that way.
+4. **`win_seq=1 post_mask=0`, one spawn.** Still untested and still unblocked by
+   M135a. Cheap, and it is the last untried ordering.
 
-Dropped from this list: **`fw = 6`** as a capture fix, **GPIO pins beyond
-1/3/8/9**, and **every remaining host-side completion handshake**. The reporting
-path is proven correct end to end; the producer is what is stalled.
+5. **Possible mirror.** The "Boss" logo at top-left of `m130-colour-correct-frame.raw`
+   looks mirrored. Check against the physical scene before touching
+   `mirror`/`flip` - the camera may simply be pointed that way.
+
+Dropped for good: **every remaining completion/reporting handshake** (credit,
+enc_stat, kicks, `vic_int_mode`, EVENT), and **`fw=6` as a capture fix**. The
+reporting path is proven correct end to end and is not reached.
 
 ## Tools
 
