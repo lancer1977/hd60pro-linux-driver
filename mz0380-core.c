@@ -792,7 +792,7 @@ MODULE_PARM_DESC(vic_fast_kill, "M82: SET_VIC byte33 fast_kill (def:1)");
  * 0.00.80.80, i.e. neutral grey; we sent all zeros, which is green.
  */
 /*
- * M136: SET_VIC byte 34 - the frame-completion interrupt enable.
+ * M136/M138: SET_VIC byte 34 - NOT the frame-completion interrupt enable.
  *
  * Found in ep.ko, not guessed. pciep_isr's cmd-41 arm (0x171c) ends with:
  *
@@ -801,34 +801,38 @@ MODULE_PARM_DESC(vic_fast_kill, "M82: SET_VIC byte33 fast_kill (def:1)");
  *   174c: movne r3, #1
  *   1754: strb r3, [r5, #0x630]    @ state[0x630] = (byte34 != 0)
  *
- * and state[0x630] is the gate in store_channel_done() - the sysfs attribute
- * the CARD's userspace writes when a channel finishes a frame:
+ * and state[0x630] IS read by store_channel_done() - the sysfs attribute the
+ * CARD's userspace writes when a channel finishes a frame:
  *
  *   e88: ldrb r3, [r1, #0x630]
  *   e8c: cmp  r3, #0
- *   e94: beq  0xefc                @ zero: do NOT raise, only accumulate
- *   ...
- *   ebc: str  r4, [r3, #0x30]      @ BAR0 0x30 = EVENT |= (1 << ch)
- *   ed0: str  r0, [r3]             @ and poke the interrupt
+ *   e94: beq  0xefc                @ int_mode == 0: the OTHER branch
  *
- * So with byte 34 at zero the card packs its per-channel frame counters into
- * BAR0 0x40/0x44/0x48/0x4c and then **never tells the host**. That is exactly
- * what every run in this file reports at stop: `EVENT[0x30]=00000000`,
- * `frame_events=0`, `token[0x40]=00000000`, and one frame per stream.
+ * M138 CORRECTION - this byte is NOT the EVENT gate. Both branches of that
+ * test raise the EVENT the same way, and both are gated on the same thing: the
+ * one-shot completion credit at ep.ko's .data[0].
  *
- * We have sent 0 here for the driver's entire life. M82 read this byte as
- * "mix" from the Windows traces, where it is also zero - but Windows gets its
- * frames a different way, and "Windows sends 0" has already cost us fw=7 and
- * post_mask=0x1f (method rule 4).
+ *   e98: ldr r0, [credit] ; beq 0xed8   @ int_mode != 0 branch: no credit ->
+ *   f08: ldr r8, [credit] ; beq 0xf34   @ int_mode == 0 branch:  accumulate
+ *   f54: ldr r0, [credit] ; beq 0xfb4   @ ditto, aic_int_mode != 1
  *
- * The AIC side of the same mechanism is already known and named:
- * SET_AIC byte 17 = aic_int_mode -> state[0x63c] (see MZ0380_CMD_SET_AIC_PARAMS).
- * This is its video twin, and nothing has ever set it.
+ * The only difference between the branches is the shift used for the AUDIO
+ * channel bit (r0+15 vs r4+16). For video the code is identical. So byte 34
+ * cannot change frame reporting, which is exactly what M137 measured.
+ *
+ * The credit itself is fine: it starts at 1, every raised event consumes it,
+ * and card IRQ 42 (pciep_isr_clrint) restores it - reached from the host by
+ * BAR0[0x00] = MZ0380_MB_INT_ACK (0x400, bit 10; 0x800/bit 11 is IRQ 43, the
+ * command dispatcher). M133's 1224 completed commands prove that path re-arms
+ * it 1000+ times per run. See mz0380_credit_rearm().
+ *
+ * Kept as a knob only because it is free and the AIC twin (SET_AIC byte 17 ->
+ * state[0x63c]) is set to 1; nothing depends on it.
  */
 unsigned int mz0380_vic_int_mode;
 module_param_named(vic_int_mode, mz0380_vic_int_mode, uint, 0644);
 MODULE_PARM_DESC(vic_int_mode,
-		 "M136: SET_VIC byte 34 - nonzero makes ep.ko's store_channel_done() raise the frame-completion EVENT to the host instead of only accumulating it. Never tried; the one-frame cadence is consistent with it being 0 (def:0)");
+		 "SET_VIC byte 34 -> ep.ko state[0x630]. M138: NOT the frame-completion EVENT gate (the one-shot credit is, and it is re-armed correctly); byte 34 only shifts the audio bit. Tried in M137, changes nothing (def:0)");
 
 unsigned int mz0380_vic_nosg = 0x80800000;
 module_param_named(vic_nosg, mz0380_vic_nosg, uint, 0644);

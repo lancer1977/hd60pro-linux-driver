@@ -7675,3 +7675,256 @@ This is free, it is the only remaining thread, and it is where the next session
 should start. Do NOT spend more spawns on host-side knobs until it is read -
 five have now been spent proving, one at a time, that the reporting path is not
 the problem.
+
+## M138 (static, 2026-08-21): the producer chain read end to end - `encode_handler` blocks on an empty ring, and the stall is three layers upstream
+
+M137 ended with a list of five PLT candidates and the instruction to read
+`EncodingGroup::encode_handler`. It is read. **None of the five is the answer**,
+because none of them is reached: the loop parks at its very first statement.
+
+Everything below is static, from the in-tree blob unpack. Zero spawns.
+
+### `encode_handler`'s loop, exactly
+
+`_ZN13EncodingGroup14encode_handlerEPv` is at **0x12b00**, not 0x12c60 (0x12c60
+is the `open()` of `channel_done` inside it), and runs to 0x15c5c. Prologue:
+
+    12c60  ldr  r0, =0x2ae10          "/sys/class/vpl_pciep/channel_done"
+    12c64  bl   open@plt              -> fd kept at [sp,#0x78]
+    12c94  bl   SSM_Reader@plt        -> reader handle to [r11,#0x6c]
+
+Loop head is **0x12f04**. The body begins:
+
+    12f04  ldrb r8, [r11,#0x38]       run flag
+    12f0c  beq  0x12fc0               0 -> clean exit
+    12f10  ldr  r0, [r11,#0x6c]       reader handle
+    12f18  beq  0x150f8               NULL -> puts + exit
+    12f24  bl   SSM_ReleaseAndReceive@plt      <-- FIRST call of every iteration
+    12f30  bls  0x1512c               ret < 0 -> set flag, exit
+
+`SSM_ReleaseAndReceive` releases the frame just encoded and fetches the next.
+It is the first thing the loop does, so if it does not return, nothing else in
+the body runs. `TK_H264Enc_WaitOneFrame` (0x14760, 0x147e0),
+`TK_MMA_WaitOneFrameComplete` (0x14358, 0x150dc) and the `pread` of
+`enc_stat%d` (0x139e0) all sit **downstream** of it. There is no `PB_GetFullness`
+call in the function at all.
+
+The `channel_done` write is at **0x13dfc** - `pwrite(fd=[sp,#0x78],
+buf=sp+0x120, 24, 0)` - well after the receive. So the order per frame is
+*receive -> encode -> report -> receive again*, and "one frame reported" means
+the second receive never returned.
+
+### It blocks, it does not exit
+
+`libsyncsharedmemory.so.0` imports `pthread_cond_wait` and **no timed variant**.
+`SSM_ReleaseAndReceive` (0x1d0c):
+
+    1e74  cmp  r3, r2                 r3 = reader rd_idx [r4,#0x10]
+                                      r2 = shared wr_idx [r5,#0x9c]
+    1e80  beq  0x1e58 -> pthread_cond_wait(cond = shm+0xc0, mutex = shm+0xa4)
+
+Reader index equal to writer index means the ring is empty, and the thread
+sleeps on a process-shared condvar with **no timeout**. It is parked, not dead.
+That distinction is testable and matters: on the error return (`ret < 0`) the
+loop instead falls to **0x12fc0**, which `close()`s the `channel_done` fd,
+`TK_MMA_Release`s both handles, `SSM_Release` + `SSM_RecycleHandle`s the reader
+and returns 0. A dead encoder therefore *closes* its sysfs fd; a starved one
+holds it open.
+
+### The full producer chain
+
+    vpl_vic.ko ISR (0xfd8)
+      sets chan->frame_ready = 1 at [r8,#0x4c], then __wake_up (0x17a8)
+        |
+    ioctl(/dev/vpl_vic, 0xe301)              vpl_vic Ioctl handler at 0x30a8
+      = wait_event_interruptible_timeout(frame_ready == 1, T)
+      T = global[0x40] * 100 jiffies; on success clears the flag
+        |
+    libvideocap.so.13  VideoCap_WaitVIC (0x4644) = 2 insns: ioctl(fd, 0xe301)
+      VideoCap_Sleep (0x43d4) is a single `b` to it
+        |
+    libtk_video_capture.so.0  process() (0xd0c)   <-- the frame loop
+        |
+    callback = libtkmf_video_source.so.0  img_handler (0x1188)
+      registered through TK_VideoCap_Init from TKMF_VideoSrc_Init (0x18bc/0x18e4)
+        |
+    SSM_DeliverAndAllocate -> wr_idx++ -> broadcast
+        |
+    tinyvenc5 encode_handler wakes
+
+`process()` is the loop, and it **never gives up**:
+
+    d40  loop:  if (!ctx->run) return 0
+    d4c         if (ctx->force_exit) { usleep(100); return 0 }
+    d58         r = VideoCap_Sleep(ctx)                 // the blocking wait
+    d64         if (r == 0) goto da0                    // frame ready
+                ctx->timeouts++
+                usleep(1000); goto d4c                  // retry, forever
+    da0         r = VideoCap_GetBuf(ctx, &buf)
+                if (r) { usleep(1000); retry }
+    e00         callback(&buf, cbarg)                   // img_handler
+    e0c         VideoCap_ReleaseBuf(ctx, &buf)          // ioctl 0x4004e304
+    e20         ...option update...  goto d40
+
+A VIC that stops producing therefore yields a permanent one-frame state with a
+1 ms poll spinning behind it and **no error anywhere the host can see**. That is
+exactly the symptom this project has had since the beginning.
+
+### `img_handler`'s drop gates, both of them, decoded
+
+This is the function the "(Drop this frame) ... bNoSignal" string lives in. Its
+two early-outs are:
+
+**1. A pure geometry equality test.**
+
+    11b4  ldr  r3, [r5,#0x1c]         VIC_Get width, from the capture descriptor
+    11bc  ldrh r1, [0xaa54]           Tiny_Set width, from .bss
+    11c4  bne  0x12e0                 -> printf, then return WITHOUT delivering
+
+The printf is
+`[yuan][tkmf] (Drop this frame) Tiny_Set(%d x %d)!= VIC_Get( %d x %d)(stride %d),
+Count = %d, idx = %d, Time = %d:%03d, dwInWidth: %d, bCCIRErr: %d, bNoSignal: %d,
+bFifoFull: %d`, and its arguments map to
+`bss[0]`, `bss[2]`, `frame[0x1c]`, `frame[0x20]`, `frame[0x24]`, `frame[0x4]`,
+`frame[0x0]`, `frame[0x8]`, `frame[0xc]`, `frame[0x18]`, `frame[0x30]`,
+`frame[0x2c]`, `frame[0x28]`.
+
+**`bNoSignal`, `bCCIRErr` and `bFifoFull` are printf arguments and nothing
+else.** They are never tested, anywhere in the library. M127 named this path as
+the target and M129 called that wrong; this is *why* it was wrong, and it is now
+closed for a mechanical reason rather than an inference.
+
+**2. A modulo frame skip, and only when pixel format == 2.**
+
+    1340  ldrh r1, [0xaa54+6]         m_skip
+    1350  beq  -> normal              m_skip == 0: no skipping at all
+    1358  r0 = frame[0x4]             Count
+    135c  bl   __aeabi_uidivmod       r1 = Count % (m_skip + 1)
+    1364  bne  -> normal
+    1368  return                      Count % (m_skip+1) == 1 -> drop
+
+Note the direction: it drops **one frame in (m_skip+1)**, it does not deliver
+one in (m_skip+1). `m_skip = 0` disables it entirely, `m_skip = 1` costs half
+the frames. **This kills M134's "a preview pacer with skip=0 is a plausible
+reason for exactly one frame"** - skip=0 is the *no-drop* setting. Chasing
+`skip` through the mask (M134/M135) was chasing a divider that was already off.
+
+### `Tiny_Set` is host-driven, once, and three of its five fields are dead
+
+`TKMF_VideoSrc_Setup` (0x168c) is 5 halfword stores into the .bss struct at
+**0xaa54**: `{ m_vic_width, m_vic_height, m_fps, m_skip, m_avg }`, plus the
+`[TKMF] VideoSrc_Setup m_vic_width(%d), m_vic_height(%d), m_fps(%d), m_skip(%d),
+m_avg(%d)` banner.
+
+`img_handler` reads **only offset 0 (width) and offset 6 (skip)**. Offset 2
+(height) appears in the drop printf only; **`m_fps` and `m_avg` are written and
+never read**. Anything that tried to pace the source through fps/avg was a
+no-op.
+
+tinyvenc5 calls it **exactly once**, from `EncodingGroup::Start` at **0x11014**,
+filling the struct from the per-channel config record (60 bytes per channel):
+
+    [sp+8]  = ldrh cfg[ch]+0x0c    m_vic_width
+    [sp+10] = ldrh cfg[ch]+0x0e    m_vic_height
+    [sp+12] = ldrb cfg[ch]+0x09    m_fps
+    [sp+14] = ldrb cfg[ch]+0x38    m_skip
+    [sp+16] = 0                    m_avg
+
+One call, before the loop, so the geometry gate cannot change mid-stream. If it
+matched for frame 1 it matches for frame 2.
+
+### `img_handler`'s first call is an init, not a delivery
+
+    11c8  ldr r2, [r4,#0x0c]   ; if 0 -> 0x129c, the one-time init
+    14f4  bl  SSM_Writer(..., 4 buffers)
+    1544  bl  SSM_DeliverAndAllocate(writer, zeroed descriptor)   ; prime only
+    1580  bl  TK_ImgProc_Init ...
+    1600  [r4,#0x0c] = 1 ; return
+
+`SSM_DeliverAndAllocate` (0x19a8) short-circuits at 0x19c4 when the descriptor's
+buffer pointer is NULL and does **not** advance `wr_idx`. So the prime is not a
+frame. Getting one frame at the host means `img_handler` ran at least twice and
+then stopped.
+
+### The host-facing link cleared: `store_channel_done` cannot block
+
+`ep.ko` has **no** relocation to `wait_event`, `wake_up`, `msleep`, `schedule`
+or `udelay` anywhere - its only scheduling relocs are two `preempt_schedule`
+from `spin_unlock`. `store_channel_done` (0xdc8) runs with interrupts masked
+(`mrs`/`orr #0x80`/`msr`) and is a straight-line register write. The `pwrite`
+at 0x13dfc therefore always returns immediately, and "encode_handler is blocked
+in the sysfs write waiting for a host ack" is **dead**.
+
+### The EVENT credit, and why the existing ack sequence is correct
+
+While in `ep.ko`, the completion path was read out completely. There is one
+32-bit word in `.data` at offset 0, **initialised to 1**, that gates every
+event the card raises:
+
+    pciep_isr_clrint (0xd44)      card IRQ 42
+        bar0[0x30] = 0
+        credit     = 1                 <-- the ONLY writer of 1
+
+    msi.constprop.1 (0x1160)      command completion
+        pending |= (1 << 11)
+        if (credit) { bar0[0x30] = pending; pending = 0; credit = 0; *doorbell = 1 }
+
+    store_channel_done (0xdc8)    frame completion
+        pending |= (1 << ch)
+        if (credit) { bar0[0x30] = pending; pending = 0; credit = 0; *doorbell = 1 }
+        else        { }                       // accumulate silently
+
+`pending` is `state[0x634]`, the host-notify register pointer is
+`state[0x638]`, set at module init to `<cfg base> + 0xdc` (which init also
+primes to 2) - i.e. exactly the `BAR5[0xdc]` of our ack sequence.
+
+`mozart_module_init` registers **`request_irq(42, pciep_isr_clrint, ...)`** and
+**`request_irq(43, pciep_isr, ...)`**. The doorbell values line up with the IRQ
+numbers on a base of 32: `MZ0380_MB_INT_ACK` = 0x400 = bit 10 -> IRQ 42 ->
+`pciep_isr_clrint`; `MZ0380_MB_FIRE` = 0x800 = bit 11 -> IRQ 43 -> `pciep_isr`,
+the command dispatcher. **`BAR0[0x00] = 0x400` is what re-arms the credit**, and
+the driver's `mz0380_credit_rearm()` fires precisely that.
+
+Independent confirmation: command completions consume the same one-shot. M133
+ran 1224 op-`0x06` and 1171 op-`0x2f` commands and every one completed. That is
+impossible unless the credit is being restored 1000+ times per run. **M118's
+credit hypothesis was right about the mechanism and M134's negative was right
+about the outcome** - the credit works, and it was never the gate.
+
+### Correction to M136: `state[0x630]` does not gate EVENT delivery
+
+M136 read SET_VIC byte 34 -> `state[0x630]` as deciding "whether
+`store_channel_done()` raises `EVENT |= (1 << ch)` or merely accumulates". It
+does not. Both branches of the 0x630 test are credit-gated identically:
+
+    e88  ldrb r3, [state+0x630]
+    e94  beq  0xefc                 int_mode == 0
+    e98  ldr  r0, [credit] ; beq 0xed8 -> accumulate     (int_mode != 0 branch)
+    ...
+    efc  ldrb r7, [state+0x63c]     aic_int_mode
+    f08  ldr  r8, [credit] ; beq 0xf34 -> accumulate     (int_mode == 0 branch)
+    f54  ldr  r0, [credit] ; beq 0xfb4 -> accumulate
+
+The only real difference between the two branches is the shift used for the
+**audio** channel bit (`r0+15` vs `r4+16`). For video the code is the same
+either way. So M137's "`vic_int_mode=1` changes nothing" is the correct and
+expected result, and the caveat about byte 34 not appearing in the log is moot:
+the knob could not have mattered. `state[0x63c]`/SET_AIC byte 17 is in the same
+position.
+
+### What this leaves
+
+The stall is **on the card, upstream of tinyvenc5**, in one of:
+
+1. the VIC hardware not raising further frame interrupts,
+2. `vpl_vic.ko`'s ISR (0xfd8) not reaching its `frame_ready = 1` + `__wake_up`
+   at 0x1788/0x17a8 on later frames,
+3. `process()` spinning on `VideoCap_Sleep` timeouts, which is the observable
+   consequence of either.
+
+None of that is reachable by patching (the no-upload rule) or by console (the
+card's console is unreachable). What *is* reachable is everything the host feeds
+the VIC: SET_VIC geometry, the receiver's BT1120 output, and the GPIO/reset
+lines. The geometry gate above makes the first of those newly interesting - not
+as a drop cause (it would drop frame 1 too) but because `cfg[ch]+0x0c/0x0e` are
+the only host-settable values the source layer actually reads.

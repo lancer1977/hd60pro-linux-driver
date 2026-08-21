@@ -1,11 +1,14 @@
 # NEXT SESSION START
 
 _Last updated 2026-08-21. Full history in **RE_FINDINGS.md**; the most recent
-milestone is **M129 - the card captures real video**. This file is the handoff
-only. Everything below was verified on hardware unless it says otherwise._
+milestones are **M129 - the card captures real video** and **M138 - the
+producer chain read end to end**. This file is the handoff only. Everything
+below was verified on hardware unless it says otherwise._
 
 **If you read one thing:** the "no signal" story that dominated this project was
-wrong. Skip to `## STATE after M129`.
+wrong (`## STATE after M129`), and the surviving one-frame defect is **on the
+card, upstream of tinyvenc5** (`## Where to go next`). No host-side handshake
+remains untried or unexplained.
 
 ---
 
@@ -185,7 +188,10 @@ Before/after pair kept in-tree: `m129-first-real-frame.raw` (broken chroma),
 | **Host wake-ups / kicks** | op `0x2f` x1171 and op `0x06` x1224 (M133): accepted every time, **one frame**, and the receiver **loses lock** under either. Kicks do not gate the cadence. Do not flood these. |
 | **Opcode `0x50`** | `SET_OSD` - on-screen-display text. |
 | **"the VIC sees no signal"** | **WRONG - M129.** The card captures real 1080p video. The standby thread was painting over it. Every splash verdict in this file measured that thread. |
-| **frame rejection in `libtkmf_video_source.so.0`** | Not what was happening. M127 named it as the target from static RE alone; it was never observed and it was wrong. M129. |
+| **frame rejection in `libtkmf_video_source.so.0`** | Not what was happening. M127 named it as the target from static RE alone; it was never observed and it was wrong. M129. **M138 gives the mechanical reason:** `bNoSignal`/`bCCIRErr`/`bFifoFull` are `printf` arguments in the drop banner and are never tested. The only real gate is a width equality test. |
+| **the host completion handshake** | **Fully cleared, M138.** `ep.ko` cannot block (no wait/wake/sleep relocation exists in it). The EVENT credit is a real one-shot but `BAR0[0x00]=0x400` re-arms it via card IRQ 42, and M133's 1224 completed commands prove that happens 1000+ times a run. Stop spending spawns here. |
+| **`state[0x630]` / SET_VIC byte 34** | M136 read it as gating EVENT-vs-accumulate. **Wrong, M138:** both branches are credit-gated identically and byte 34 only shifts the *audio* bit. M137's null result was expected. |
+| **`skip` / `fps` / `avg` as preview pacers** | **Dead, M138.** `m_fps` and `m_avg` are stored by `TKMF_VideoSrc_Setup` and never read. `m_skip` drops one frame in `(skip+1)` - so `skip=0` is the *no-drop* setting, the opposite of M134's theory. |
 | **EDID / HDCP** | Dead ends. Windows captures with no EDID pushed. |
 | **op `0x2f`** | `SET_ENC_PARAMS_POST` - the SAME handler as `0x2d` (0xebdc), differing only in which banner it prints. H.264 knobs; cannot touch capture. M128. |
 | **op `0x51`** | `SET_BAR` - a colour-bar overlay rect per (ch, line). Overlay only. M128. |
@@ -270,79 +276,100 @@ too. M82 also had mirror/flip swapped; the card's own printf wins.
 
 ## Where to go next
 
-Capture works. The remaining work is output correctness and robustness, not
-"does the card see the signal".
+Capture works. The remaining defect is **one frame per stream**, and M138
+relocated it decisively: the stall is **on the card, upstream of tinyvenc5**.
 
-1. **START HERE, AND IT IS FREE: disassemble `EncodingGroup::encode_handler`**
-   (tinyvenc5 0x12c60 region) and find what it blocks on after its first frame.
+### What M138 settled (static, zero spawns) - do not redo any of it
 
-   `/sys/class/vpl_pciep/channel_done` - the attribute whose `store_channel_done()`
-   handler raises the host's frame EVENT - is written from exactly two places in
-   tinyvenc5: `encode_handler` (0x12c60) and `fake_frame_process` (0x15d58).
-   The second is the splash thread that `fake_frame_off=1` stops from existing,
-   so **`encode_handler` is now the only writer, and it writes once then
-   blocks**. (Not a regression: every pre-M129 run also gave one frame.)
+`EncodingGroup::encode_handler` is read. It is at **0x12b00** (0x12c60 is the
+`open()` of `channel_done` inside it). Its loop head is **0x12f04** and the
+first call of every iteration is `SSM_ReleaseAndReceive` (0x12f24).
+`libsyncsharedmemory.so.0` has **no timed condvar wait**: when reader index ==
+writer index the thread parks in `pthread_cond_wait` forever. So the encoder is
+**starved, not stuck** - and none of M137's five PLT candidates is reached,
+because all of them sit downstream of that first call.
 
-   That relocates the whole problem. Every host-side handshake we tried
-   addresses the *reporting* path; the **producer** is what is stalled.
-   Candidates it could be blocked in, all visible in tinyvenc5's PLT:
-   `TK_H264Enc_WaitOneFrame`, `TK_MMA_WaitOneFrameComplete`,
-   `SSM_ReleaseAndReceive`, `PB_GetFullness`, and the `pread` of
-   `/sys/vpl_pciep/enc_stat%d`.
+The whole producer chain is now mapped:
 
-   **Do not spend more spawns on host-side knobs until this is read.** Five have
-   now gone, one variable at a time, proving the reporting path is not the
-   problem:
+    vpl_vic.ko ISR -> chan->frame_ready = 1 + __wake_up
+      -> ioctl(/dev/vpl_vic, 0xe301) = wait_event_interruptible_timeout(...)
+      -> libvideocap VideoCap_WaitVIC / VideoCap_Sleep
+      -> libtk_video_capture process() loop
+      -> libtkmf_video_source img_handler  (the callback)
+      -> SSM_DeliverAndAllocate -> wr_idx++ -> broadcast
+      -> tinyvenc5 encode_handler -> pwrite channel_done -> ep.ko -> host
 
-   | tried | result |
-   |---|---|
-   | enc_stat ack (M117) | 1 frame |
-   | op6 kick x1224 (M133) | 1 frame, **lock lost - never flood** |
-   | credit re-arm (M134) | 1 frame |
-   | asking v4l2 for 5 (M132) | 1 frame |
-   | `vic_int_mode=1` (M136/M137) | 1 frame, EVENT still 0 |
+`process()` **never exits on a stalled VIC** - it retries `VideoCap_Sleep` every
+1 ms forever. A dead VIC therefore looks exactly like what we have: one frame,
+no error, no log, no host-visible symptom.
 
-   M136 is still worth knowing even though it did not fix anything: **SET_VIC
-   byte 34 sets ep.ko's `state[0x630]`**, which gates whether
-   `store_channel_done()` raises `EVENT |= (1 << ch)` at BAR0 0x30 or merely
-   accumulates. Its AIC twin is SET_AIC byte 17 (`aic_int_mode` -> `0x63c`).
-   Caveat: the SET_VIC log line did not print byte 34 on that run, so the
-   negative is one notch below this file's usual standard - the line now prints
-   `fk=` and `int_mode=`, so re-confirm when a run next carries it.
+Also closed by M138:
 
-2. **`win_seq=1 post_mask=0`, one spawn.** M135a completed the mask bisect:
-   bit 0 (skip) truncates because it makes tinyvenc5 skip
-   `tiny_calculate_skip_fps()`; **die_en (bit 4) is safe** - `post_mask=0x10`
-   gives a full frame. So `win_seq=1` "renders nothing" (M90/M91) only because
-   it sends `0x31` with mask 0x1f. The Windows ordering is now testable.
+| claim | status |
+|---|---|
+| `store_channel_done` blocks waiting for a host ack | **dead.** `ep.ko` has no wait/wake/sleep relocation at all; the handler runs with IRQs masked and is straight-line register writes. |
+| the EVENT credit is the gate | **dead, and the driver is correct.** `.data[0]` starts at 1, is consumed by every event and re-armed only by card **IRQ 42** = `pciep_isr_clrint`, reached by `BAR0[0x00] = 0x400` (bit 10; `0x800`/bit 11 -> IRQ 43 = command dispatcher). M133's 1224 successful commands prove it is re-armed 1000+ times per run. |
+| `state[0x630]` / SET_VIC byte 34 gates EVENT vs accumulate | **wrong (M136 corrected).** Both branches are credit-gated identically; byte 34 only shifts the **audio** bit by 15 vs 16. M137's null result was the expected one. |
+| `bNoSignal` / `bCCIRErr` / `bFifoFull` gate frame delivery | **dead.** They are `printf` arguments in `img_handler`'s drop banner and are never tested anywhere in the library. |
+| `skip` paces the preview (M134's theory) | **backwards.** `img_handler` drops when `Count % (m_skip+1) == 1`, i.e. it drops **one in (skip+1)**. `m_skip = 0` is the *no-drop* setting. |
+| `m_fps` / `m_avg` reach the video source | **dead.** `TKMF_VideoSrc_Setup` stores five halfwords; `img_handler` reads only width (offset 0) and skip (offset 6). fps and avg are written and never read. |
 
-3. **DONE (M131) - the working configuration is the default.** `post_proc=1`,
-   `post_mask=0`, `fake_frame_off=1`, `mst_csc_ctl=AUTO`. A plain insmod should
-   now produce real, correctly-coloured video. **Reproducing any result in
-   RE_FINDINGS older than M129 needs the first three set back by hand**
-   (`post_proc=0 post_mask=0x1f fake_frame_off=0`).
+### The one remaining host-side gate in the source layer
 
-3. **`out_fmt`.** SET_VIC byte 12 is the output format and we still send **0**,
+`img_handler`'s only real early-out is a **geometry equality test**:
+
+    VIC_Get.width (capture descriptor +0x1c)  ==  Tiny_Set.width (.bss 0xaa54)
+
+`Tiny_Set` comes from a **single** `TKMF_VideoSrc_Setup` call in
+`EncodingGroup::Start` (tinyvenc5 **0x11014**), filled from the per-channel
+config record: width `cfg[ch]+0x0c`, height `+0x0e`, fps `+0x09`, skip `+0x38`.
+One call, before the loop - so the gate cannot change mid-stream, and it cannot
+be what kills frame 2 while letting frame 1 through. But `cfg[ch]+0x0c/0x0e` are
+now known to be the **only** host-settable values the source layer reads at all,
+which is what makes SET_VIC geometry worth a look.
+
+### Ranked next steps
+
+1. **Distinguish parked from dead, one spawn.** `encode_handler`'s two exits
+   differ observably: on a clean exit (run flag cleared, reader NULL, or
+   `SSM_ReleaseAndReceive < 0`) it **`close()`s the `channel_done` fd** at
+   0x12fc0 and releases both `TK_MMA` handles; while merely starved it holds
+   them open. Anything the host can read that reflects the card's fd/handle
+   state separates "the encoder died" from "the encoder is waiting", and only
+   the second sends us to the VIC. Check what `epint_show` / the `/sys` mirrors
+   expose before spending the spawn.
+
+2. **SET_VIC geometry as the source-layer lever.** Bytes 8..11 are already known
+   to drive captured geometry (M127's cfg-patcher finding). They are now also
+   known to be the values `img_handler` compares against. A run where
+   `Tiny_Set != VIC_Get` should deliver **zero** frames, not one - so a
+   deliberate mismatch is a cheap positive control that proves the source layer
+   is alive and being called repeatedly. If a mismatched run still delivers
+   exactly one frame, `img_handler` is not being called at all and the VIC is
+   confirmed dead after frame 1.
+
+3. **`win_seq=1 post_mask=0`, one spawn.** Unchanged from M137's list and still
+   untested. M135a completed the mask bisect: bit 0 (skip) truncates because it
+   makes tinyvenc5 skip `tiny_calculate_skip_fps()`; **die_en (bit 4) is safe**
+   (`post_mask=0x10` gives a full frame). So `win_seq=1` "renders nothing"
+   (M90/M91) only because it sends `0x31` with mask 0x1f. The Windows ordering
+   is now testable.
+
+4. **`out_fmt`.** SET_VIC byte 12 is the output format and we still send **0**,
    which M72 flagged as not a legal value - the card falls back to the cfg. Now
    that the picture is right, setting it deliberately is worth one spawn.
    **Warning:** `fw=6`/YUY2 makes frames 4:2:2 = 4147200 bytes and
    `mz0380_infer_frame_length`'s `want` is hardcoded `w*h*3/2`; fix that first
    or poll-drain will never see a complete frame.
 
-4. **Which mask bit truncates** (M128d), one spawn each: `post_mask=0x10`
-   (die_en alone) vs `post_mask=0x01` (skip alone). Not needed for capture any
-   more, but it is the entire explanation for `win_seq=1` rendering nothing
-   (M90/M91), so it still gates the Windows ordering.
-
 5. **Possible mirror.** The "Boss" logo at top-left of the captured frame looks
    mirrored. Check against the physical scene before touching `mirror`/`flip`
    (SET_VIC bytes 13/14, SET_PREVIEW_PARAMS bytes 0x10/0x11) - the camera may
    simply be pointed that way.
 
-6. Dropped from this list: **`fw = 6`** as a capture fix, and **GPIO pins beyond
-   1/3/8/9**. Both were hunting a capture fault that does not exist. `fw=6` is
-   still interesting, but as an *output format* lever (item 1), not a capture
-   one.
+Dropped from this list: **`fw = 6`** as a capture fix, **GPIO pins beyond
+1/3/8/9**, and **every remaining host-side completion handshake**. The reporting
+path is proven correct end to end; the producer is what is stalled.
 
 ## Tools
 
