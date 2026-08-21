@@ -330,6 +330,19 @@ MODULE_PARM_DESC(kick_opcode,
 		 "M126: opcode fired by op6_kick_ms after each delivered frame - 0x06 (def, START, also notifies audio_ctrl) or 0x2f / 0x09 (bare epint wake-up)");
 
 /*
+ * M139: sentinel written into BAR0 0x40/0x44/0x48/0x4c just before
+ * START_STREAMING so the producer watch can tell "the card reported one frame
+ * from buffer 1" (nibble goes to 0, upper bits survive) from "the card never
+ * reported at all" (sentinel intact).  Nothing card-side reads these
+ * registers; store_channel_done() only read-modify-writes one nibble per
+ * channel into them.  Set 0 to leave them alone.
+ */
+unsigned int mz0380_token_seed = 0xa5a5a5a5;
+module_param_named(token_seed, mz0380_token_seed, uint, 0644);
+MODULE_PARM_DESC(token_seed,
+		 "M139: sentinel seeded into the BAR0 frame-token registers before START so the producer watch can distinguish 'reported buffer 1' from 'never reported' (0 = do not seed, def:0xa5a5a5a5)");
+
+/*
  * M126: with the kick confined to the post-delivery branch, a one-frame stream
  * fires exactly one kick - which is what the first 0x2f run measured, and it
  * cannot distinguish "the card ignored the wake-up" from "we only asked once".

@@ -1488,6 +1488,41 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	}
 
 	/*
+	 * M139: seed the frame-token registers with a sentinel before the card
+	 * can touch them.
+	 *
+	 * M138's watch reported "0 changes, final 40/44/48 = 0", which is
+	 * ambiguous: the card's store_channel_done() writes report[N] - 1 into
+	 * one nibble per channel, so a single report carrying buffer index 1
+	 * writes zero over a register that was already zero and looks identical
+	 * to never having run at all.
+	 *
+	 * The write is a read-modify-write of one nibble
+	 * (reg = (reg & ~(0xf << ch*4)) | (val << ch*4)), so a sentinel makes
+	 * it unmistakable: the upper bits survive and only channel 0's nibble
+	 * changes.  a5a5a5a5 -> a5a5a5a0 means the encoder reported exactly one
+	 * frame from buffer 1; a5a5a5a5 unchanged means it never reported at
+	 * all.  Nothing card-side ever reads these, so seeding them is inert.
+	 *
+	 * Self-validating: if BAR0 0x40 is not host-writable the producer
+	 * watch's baseline line reads back something other than the sentinel
+	 * and the whole test is void.
+	 */
+	if (mz0380_token_seed) {
+		mz_mmio_write(dev, MZ0380_MB_EVT_PAYLOAD0, mz0380_token_seed);
+		mz_mmio_write(dev, MZ0380_MB_EVT_PAYLOAD1, mz0380_token_seed);
+		mz_mmio_write(dev, MZ0380_MB_EVT_PAYLOAD2, mz0380_token_seed);
+		mz_mmio_write(dev, MZ0380_MB_EVT_PAYLOAD3, mz0380_token_seed);
+		wmb();
+		pr_info("%s: stream start: frame-token sentinel %08x seeded into BAR0 40/44/48/4c; readback %08x/%08x/%08x/%08x\n",
+			dev->name, mz0380_token_seed,
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD0),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3));
+	}
+
+	/*
 	 * op 0x06 is FIRE-AND-FORGET. Unlike INIT/SET_VIC, its ep.ko handler
 	 * (@0x1854, M22) only does sysfs_notify(epint) to wake tinyvenc5 - it
 	 * posts NO mailbox completion (no STATUS bit0, no EVENT bit11). Waiting

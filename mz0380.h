@@ -708,6 +708,7 @@ extern unsigned int mz0380_aic_int_mode;
 extern unsigned int mz0380_vic_color_info;
 extern unsigned int mz0380_vic_fast_kill;
 extern unsigned int mz0380_vic_int_mode;
+extern unsigned int mz0380_token_seed;
 extern unsigned int mz0380_vic_nosg;
 extern bool mz0380_win_seq;
 extern bool mz0380_win_start_op6;

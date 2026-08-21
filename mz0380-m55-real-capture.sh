@@ -303,7 +303,11 @@ echo "=== 3. what did the card do? ==="
 # M132: "MST3367 CSC" added - mz0380_mst3367_apply_csc_mode() logs which CSC
 # mode it picked and why, and the old pattern filtered it out, so the one line
 # that confirms the colour knob landed was invisible. Method rule 9.
-dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal|poll-drain|MST3367 CSC" | head -24
+# M139: "producer watch" added. The watch samples BAR0 40/44/48 every poll
+# interval and its baseline/change lines are the only host-visible proof that
+# the card's producer is still running - filtering them out would repeat
+# exactly the mistake method rule 9 records.
+dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal|poll-drain|MST3367 CSC|producer watch" | head -28
 # M70: the per-buffer poison scan is the "did H.264 bytes land without a
 # completion" measurement - it has been printed at every stop and filtered
 # out by the grep above this whole time.
