@@ -8066,3 +8066,76 @@ so a single report of buffer 1 writes zero over a register that was already
 zero. The sentinel is what made the measurement mean something. Method rule 1
 again - a null result is only informative once every other value in it is known
 to be distinguishable.
+
+## M140 (hardware, 2026-08-22): 3840 is not the gate - and no width sweep this project has run was ever single-variable
+
+    sudo POLLDRAIN=20 EXTRA="vic_out_w=3840 vic_out_h=540" ./mz0380-m55-real-capture.sh 5
+
+    stream start: SET_VIC(... -> H.264 output=3840x540, bitstreams=1) ret=0
+    producer watch: baseline 40=a5a5a5a5 44=a5a5a5a5 48=a5a5a5a5
+    poll-drain stopped after 0 deliveries, 0 kicks; producer watch saw 0 change(s),
+                  final 40=a5a5a5a5 44=a5a5a5a5 48=a5a5a5a5
+    stop buf[0..3] ... 0/1024 sampled pages touched
+
+**Zero deliveries** - one worse than the 1920x1080 baseline - and the sentinel is
+untouched. `img_handler`'s width gate is not opened by 3840, so the M139
+double-rate reading is wrong: the VIC is not measuring 3840.
+
+The receiver was locked and coherent throughout (`55=7f`, `b0=21`, htot=2200,
+vtot=1125), so nothing upstream changed. Only the geometry did.
+
+### Why it went to zero, and the method consequence
+
+`re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg` is the card's own capture
+config and it is in the tree. It contains **twelve lines valued 1920 and twelve
+valued 1080**:
+
+    maximum frame width / height          <- ISP allocation
+    captured frame width / height
+    input frame width / height
+    AE HardwareCtl Window0..8 x width / y height    (nine pairs)
+
+M127 established that `video_capture_mgr`'s patcher (0xa290) `atoi()`s every
+line and rewrites **any** line valued 1920 with SET_VIC bytes 8..9 and **any**
+line valued 1080 with bytes 10..11. It is blunt: it does not know which line it
+is on.
+
+So `vic_out_w=3840 vic_out_h=540` did not move one gate input. It moved the ISP
+allocation size, the capture geometry, the VIC input geometry and all nine
+auto-exposure windows, simultaneously. The capture path never came up at all,
+which is a perfectly ordinary outcome for a 3840x540 ISP configuration and says
+nothing about the gate.
+
+**This retroactively qualifies every width experiment in this file**, M76's
+included: a SET_VIC width change is a ~24-line cfg rewrite, and there is no way
+to move the gate's input without also moving the ISP's. Method rule 1 applies -
+the other variables were never held at values known to permit the outcome.
+
+### The cfg also documents the enums inline
+
+    1  // output format (1:YUV420, 2:YUV422)
+    6  // input format (1:8-bits Raw, 2:CCIR656i, 3:CCIR656p, 4: Bayer,
+       //               5:16-bits Raw, 6: BT1120p, 7: BT1120i)
+
+`in_fmt = 6` is confirmed correct for a progressive BT1120 source. (SET_VIC byte
+12 is *not* this field - M79 found it never reaches the cfg and M82 settled it
+as a fractional-rate flag Windows sends 0 for. Unchanged.)
+
+### The unifying model: the VIC captures exactly ONE frame
+
+Everything M139 measured follows from that single fact, with nothing else
+needing to be true:
+
+| observation | consequence of one VIC frame |
+|---|---|
+| `channel_done` never written (sentinel intact) | `img_handler`'s **first** call is the init path - `SSM_Writer`, a prime `SSM_DeliverAndAllocate` with a NULL descriptor that does not advance `wr_idx`, `TK_ImgProc_Init`, then return. It publishes nothing. With no second call the ring stays empty. |
+| `encode_handler` produced nothing | It is created unconditionally (M139) and parks on its first `SSM_ReleaseAndReceive`, which has no timeout (M138). |
+| `EVENT = 0`, `frame_events = 0`, `enc[0x50] = 0` | Downstream of a `channel_done` that never happens. |
+| one real frame in buffer 0 | That single VIC capture, pushed over `vpl_dmac`'s outbound transfer. |
+| buffers 1-3 never touched | There was never a second capture to push. |
+| 3840x540 gives zero | The ISP could not come up, so not even the one capture happened. |
+
+The defect is now stated in one line: **the card's VIC captures a single frame
+and stops.** Everything this project has spent spawns on since M111 - the
+completion credit, enc_stat, kicks, `vic_int_mode`, the poll-drain - is
+downstream of that and cannot affect it.
