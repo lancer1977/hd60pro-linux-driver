@@ -2768,3 +2768,4910 @@ Notable implications:
   2. The 0x11 "fill" of M30-M38 was this splash's background all along.
   3. Open question (cosmetic): whether the 720-wide render is fake_frame's
      hardcoded canvas or tracks some other config (OSD size? input dims?).
+
+--------------------------------------------------------------------------
+
+ M76 THE CARD-SIDE CAPTURE CHAIN, FULLY DECOMPILED. (2026-08-19)
+
+Tooling note: system objdump has no ARM support here; use `llvm-objdump` or
+Ghidra headless (`/opt/ghidra/support/analyzeHeadless <proj> <name> -import
+<file> -processor ARM:LE:32:v5 -postScript DecompAll.java <out.c>`). All four
+card-side binaries were decompiled this pass: `vpl_vic.ko`, `ep.ko`,
+`video_capture_mgr`, `tinyvenc5`, plus `libvideocap.so.13`.
+
+### 1. What "No signal !!" actually is (the blocker, precisely located)
+
+`VideoCap_GetBufVIC` is ONE ioctl and nothing else:
+
+    ioctl(fd, 0x8078e303, &buf)      /* _IOR(0xe3, 3, 120) on /dev/vpl_vicN */
+
+It returns the ioctl's own return value. In `vpl_vic.ko`'s `Ioctl` the GETBUF
+arm returns **-1** when the channel has no completed frame queued
+(`chan->done_list == NULL`), which is what `VideoCap_GetBuf` turns into the
+console line. The three error messages are selected from a status word the
+driver copies out of the VIC's hardware MMR (per-channel byte in MMR+0x30):
+
+    (stat & 0x12) == 0x12   ->  "[VIDEOCAP][ERROR]: FIFO full (error frame) !!"
+    (stat & 0x14) == 0x14   ->  "[VIDEOCAP][ERROR]: No signal !!"
+    (stat & 0x17) == 0x10   ->  vpl_vic ISR printk
+                                "(CCIR or width(%lu) chck fail)"
+
+**All three are hardware verdicts about the BT1120 bus**, produced by the SoC's
+video input controller, not by any software policy we can reach from the host.
+"No signal" means the VIC saw no valid embedded-sync stream on its input pins
+while the MST3367 held lock. Bit 0x10 is the shared error flag; bit 0x02 is
+FIFO overrun; bit 0x04 is no-signal. They are only distinguishable on the
+card's console.
+
+### 2. SET_VIC -> capture config: complete, byte-exact, and OUR PACKET IS RIGHT
+
+`video_capture_mgr` op 0x29 fills a per-channel struct, then `FUN_0000a290`
+(vcm 0xa290) rewrites the 163-line template `nullsensor_1920x1080.cfg` into
+`/tmp/nullsensor_yuan%d.cfg`, which the freshly spawned tinyvenc reads. Only
+these cfg lines are patched - everything else is copied verbatim:
+
+  cfg line                    <- source
+  "input format"              <- SET_VIC byte 7   (6=BT1120p, 7=BT1120i)
+  "output format"             <- **derived from byte 6 (fw)**: 2 (YUY2) if
+                                 fw == 6, else 1 (YV12). NOT byte 12.
+  "start x position"          <- bytes 20..21
+  "start y position"          <- bytes 22..23
+  "input frame width"         <- bytes 24..25 (falls back to bytes 8..9 if 0)
+  "input frame height"        <- bytes 26..27 (falls back to bytes 10..11 if 0)
+  "flip video"                <- byte 13
+  "mirror video"              <- byte 14
+  "maximum frame width"       <- (capture width + 15) & ~15
+  every other line valued 1920 <- capture width  (bytes 8..9)
+  every line valued 1080       <- capture height (bytes 10..11)
+
+Consequences worth recording:
+  - Byte 12 ("m") never reaches the cfg at all; it is passed on the tinyvenc
+    argv instead. Sweeping `vic_out_format` therefore cannot change the
+    capture output format - only `fw == 6` does that.
+  - fw in {2,3} makes vcm OVERRIDE the width to 1968 (1936 when height ==
+    576). Those are the SDI paths. fw >= 4 rounds width up to a multiple of 16.
+  - fw == 7 spawns ./tinyvenc7, fw == 8 spawns ./tinyvenc8, anything else
+    (including 6) spawns ./tinyvenc5.
+  - Hard guard: if capture width < 128 OR capture height < 128, vcm does
+    NOTHING - no cfg, no spawn.
+  - `tinyvenc5` has VideoCap **14.0.0.0** statically linked; the on-disk
+    `libvideocap.so.13` (13.0.0.4) is not what runs. Same logic, different
+    build - hence `VideoCap_CheckVIC`'s version-only "Invalid vpl_vic driver
+    version" string.
+
+Verdict: the driver's 44-byte SET_VIC packet and the cfg it produces are
+correct. The cfg is eliminated as a suspect.
+
+### 3. NEW: ep.ko has a NO-SIGNAL LATCH that silently swallows commands
+
+In `pciep_isr`, op 0x29 does:
+
+    if (width != 0 && height != 0) {
+        no_signal_latch = 0;
+        windows_select_fw = (fw == 7) ? 7 : 5;
+        sysfs_notify("command");            /* wakes video_capture_mgr */
+    } else {
+        printk("$$$ cmd(%d) => no signal");
+        no_signal_latch = 1;
+    }
+
+While the latch is set, ops **6, 7, 9, 0x2a, 0x2f, 0x31, 0x60, 0x61, 0x62**
+skip their sysfs_notify entirely - the card never sees them - but ep.ko still
+runs its MSI path, so **the host observes a clean completion for a command
+that was discarded**. Only a SET_VIC with non-zero width AND height clears it.
+This is the mechanism behind the whole class of "returns 0, nothing happens".
+Our driver has exactly one SET_VIC call site and never sends zero dimensions,
+so this is not our current bug - but it is a real trap.
+
+### 4. NEW: SET_VIC byte 34 = int_reduce_en
+
+Previously unnamed in our field map. ep.ko stores it at its private +0x630 and
+`store_channel_done` branches on it to choose between coalescing frame-done
+events into the shadow EVENT word and raising an MSI per event. We send 0
+(the more-interrupts option). Worth diffing against what Windows sends.
+
+### 5. CONFIRMED: the one-shot MSI credit, and what re-arms it
+
+    msi():                 EVENT |= 0x800
+                           if (msi_enable) { BAR0[0x30] = EVENT; EVENT = 0;
+                                             msi_enable = 0; ring doorbell; }
+    pciep_isr_clrint():    BAR0[0x30] = 0;  msi_enable = 1
+
+So the credit is consumed by every MSI and re-armed by the host's
+interrupt-clear write - i.e. by our existing ack. The "dead credit"
+hypothesis from M35 is closed: the credit cannot stay dead as long as we ack.
+
+### 6. Loose ends surfaced, not chased
+
+  - `tinyvenc5`'s `Start()` reads `/sys/vpl_pciep/dency`; value 3 turns on
+    "split_check" for the channel. `dency` is one of ep.ko's sysfs knobs
+    (hready/hency/aency/dency/qency/wency/pre_uv) - none is written by the
+    host command path we use.
+  - The unexplored I2C device at 0x98 remains unexplored.
+
+### Where this leaves the search
+
+Every host-controllable software input to the capture chain is now verified
+correct against the card's own code, and the failing verdict is produced by
+the SoC's VIC hardware about the BT1120 bus itself. The next discriminating
+evidence is physical: the card's serial console (which of bits 0x02/0x04/0x10
+is set), or a probe on the BT1120 lines.
+
+One cheap software experiment does remain, because the cfg exposes the VIC's
+width register independently of the capture width: send SET_VIC with
+bytes 24..25 (input frame width) = 3840 while leaving capture width at 1920.
+If the MST3367 is emitting 8-bit double-rate samples rather than 16-bit
+BT1120, the VIC's width check would fail exactly as observed, and this is the
+only host-side way to test that without a scope. The paired variant is
+in_fmt = 3 (CCIR656p) with the same 3840.
+
+### M76 SWEEP RESULT (hardware, 2026-08-19): width hypothesis DEAD, and the
+### card is writing its NO-SIGNAL SPLASH on the REAL path
+
+`mz0380-m76-vicwidth-sweep.sh`, four passes against a locked 1080p60 source
+(R55=0x7f, htot=2200, vtot=1125, hact=1920 every pass):
+
+    vic_in=1920x1080 in_fmt=6   ret=0   captured 0 bytes
+    vic_in=3840x1080 in_fmt=6   ret=0   captured 0 bytes
+    vic_in=3840x1080 in_fmt=3   ret=0   captured 0 bytes
+    vic_in=1920x1080 in_fmt=3   ret=0   captured 0 bytes
+
+Byte-identical outcomes. **The VIC width/format declaration is eliminated** -
+the 8-bit double-rate hypothesis is dead, and so is CCIR656p as an input
+format. `vic_in_w`/`vic_in_h`/`vic_in_fmt` stay in the driver as inert
+(0-default) levers.
+
+The sweep's own grep hid the important part. Every pass reported:
+
+    stop buf[0] @0x100000000 head=11 11 11 11 11 10 11 11 ... |
+        760/1024 sampled pages touched, last @0x2f7000
+    stop buf[1..3]                                            0/1024
+
+Buffers are freshly poisoned with 0xAA at every arm (bufs 1-3 still read 0xAA,
+so the scan is sound). So on the **real** path, `is_nosg=0`, with the receiver
+locked for the whole 60 s window, the card DMAs ~3.1 MB into buf0 -
+deterministically, same extent and same head bytes in all four passes.
+0x2f7000 = 3,108,864, i.e. the 0x30a5c0 (3,188,160) fake-frame burst extent of
+M30-M38, and 0x11 is that splash's documented background fill.
+
+This overturns two things the previous handoff asserted:
+
+  1. "the card's VideoCap never delivers a frame / host buffers stay
+     untouched (0/1024 pages)" - it *does* deliver, and the destination
+     programming, opcode 0x02, IOVA remap and outbound window all work on the
+     real path, not just the synthetic one.
+  2. The failure is not "nothing happens". tinyvenc5 is running and producing
+     its **no-signal fallback picture** - which is the card-side expression of
+     the `VideoCap_GetBuf -> "[VIDEOCAP][ERROR]: No signal !!"` path decoded
+     above. The card's own userspace has decided there is no input while the
+     MST3367 holds lock.
+
+`captured 0 bytes` is therefore a separate, downstream fact: raw splash bytes
+land in buf0 but no completion (enc_stat / frame token) is ever signalled, so
+the V4L2 node has nothing to hand out. Whether that is because the splash is a
+one-shot write outside the encode path, or because completion is only raised
+for encoded output, is the next question - and the m55 run that produced this
+was grep-filtered, so the `stream start|frame token|enc` lines were never
+seen.
+
+Instrumentation added for the next pass: `/proc/mz0380-buf0` dumps stream
+buffer 0 verbatim (0400), and m55 now writes it to `/tmp/mz0380-buf0.bin`
+before unloading the module, so the content can be identified offline rather
+than inferred from 16 head bytes.
+
+### M76 buf0 DECODED, and the console is reachable over PCIe after all
+
+`/proc/mz0380-buf0` dump of the M55 run, region map:
+
+    [0x000000, 0x1FA400)  2,073,600 = 1920x1080 Y, fill 0x11 + ~13.6 KB of glyphs
+    [0x1FA400, 0x2F7600)  1,036,800 = 1920x540  UV, all 0x80 (neutral = grayscale)
+    [0x2F7600, 0x400000)  0xAA poison, untouched
+
+Exactly 1920*1080*1.5. Rendered, the Y plane is the card's **"NO SIGNAL"**
+splash (spinner + text, centred) - at OUR SET_VIC geometry, not the 720-wide
+canvas of M50. So the card accepted our width, ran tinyvenc5, and drew its
+no-signal picture while R55 held 0x7f LOCKED for 60 s. `irq_total=4` (the
+command acks), `frame_events=0`, `EVENT=0`, `enc=0`: raw splash bytes land in
+buf0 with no completion, which is why V4L2 sees 0 bytes.
+
+Output-stage diff vs stoth68000/hdcapm `mst3367-drv.c` (an independent Windows
+I2C trace of the same receiver family):
+
+    reg        ours (live)   hdcapm      note
+    BANK0 b0   0x21          0x14        ours = init 0x14 -> 0x20 -> per-mode
+                                         (b0 & 0xc2) | (vic_b0 & 0x3d)
+    BANK0 b1   0xc0          0xe0        ours is deliberate: HD60 Pro's own
+    BANK0 b2   0x00          0x08          FUN_14024dc28, "sibling uses e0/08"
+    BANK0 b4   0x55 -> 0x54  same
+    ad/ae/b5/73/1e/1f/90/91/CSC           identical
+
+So b1/b2 are board-specific and sourced from this card's Windows driver, not a
+bug; and the `vic_b0` parameter's premise ("hdcapm uses 0x20") is wrong - the
+only 0xb0 write in hdcapm is 0x14. The receiver config is not obviously at
+fault, and static comparison has run out of road.
+
+**The card's console does not need a UART.** mz0380-fw.c uploads
+`/lib/firmware/mz0380/MZ0380.HD.HEX` - a gzip+tar of the entire
+`yuan_demo_sdi/` rootfs, including `yuan_start_process.sh` - on every insmod,
+and the card reboots into it. We therefore own the card's userspace. And
+`video_capture_mgr` op **0x6e (LOAD_FILES)** is an arbitrary-offset 16-byte
+read/write of a fixed path, `/mnt/flash/PIC_ENC` (vcm FUN_0000aa3c):
+
+    param1 = is_write (0 = read)   param2 = fseek offset
+    payload = 16 bytes at cmd[12..27], echoed back to the host by pwrite()
+
+Redirect tinyvenc5/video_capture_mgr stdout+stderr to `/mnt/flash/PIC_ENC` in
+`yuan_start_process.sh`, then page it back 16 bytes at a time with op 0x6e.
+That yields the exact line the card prints - which of "FIFO full",
+"No signal !!" or "(CCIR or width chck fail)" - over PCIe, with no board
+access. Recovery path if an image is bad: the card keeps
+`/mnt/flash/yuan_demo_sdi_bak` and `yuan_update_only.sh`.
+
+================================================================================
+
+ M78 THE SOURCE IS ENCRYPTING THE LINK. (2026-08-19)
+
+Read the LINK layer for the first time. R55 lock is the timing front end only;
+whether the receiver forwards pixels to BT1120 is a different layer, and we had
+never looked at it. hdcapm's RxTmdsGetType names the registers, and they are
+the same two the Windows driver reads right after its output-stage commit:
+
+    BANK1 0x01  bit2 = HDMI (clear = DVI), bit1 = HDCP_OP_STS, bit0 = HDCP_MD
+    BANK1 0x34  bit7 = HDCP in use
+
+Hardware, three sample points in one run (before START, after START, +60 s),
+identical every time, receiver holding R55=0x7f the whole window:
+
+    link: B1 01=8d 34=90 -> HDMI, HDCP present, ACTIVE (encrypted)
+          B2 0b=38 0c=11 0e=df 48=80
+
+0x8d bits [2:0] = 101, which the MST3367 table reads as **HDMI EESS + HDCP,
+without advance cipher**. The source is encrypting.
+
+This dissolves the contradiction the project has been stuck on since M45. TMDS
+clock recovery and timing measurement work on an encrypted stream - the clock
+and syncs are not encrypted, the pixels are. So "receiver LOCKED, coherent
+1080p60" and "the SoC's VIC sees no signal" were never in conflict; we were
+reading one layer and drawing conclusions about another. Every downstream
+elimination this session (cfg, SET_VIC field map, VIC width/format, DMA
+destination opcode, MSI credit, output-stage register diff) stands, and none
+of them could ever have produced a frame while the pixels arriving at the
+receiver were undecryptable.
+
+It also retires the console-over-PCIe plan as the next step: the card's log
+would have printed "No signal !!" and explained nothing.
+
+NOT re-litigated, and worth keeping straight: the 1920-wide "NO SIGNAL" splash
+of M76 is OUR geometry echoed back (host -> SET_VIC -> generated cfg ->
+tinyvenc render canvas). It proves the config path and the render/DMA/host
+path, and nothing whatsoever about what the SoC sees. No number originating
+from the VIC's view of its input has ever reached the host.
+
+NEXT TEST (no code): attach a source that does not assert HDCP - a PC desktop
+output, a Pi, a console with HDCP disabled - and run m55. The link line then
+reads "HDCP absent", and either frames flow (diagnosis confirmed, driver done)
+or they do not (HDCP was a red herring, and the receiver -> VIC path is back
+in scope along with the console plan).
+
+The test source used for every run on record is a digital microscope/camera.
+Cameras and camcorders commonly assert HDCP on their HDMI output
+unconditionally, which fits the entire symptom history.
+
+Instrumentation from this pass, all read-only and kept:
+  - mz0380_mst3367_output_diag() now also reads BANK1 0x01/0x34 and BANK2
+    0x0b/0x0c/0x0e/0x48 and decodes HDMI-vs-DVI and HDCP, at all three
+    existing sample points. m55 surfaces it under "link layer".
+  - /proc/mz0380-buf0 (M76) and /proc/mz0380-cardlog + LOAD_FILES (M76/M77)
+    remain available; the cardlog_probe self-test is built but unrun.
+
+================================================================================
+
+ M79 DEEP COLOUR: A VALID 1080p60 SOURCE WAS BEING REJECTED OUTRIGHT.
+ (2026-08-19, fixed and verified on hardware)
+
+A third test source read, stably and repeatedly:
+
+    htot=2750 vtot=1125 hact=1920 hper=674 vper=599 lines=1125 p [R55=0x7f]
+    => "MST3367 coherent but unsupported - please report"
+
+Detection failed, so the run never reached STREAMON at all. But every field
+except htotal is a textbook 1080p60, and 2750 == 2200 x 1.25.
+
+The MST3367 counts htotal in TMDS CHARACTER CLOCKS, which HDMI deep colour
+scales: 24-bit x1, 30-bit x1.25, 36-bit x1.5. hperiod and vperiod run off a
+fixed reference and are unaffected (67.4 kHz / 59.9 Hz, both correct), and
+hactive is a video-domain counter and reads a true 1920. Only the TMDS-domain
+number moves. The source is sending 30-bit deep colour.
+
+The driver already half-knew this. mst3367_match_mode() tries raw and x3/2,
+and hdcapm's table carries 720p60 twice (1650 and 2475). That duplicate row is
+not "the same mode on a Tivo" - it is a 36-bit deep-colour source. We handled
+x1 and x1.5 and had a hole at x1.25.
+
+The table sits in the x1.5 domain, so a 30-bit measurement needs x1.5/x1.25 =
+x6/5: 2750 * 6 / 5 == 3300, dead centre of the 1080p60 row (3290-3310). Third
+scaling pass added to mst3367_match_mode().
+
+HARDWARE RESULT: same source now reports "=> MATCHED", yields the correct
+1920x1080p60 V4L2 preset with a real 148.5 MHz pixel clock, and arms STREAMON.
+Independent of the capture blocker, and a bug any deep-colour source would hit.
+
+--------------------------------------------------------------------------
+
+ M79b HDCP DOWNGRADED AS A SUSPECT
+
+Three sources now - a microscope/camera, a phone over a USB-C HDMI dongle, and
+the deep-colour source above - all read B1 01=8d 34=90, byte-identical.
+
+M78 read that as the blocker. On reflection that is too strong: a source only
+encrypts AFTER a successful HDCP handshake, so "active/encrypted" means the
+MST3367's HDCP engine authenticated and is decrypting - normal operation, and
+what Windows would see too. The Elgato "refuse to capture protected content"
+behaviour is HOST-driven (the Windows driver selects /tmp/PIC_HDCP via the
+logo opcode); the card does not refuse on its own, it reports no signal.
+
+HDCP stays recorded as a fact about the links we have tested. It is no longer
+the leading explanation. A non-HDCP source would still be a clean control if
+one turns up, but it is not worth hunting for.
+
+--------------------------------------------------------------------------
+
+ M80 THE REAL SUSPECT NOW: EMBEDDED SYNC vs EXTERNAL SYNC
+
+All three sources also report input colorspace RGB (B2 0x48 & 0x60 == 0x00).
+More to the point, this driver's own receiver init ends with
+
+    /* YUV422, 8-bit, external sync */
+    mst_wr(dev, 0xb0, 0x20);
+
+EXTERNAL sync - separate HS/VS/DE. And we tell the SoC's VIC in_fmt=6 =
+BT1120p, which carries sync EMBEDDED in the data as SAV/EAV codes. A VIC
+scanning for embedded timing codes in a stream that has none reports exactly
+what we observe: no valid sync, while the timing front end stays locked.
+
+The cfg enum is 1:8-bits Raw, 2:CCIR656i, 3:CCIR656p, 4:Bayer, 5:16-bits Raw,
+6:BT1120p, 7:BT1120i. 2/3/6/7 are all embedded-sync. 5 is the 16-bit
+external-sync sibling of 6 and has NEVER been tried - M76 swept only 6 and 3.
+
+mz0380-m80-syncmode-sweep.sh sweeps in_fmt x vic_b0 (we write 0x21; hdcapm's
+only 0xb0 write is 0x14). Read the buffers, not the capture: buf0 at 760/1024
+is the NO SIGNAL splash and means the pass failed. buf[1..3] touched, or a
+nonzero capture, is the answer.
+
+### M80 RESULT (hardware): sync-mode pairing is NOT the blocker - but the
+### splash turns out to be a free progress oracle
+
+Five passes, deep-colour source, mode MATCHED, SET_VIC ret=0 every time:
+
+    in_fmt  vic_b0   buf0            capture
+    5       0x21     0/1024 poison   0 bytes
+    5       0x14     0/1024 poison   0 bytes
+    6       0x14     0/1024 poison   0 bytes
+    1       0x21     0/1024 poison   0 bytes
+    2       0x21     760/1024 SPLASH 0 bytes
+
+No pass captured anything, and no buffer other than buf0 was ever touched. The
+embedded-vs-external sync hypothesis is dead: both families fail, and so do
+both 0xb0 values.
+
+The unplanned finding is the buf0 column. Combined with M76 (in_fmt 6 and 3,
+b0=0x21, both splash):
+
+    b0=0x21 + an EMBEDDED-sync in_fmt (2, 3, 6)  -> card renders NO SIGNAL splash
+    a "Raw" in_fmt (1, 5), or b0=0x14            -> card writes nothing at all
+
+So SET_VIC byte 7 and the receiver's 0xb0 both demonstrably change how far the
+card gets, which independently confirms the control surface reaches the card's
+VIC init. More useful: **the splash is a free progress oracle.** "Splash" means
+VideoCap initialised and the capture loop ran and failed on no-signal;
+"nothing" means it failed earlier, at init. Any future config change can be
+scored on that axis with no console at all.
+
+Not a wedge: the last pass still rendered, so the card was healthy throughout
+and the 0/1024 passes are real results, not exhaustion.
+
+Where that leaves the search. The host-side configuration space is now
+genuinely exhausted: cfg contents, every SET_VIC field, VIC width/height,
+input format across both sync families, output format, DMA destination
+opcode, MSI credit, receiver output-stage registers against two independent
+Windows traces, and the link layer. The one instrument not yet used is the
+card's own log, and M76/M77 already built and proved the transport for it
+(LOAD_FILES op 0x6e round-trips cleanly; /mnt/flash/PIC_ENC simply does not
+exist yet). What remains is the one-line change to yuan_start_process.sh that
+creates it.
+
+---
+
+### M82 (Windows collect-2026-08-19): the capture-start sequence was wrong, and
+### so was the interrupt model
+
+Source: `/run/media/wolffyx/Work/hd60-trace/collect-2026-08-19/`, a full
+re-collection on the working Windows 11 machine - four live DebugView kernel
+traces plus a capstone re-analysis of `e60MZ0380.X64.SYS` v1.1.0.195. It
+answers the `WINDOWS_SESSION.md` list and overturns several things this project
+had settled.
+
+#### What it kills
+
+**EDID is not the blocker, and was never on the path.** All four traces,
+including one complete `DriverEntry`, contain zero `[UPDATE.EDID]`, `[HOTPLUG]`
+or `VSTATE_*` lines. The code at `0x140248110` explains it: the push is gated on
+a dirty flag at `EDID_buffer+0x100` that `DriverEntry` never sets, so the driver
+delivers an EDID only when an application hands it one - and no Elgato app was
+installed. Sources locked and frames reached OBS anyway. Host-side EDID
+delivery is **not required for this card to capture**. (The blob itself is a
+static 256 bytes in `.data`, monitor name `SC530-N1`, saved in the collection.)
+
+**HDCP is not the blocker.** The DSLR - one of the sources this driver cannot
+capture - captures fine on Windows: `R0055 = 7F`, 2200x1125, dotclock 74175,
+all four pin slots open, full command sequence, ring advancing, and no HDCP
+path anywhere in any trace.
+
+**Firmware 01.11 is the shipping version.** Our `MZ0380.HD.HEX` is byte-identical
+to Elgato's (sha256 `be0d5e19...`). There is nothing newer to prefer, so
+restoring `MZ0380.FW.TXT` to `01.11` is correct and stops the 21 s re-upload.
+
+**`R0055 = 0xFF` is a valid lock**, interchangeable with `0x7F`; only `0x03`
+means no signal. Our `mst3367_status_locked()` gates on `& 0x1c` and already
+accepts it, so no change - but a stricter predicate would have rejected a good
+signal.
+
+#### 1. The interrupt path we use is one Windows has never exercised
+
+`DEVPKEY_PciDevice_InterruptSupport = 3` and `InterruptMessageMaximum = 1`:
+the endpoint **does** advertise MSI, one message. Windows declines it.
+`MessageSignaledInterruptProperties` is absent for this device (14 other PCI
+devices on the same board have it), the INF has no `MSISupported`, `AllocConfig`
+assigns a level-sensitive shared line with `CM_RESOURCE_INTERRUPT_MESSAGE`
+clear, and the trace logs `INTERRUPT = 00000000` on IRQ 29.
+
+We called `pci_alloc_irq_vectors(..., PCI_IRQ_MSI | PCI_IRQ_INTX)`, which
+prefers MSI because the hardware says it is available. On top of that,
+`mz0380_initdev()` called `pci_intx(pci_dev, 0)` and never undid it, so the
+legacy line was masked even if MSI had failed to bind. If the card's MSI path
+is unwired in firmware - which the vendor refusing to use it hints at - the
+symptom is exactly ours. Now defaults to INTx (`irq_intx=1`), and the line is
+unmasked once an ISR exists.
+
+#### 2. `0x29` IS sent by Windows, first, and `CARD-ADDRESS-MAP.md` was wrong
+
+That document states in two places that `SET_VIC_PARAMS` is never sent by the
+Windows driver. It is, from `0x14028bc4c`. The earlier sweep missed it because
+the store is a plain `mov dword ptr [rbp+0xc4], 0x29` inside an 11 KB function.
+The full sequence, from one function at `0x14028a248`, on every mode change:
+
+    0x07  STOP_STREAMING   word[2]=0xFFFFFFFF, count 3, flag 1
+       ~1.9 s              (1.84-1.91 s in all six observed reconfigurations)
+    0x29  SET_VIC_PARAMS   count 0x0B, flag 1
+    0x2A  SET_AIC          count 6,    flag 1
+    0x2D  encoder, main    count 0x0C, flag 1, mask 0x3FFF, main_or_sub = 0
+    0x2D  encoder, sub     count 0x0C, flag 1, mask 0x3FFF, main_or_sub = 1
+    0x31  POST_PROC        count 7,    flag 1, mask 0x1F, di = 1
+
+Ours was `0x29 -> 0x2d(main) -> SET_BUF -> 0x2a -> 0x06`. Differences that
+matter: no stop first, no settle, the encoder before the audio, only one
+encoder stream, and **`0x31` never sent at all**.
+
+`[FIRMWARE RESET]` is resolved and is not a reset: the log site only sets a
+"reconfiguration pending" flag; the work is `0x14028cf38` (the `0x07` above)
+followed on the very next instruction by the reconfigure. `count = 3` and
+`word[2] = 0xFFFFFFFF` are both required - Windows' SEND_COMMAND rejects
+`count <= 1`.
+
+**Windows never sends START_STREAMING (`0x06`) on the capture path.** It does
+not need to: ep.ko routes `0x2d` (45) and `0x31` (49) to a bare
+`sysfs_notify("epint")`, the same wake `0x06` performs. The tail of the
+sequence is itself the kick.
+
+#### 3. SET_VIC, byte-exact - five fields were wrong
+
+Decoded from the nine dword stores at `0x14028bc56..0x14028bd49` and confirmed
+against the driver's own printf, which proves the byte assignment independently:
+`vi` is read from the slot that lands at **byte 7** and `fw` from **byte 6**.
+
+| byte | field | Windows sends | we sent |
+|---|---|---|---|
+| 6 | `fw` | **6** at <=30 fps, **7** at 60 | 5 |
+| 7 | `vi` / input format | 6 (BT1120p) | 6/7 by interlace - matches |
+| 12 | `m` | 0 at integer rates, 1 at 29.97 | 1 |
+| 16..19 | `color_info` | **0x02010101** (1,1,1,2) | 0x00800000 |
+| 33 | `fast_kill` | **1** | 0 |
+| 36..39 | `nosg` back/Y/U/V | **0.00.80.80** | 0 |
+
+`fw` is the sharpest of these. M79 established that vcm derives the capture
+cfg's *output format* from it - 2/YUY2 when `fw == 6`, else 1/YV12 - and spawns
+`./tinyvenc7` when it is 7. We have always sent 5, which is not a value the
+retail driver has ever used; it reaches tinyvenc5 by fallthrough but selects
+the other pixel format.
+
+The M72 reading of bytes 16..19 as brightness/contrast/saturation/field-invert
+is retired: they are `color_info[0..3]` and Windows sends the same four bytes
+for every source in every trace.
+
+#### 4. SET_AIC byte 17
+
+`aic_int_mode = 1` in every trace (ep.ko stores it as `G[0x63c]`); we sent 0.
+Also settled: `frame_num_of_period = 4`, and the sample rate follows the client
+rather than being fixed at 48 kHz.
+
+#### 5. What is now the leading suspect: two I2C slaves we have never driven
+
+The static I2C trace finds **four** 8-bit addresses, not the two this project
+assumed:
+
+    0x9C  MST3367 receiver         454 transactions   (we drive this)
+    0x98  colour-space / video path 233               (never touched)
+    0x90  alternate CSC path        247               (never touched)
+    0xA0  EDID EEPROM                 2 bulk writes
+
+The 18 bytes to `0x98` sub-address `0x76` that `WINDOWS_SESSION.md` §3 asked
+about are YCbCr->RGB conversion matrices: little-endian 14-bit two's-complement
+Q11, and the BT.709 variant decodes to the exact ITU-R constants (+1.5396,
+-0.4595/-0.1831, +1.8159), which confirms the reading. One of two matrices is
+chosen by a colorimetry bit out of a video-format table at `0x1402d393c`.
+
+That trace is static, so it covers every board the driver supports and does not
+by itself prove either chip is fitted on the HD60 Pro. **But we already proved
+0x98 is** - and then threw the result away. The M43-M49b bus enumeration (op
+0x1a probe, non-zero = present) recorded: "ONLY 0x9c (main) and 0x98 (flat map,
+ignores bank-select, not EDID) answer". At the time everything was being judged
+by whether it could hold an EDID, so a device that clearly was not an EEPROM
+was noted and dropped. It is a fitted, ACKing slave that the Windows driver
+writes 181 times and this driver has never written once. (The same enumeration
+found nothing at 0xa0, which is consistent: Windows only ever *writes* that
+address, and only on the EDID path that never runs.)
+
+The open blocker is
+that the SoC's VIC reports no signal on BT1120 while the receiver holds a clean
+lock, and a colour-space/video-path device between the receiver's output and
+the SoC's input - sitting on power-on defaults because nothing has ever written
+it - is the first new candidate for that since the host-side configuration
+space was declared closed. `mz0380-m83-i2c-devscan.sh` settles whether they
+ACK; it costs zero encoder spawns and needs no source.
+
+#### 6. Frame geometry hypothesis
+
+`DriverEntry` logs `[MEMORY] [00466000] [0034BD00] [0034BD00]`. `0x34BD00` =
+3,456,256, and `2048 x 1125 x 1.5 = 3,456,000` - 256 bytes short. That is a
+YUV420 frame at a **2048-byte stride** over **1125 lines** (the *vtotal*, not
+the 1080 active lines) plus a 256-byte header, allocated twice. One sample, so
+a hypothesis and not a layout - but it is a concrete alternative to assuming a
+tightly packed 1920x1080 frame. `0x466000` is a third region, unexplained.
+
+#### Changes made
+
+`irq_intx` (def 1), `win_seq` (def 1), `stop_settle_ms` (def 1900),
+`vic_color_info` (def 0x02010101), `vic_fast_kill` (def 1), `vic_nosg`
+(def 0x80800000), `aic_int_mode` (def 1), `enc_sub` (def 1), `enc_mask`
+(def 0 = keep the conservative fps/gop/bitrate mask), `post_mask` (def 0x1f),
+`post_di` (def 1), `win_start_op6` (def 0). `vic_fw` default 5 -> 0 (auto),
+`vic_out_format` default 1 -> 0, `vic_saturation` now unset by default and only
+overrides byte 18. All STOPs now carry the all-channels word.
+
+---
+
+### M83 RESULT (hardware, 2026-08-20): 0x98 IS fitted; 0x90 is not
+
+Zero-spawn bus probe, `mz0380-m83-i2c-devscan.sh`, REG_READ (0x1a) over the
+mailbox proxy, regs 0x00..0x3f, no source needed.
+
+| chip | zero regs | verdict |
+|---|---|---|
+| `0x9c` MST3367 (positive control) | 38 / 64 | present, plausible bank-0 values |
+| **`0x98`** | **10 / 64** | **PRESENT.** Dense, varied, high-entropy - `54 49 12 16 1c 60 ... 96 5e 9a 5f 0d fb 82 d9 ...` |
+| `0x90` | 64 / 64 | absent - NAKs every address on this board |
+
+So of the two slaves the Windows driver drives and we never have, **one is
+really on this board**: `0x98`, which the retail driver touches 233 times (181
+of them writes) and which has been sitting on power-on defaults for the entire
+life of this project. `0x90` is another board's path and can be ignored.
+
+This also retro-confirms the M43-M49b enumeration, which had already seen 0x98
+answer and filed it as "flat map, ignores bank-select, not EDID" - correct, and
+irrelevant to what it actually is.
+
+### M84 RESULT (hardware, 2026-08-20): the Windows sequence runs clean and makes
+### things WORSE - the splash oracle went dark
+
+First run of the M82 change set against a live 1080p60 source (not the DSLR).
+Every command was accepted:
+
+    pre-STOP(op 0x07, all channels) ret=0, settling 1900 ms
+    SET_VIC(1920x1080p@60 fw=7 in_fmt=6 out_fmt=0 ...) ret=0
+    SET_AIC(on=1, 2ch, 16bit, 48000) ret=0
+    SET_ENC_PARAMS(0x2d, mask=0x0043, main ch0, fps=60, gop=60) ret=0
+    SET_ENC_PARAMS(0x2d, mask=0x0043, sub  ch0, fps=60, gop=60) ret=0
+    POST_PROC(0x31, mask=0x1f, fps=60, di=1) ret=0
+
+Receiver held `R55=0x7f` for the whole 60 s window and re-MATCHED 1080p60
+repeatedly across source power-cycles. And:
+
+    stop buf[0..3]: 0/1024 sampled pages touched, head still aa aa aa ...
+    EVENT=0 token=0 enc_stat=0 frame_events=0 irq_total=8
+
+**All four buffers untouched.** That is a regression, not a null result: before
+this change set the same path wrote ~3.1 MB of the card's NO SIGNAL splash into
+buf0. Scored on the M80 oracle, we moved from "VideoCap initialised, capture
+loop ran, failed on no-signal" to "failed earlier, at VIC init".
+
+Six things changed at once, which is exactly the mistake the M81 post-mortem
+warned about. Ranked suspects:
+
+1. **`fw` 5 -> 7.** Much the largest blast radius. `fw == 7` makes vcm spawn a
+   **different binary** (`./tinyvenc7`, which does exist in the image - checked)
+   and makes ep.ko route every subsequent notify to **`epint_1080p`** instead of
+   `epint`. Every host-side ABI we hold - notably the enc_stat handshake at
+   BAR0+0x50+idx - was derived from tinyvenc5. Note Windows only uses 7 at
+   60 fps; at 30 fps it uses 6, which still falls through to tinyvenc5 and only
+   changes the cfg's output format to 2/YUY2. **So `fw=6` is the Windows value
+   that keeps our known-good encoder binary, and is the right first bisect.**
+2. **No op 0x06.** M22 proved on hardware that tinyvenc5 blocks on epint waiting
+   for START before it DMAs anything. Windows substitutes the 0x2d/0x31
+   notifies - but our 0x2d carries mask 0x0043, not Windows' 0x3FFF.
+   `win_start_op6=1` restores it.
+3. **SET_BUF moved before SET_VIC.** M23 put it after, so that op6's iATU latch
+   would see our addresses. Now split out as `win_bufs_first` (M84) so it can be
+   bisected without disturbing `win_seq`.
+4. The value fixes (color_info, fast_kill, nosg, m, aic_int_mode) - low blast
+   radius, but `fast_kill=1` is not a name to trust blindly.
+
+**Unrelated but worth keeping: this source is HDCP-free and YUV444.**
+`B1 01=8c 34=40` -> HDMI, **HDCP absent**; `B2 48=d2` -> **input colorspace
+YUV444**. Every source before this one read `01=8d 34=90` (HDCP active) and
+`48=80` (RGB). So the capture failure reproduces with no HDCP anywhere in the
+link - which confirms the Windows oracle's verdict on our own hardware, not just
+theirs. It also means the receiver's output stage is being asked to convert
+YUV444 -> YUV422 for BT1120 with `b0=0x21`; hdcapm ends its init with
+`0xb0 = 0x20`, and M80 swept 0x21 against 0x14 but never against 0x20.
+
+`irq_total=8` on legacy INTx (irq 40) - the line does deliver, so the M82
+interrupt change is at least not inert. Those are command completions, not frame
+events (`frame_events=0`).
+
+#### M84 fallout: the INTx switch exposed a teardown-order bug (fixed)
+
+The run after M84 could not load at all - `insmod: Device or resource busy`,
+with `lsmod` showing `mz0380 303104 -1`: **refcnt -1**, i.e. the module stuck in
+`MODULE_STATE_GOING`. A module in that state can neither be removed nor
+reloaded; only a reboot clears it.
+
+Cause, from the journal:
+
+    RIP: 0010:mz_read+0x16/0x20 [mz0380]
+    CR2: 0000000000000030        <- MZ0380_MB_EVENT
+    RAX: 0000000000000000        <- dev->bmmio[0], already NULL
+    RSI: 0000000000000000        <- map index 0 = MZ0380_MAP_BAR_MMIO
+    note: rmmod[26730] exited with irqs disabled
+
+`mz0380_finidev()` called `mz0380_dev_unregister()` (which `iounmap`s both BARs
+and NULLs `bmmio`) **before** `mz0380_irq_release()` (which does the
+`free_irq`). Under MSI that window is harmless: an MSI source stops signalling
+once the device is quiesced, so the handler is never entered after the unmap.
+Under the shared INTx line the Windows driver uses, **every other device on
+IRQ 40 enters our handler** - and the first one to do so inside that window
+dereferenced a NULL `bmmio` in the ISR's very first `mz_mmio_read`, oopsing
+inside `rmmod` with IRQs disabled.
+
+So this is not a reason to back away from INTx; it is a latent ordering bug that
+only a shared line can reach. Two fixes:
+
+1. `mz0380_finidev()` now frees the IRQ before unmapping anything.
+2. `mz0380_isr()` returns `IRQ_NONE` if `dev->bmmio[MZ0380_MAP_BAR_MMIO]` is
+   NULL. A shared handler must not depend on teardown ordering alone.
+
+Lesson for the scripts: `mz0380-m55-real-capture.sh`'s cleanup trap runs
+`fuser -k` on the video node and then `rmmod`. When the `rmmod` itself oopses,
+the trap reports a confusing `line 48: <pid> Killed` and leaves the machine
+needing a reboot - the "Killed" is the dying `rmmod`, not the capture.
+
+**Prevention, not just a fix.** `mz0380-m85-unload-smoke.sh` loads and unloads
+the module with `enable_dma=1` (required - `mz0380_irq_request()` is gated on
+it, and with no `request_irq` there is no `free_irq` and so no DEBUG_SHIRQ
+callback to catch anything), `enable_video=0`, `firmware_upload=0`. Five
+seconds, zero encoder spawns, and it fails loudly on any oops/BUG/WARN or a
+module still listed after `rmmod`. Run it for **both** interrupt paths - a pass
+under MSI proves nothing about INTx, because MSI cannot reach the shared-IRQ
+teardown window at all. `mz0380-m55-real-capture.sh` now runs it as a preflight
+and refuses to start if it fails or if the module is already stuck in
+`MODULE_STATE_GOING` (`SKIPSMOKE=1` bypasses).
+
+The general rule this cost us: **moving a driver to a shared interrupt is a
+contract change, not a one-line parameter change.** The handler becomes
+callable at instants it previously never was - including from inside
+`free_irq()` - so it must be audited against every teardown path and must be
+safe when the resources it reads are already gone.
+
+### M86 CONTROL (hardware, 2026-08-20): the oracle holds, so M84 really is a regression
+
+`fw=6` did not restore the splash either (0/1024 on all four buffers), which
+clears tinyvenc7 - but it also does not clear the change set, because `fw=6`
+is not the old configuration: per M79, `fw==6` makes vcm write "output format"
+= 2/YUY2 into the cfg where our long-standing `fw=5` wrote 1/YV12. Neither M84
+nor the fw bisect ever reproduced the pre-M82 state.
+
+Worse, the "splash rendered" baseline had only ever been observed with the OLD
+sources (RGB, HDCP-active). The current source is YUV444 and HDCP-free, so
+"we regressed it" was, at that point, an unsupported inference. Run the control
+before bisecting against a baseline you have not verified on the hardware in
+front of you.
+
+Control = the exact pre-M82 configuration, current source:
+
+    WINSEQ=0 VICFW=5 VICM=1 INTX=0
+    EXTRA="vic_color_info=0x00800000 vic_fast_kill=0 vic_nosg=0 aic_int_mode=0"
+
+Result:
+
+    stop buf[0] head=11 11 11 11 11 10 11 11 ... | 760/1024 pages touched, last @0x2f7000
+    stop buf[1..3] untouched
+
+**The splash is back.** So the oracle is valid for this source and the M82
+change set is what took it away. Note the UV offset: 0xbdd80 reads 0x11, not
+0x80, i.e. this is the 1920-wide layout, not M50's 720-wide canvas - the card
+renders at our SET_VIC geometry, as M80 recorded.
+
+`irq_total` was 4 under MSI here against 8 under INTx in M84/M85 - both are
+command completions, `frame_events=0` in every run, so the interrupt path is
+not implicated either way.
+
+The change set splits cleanly in two, and one run separates them: **ordering**
+(`win_seq`: pre-STOP + settle, SET_BUF before SET_VIC, AIC before the encoder,
+sub-stream, POST_PROC, no op6) versus **values** (fw, out_fmt, color_info,
+fast_kill, nosg, aic_int_mode) plus the interrupt path. `WINSEQ=0` with every
+other M82 default is the split.
+
+### M87 BISECT (hardware, 2026-08-20): the regression is in the VALUES, not the order
+
+`WINSEQ=0` with every other M82 default (fw=auto=7, out_fmt=0, new color_info /
+fast_kill / nosg / aic_int_mode, INTx): **0/1024, no splash.**
+
+Old order + old values (M86)  -> splash
+Old order + new values (M87)  -> nothing
+
+So the whole ordering half of M82 is cleared: the pre-STOP with 0xFFFFFFFF, the
+1.9 s settle, SET_BUF before SET_VIC, AIC before the encoder, the sub-stream
+SET_ENC_PARAMS and POST_PROC(0x31) are all innocent. The card accepts the
+Windows sequence exactly as the Windows driver issues it.
+
+This also retro-invalidates the `fw=6` run as evidence about `fw`: it carried
+`out_fmt=0` and the new cosmetics too, so its failure said nothing about the
+encoder selector.
+
+    run          order   fw   m   cosmetics   irq    buf0
+    M84          new     7    0   new         INTx   nothing
+    fw bisect    new     6    0   new         INTx   nothing
+    M86 control  old     5    1   old         MSI    SPLASH
+    M87          old     7    0   new         INTx   nothing
+
+Next single variable from M87: `WINSEQ=0 VICFW=5` (only fw changes). If that
+restores the splash then only fw=5 works, while Windows sends 6 or 7 - which
+would be a real contradiction worth chasing rather than a settled answer. If it
+does not, fw is cleared and the suspects are byte 12 `m` (M79: it never reaches
+the cfg, it goes on the tinyvenc argv, where 0 may simply be rejected),
+color_info, fast_kill, nosg, aic_int_mode, or INTx.
+
+### M88 (hardware, 2026-08-20): the regression is ONE BYTE - SET_VIC byte 6 (fw)
+
+`WINSEQ=0 VICFW=5`, i.e. M87 with `fw` changed from 7 to 5 and **nothing else**
+- `out_fmt=0`, the new `color_info`/`fast_kill`/`nosg`/`aic_int_mode`, INTx all
+still in place:
+
+    stop buf[0] head=11 11 11 11 11 10 11 11 ... | 760/1024 pages touched, last @0x2f7000
+
+**Splash back.** Bisect complete.
+
+    fw = 5  -> tinyvenc5, cfg output format 1/YV12  -> splash renders
+    fw = 6  -> tinyvenc5, cfg output format 2/YUY2  -> nothing written
+    fw = 7  -> tinyvenc7, cfg output format 1/YV12  -> nothing written
+
+5 and 6 spawn the SAME binary and differ only in the cfg's "output format"
+line, so **YUY2 alone stops the capture loop before it writes a byte**. 7 fails
+independently, via a different encoder. Everything else in M82 is cleared and
+stays: the full Windows ordering (pre-STOP with 0xFFFFFFFF, 1.9 s settle,
+SET_BUF first, AIC before the encoder, the sub-stream, POST_PROC 0x31), all
+four value fixes, and legacy INTx.
+
+`vic_fw` default reverted to 5. `vic_fw=0` still selects the Windows rule for
+anyone re-testing the contradiction.
+
+**And it is a contradiction worth keeping in view.** Windows sends 6 at 30 fps
+and 7 at 60 and captures fine, on a card running a byte-identical firmware
+image (sha256 be0d5e19...; both hosts skip the upload because the version
+matches, so both boot the card's own flash). The same rootfs, the same opcode,
+the same 44-byte struct - and the value the retail driver uses kills our
+capture loop before it renders anything.
+
+So the difference is card STATE, not card CODE, and something in the state
+Windows establishes and we do not is what makes 6/7 viable there. The obvious
+candidate is the one M83 just found: **I2C 0x98, fitted, ACKing, written 181
+times by the retail driver and never once by us.** A colour-space converter is
+exactly the kind of thing that would make the difference between a YV12 and a
+YUY2 capture path working, and it sits in the video path where the VIC's
+no-signal verdict is produced.
+
+**Method note.** Byte-for-byte parity with the retail driver is a hypothesis
+generator, not a rule. Six changes went in together on the strength of "this is
+what Windows does"; five were right and one was actively harmful, and the run
+that found it was the CONTROL - re-establishing the known-good baseline on the
+hardware actually in front of us - not any of the bisect steps.
+
+**M89 (tooling, cost one hardware run).** The first attempt at the M88 baseline
+went out at `fw=7` despite the driver default having just been corrected to 5,
+because `mz0380-m55-real-capture.sh` hardcoded `vic_fw="${VICFW:-0}"` - and
+after M88, `0` means "use the Windows rule", i.e. 7 at 60 fps. The script
+silently overrode the default it was supposed to be testing.
+
+The script now builds its optional arguments with `add_opt`, which appends a
+knob **only when the caller actually set the environment variable**, so the
+driver's own default governs in every other case. Any `"${VAR:-<literal>}"`
+default in a test harness is a second source of truth for a value that already
+has one, and it goes stale the moment the driver changes.
+
+(The run itself was not misleading, just redundant: full Windows sequence +
+`fw=7` -> nothing written, consistent with M88.)
+
+### M90 CORRECTION (hardware, 2026-08-20): M87 and M88 both overclaimed - ordering
+### matters too, and the two interact
+
+Full Windows sequence with `fw=5` (verified `fw=5` on the wire this time, after
+the M89 harness fix): **0/1024, no splash.**
+
+    run          order   fw   m   cosmetics   irq    buf0
+    M84          new     7    0   new         INTx   nothing
+    fw bisect    new     6    0   new         INTx   nothing
+    M86 control  old     5    1   old         MSI    SPLASH
+    M87          old     7    0   new         INTx   nothing
+    M88          old     5    0   new         INTx   SPLASH
+    M90          new     5    0   new         INTx   nothing
+
+M88 and M90 differ in `win_seq` alone. M87 and M88 differ in `fw` alone. So
+**both are necessary**: the splash appears only with `fw=5` AND the pre-M82
+ordering. Neither variable alone explains anything.
+
+**Where the reasoning went wrong.** M87 concluded "the regression is in the
+VALUES, not the order" from a single run that reverted the ordering while
+`fw=7` was still set - and `fw=7` independently stops the capture loop. A
+variable cannot be cleared by a run in which another variable is already fatal.
+M88 then inherited the error and stated that the entire ordering half of M82
+was innocent. Both claims are withdrawn. What survives from M88 is only the
+narrower fact that, holding the old ordering fixed, fw=5 works and fw=7 does
+not.
+
+This is the same confounding mistake as the original six-at-once change, in a
+subtler form: a bisect step is only informative if every OTHER variable is at a
+value already known to permit the outcome being measured.
+
+**Remaining bisect, now on the ordering, with fw=5 held at its working value.**
+`win_seq` bundles six changes:
+
+  1. pre-STOP (0x07 with 0xFFFFFFFF) plus the 1.9 s settle
+  2. SET_BUF before SET_VIC          (`win_bufs_first`)
+  3. SET_AIC before the encoder      (vs the encoder first)
+  4. the sub-stream SET_ENC_PARAMS   (`enc_sub`)
+  5. POST_PROC (0x31)
+  6. no START_STREAMING (0x06)       (`win_start_op6`)
+
+6 and 2 are the two with hardware-proven prior evidence against them - M22
+showed tinyvenc blocks on epint waiting for op6, and M23 placed SET_BUF after
+SET_VIC so that op6's iATU latch would see our addresses. Test 6 first
+(`OP6=1`), then 2 (`WINBUFS=0`).
+
+### M91 (hardware, 2026-08-20): op6 is necessary but NOT sufficient - and the
+### failure mode is a 16-byte stall, not silence
+
+`OP6=1`, `win_seq=1`, `fw=5` (default). New outcome, distinct from both previous
+ones:
+
+    stop buf[0] head=11 11 11 11 10 10 11 11 11 11 11 11 11 11 11 11 | 1/1024 pages touched
+    buf0 dump  +0x00: 11 11 11 11 10 10 11 11 11 11 11 11 11 11 11 11
+               +0x10: aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa
+
+**Sixteen bytes of splash pixel data, then untouched poison.** The transfer
+started and died immediately. For comparison, M88's full splash was 760/1024
+pages, ~3.1 MB, same 0x11 background.
+
+    run                       order  fw  op6  bufs   buf0
+    M88                       old    5   yes  after  SPLASH (760/1024)
+    M90                       new    5   no   first  nothing (0/1024)
+    M91                       new    5   yes  first  16 BYTES (1/1024)
+
+So op6 is required - Windows genuinely does not need it, we do - but restoring
+it alone does not restore the stream. Something else in `win_seq` truncates the
+DMA after one 16-byte burst.
+
+M23 predicted exactly this shape: START (op6) is what makes vpl_dmac latch
+channels[] into the outbound iATU, and SET_BUF was deliberately placed AFTER
+SET_VIC so the addresses latched would be ours. Under `win_bufs_first=1` we
+program the buffers before SET_VIC, so the spawn sits between SET_BUF and the
+latch. A first burst landing correctly and everything after it going elsewhere
+is what a stale or half-updated iATU target looks like.
+
+Next: `OP6=1 WINBUFS=0` - one variable from M91, and every other variable is at
+a value already known to permit writing, so the step is informative either way.
+
+### M92 (full read of collect-2026-08-19, 2026-08-20)
+
+Everything in the Windows collection that bears on the capture path has now been
+read rather than skimmed. Three results, one of which retires a lead of my own.
+
+#### 1. The buffer-registration command shape, byte-exact
+
+`funcinfo` puts every one of them inside a single 6987-byte function,
+`0x14027aaa8..0x14027c5f3`. Extracting each doorbell-to-SEND_COMMAND block:
+
+    0x14027af84  op=r15d  ch=ebx   size=0xCA900   count=0xC
+    0x14027b080  op=3     ch=r12d  size=r15d      count=0xC
+    0x14027b111  op=4     ch=ebx   size=r15d      count=0xC
+    0x14027b1f2  op=5     ch=ebx   size=edi       count=0xC
+    0x14027b2e8  op=r15d  ch=ebx   size=0x10F000  count=0xC
+    0x14027b3e9  op=3     ch=r12d  size=r15d      count=0xC
+    0x14027b47a  op=4     ch=ebx   size=r15d      count=0xC
+    0x14027b55b  op=5     ch=ebx   size=edi       count=0xC
+    0x14027b62d  op=2     ch=0     size=0x466000  count=0xC
+    0x14027b752  op=8     ch=0     size=same      count=0xC
+    0x14027b787  op=3     ch=r15d  size=0x2000    count=0xC
+
+Identical shape throughout: `word[2]` = channel, **`word[3]` = buffer SIZE IN
+BYTES**, `word[4..11]` = four {hi,lo} pairs, count 12. High dword first, which
+is what we already send.
+
+**`word[3]` is a size, not a stride.** M27 named it "stride" and concluded the
+card ignored it. The sizes decode exactly:
+
+    0x466000 = 2048 x 1125 x 2   + 4096
+    0x34BD00 = 2048 x 1125 x 1.5 + 256
+    0x10F000 = 1024 x  540 x 2   + 4096
+    0x0CA900 = 1024 x  540 x 1.5 + 256
+
+frame bytes plus a small header, at a power-of-two stride, height = vtotal not
+active lines. That also identifies the third region in
+`[MEMORY] [00466000] [0034BD00] [0034BD00]`, which the collection had left
+unexplained: it is this command's size word. Our value (the real size of the
+buffer we allocate) was right all along; only the name was wrong.
+
+#### 2. op 0x02 and op 0x08 are a PAIR, and we send half of it
+
+Windows issues `0x08` immediately after `0x02` - back to back at
+`0x14027b62d` / `0x14027b752`, same channel, same size, four more address
+pairs - and never one without the other. ep.ko treats them asymmetrically:
+op2 fills window0 slots 1..4 and **clears** `host_ready` (G[0]); op8 fills
+slots 5..8 and **sets** `wency_ready = 8`. For the whole life of this driver we
+have sent only the one that clears a ready flag.
+
+Added as `set_buf_op8`, default 0 - the M88 baseline renders the splash without
+it, and after M84 an unmeasured change does not get to be a default.
+
+Note `probe_windows` (M32) already covers ops 0x04/0x05/0x03 but never included
+0x08, so this specific pairing had not been tested.
+
+Also confirmed from trace 1: `[CAPTURE PIN]` + `START [0] [0]` at 19:33:24.887,
+`[CH00]` at 19:33:25.607 - buffers really are registered ~0.7 s BEFORE SET_VIC,
+which is what `win_bufs_first=1` does.
+
+#### 3. RETRACTION: the 0x98 lead is much weaker than I claimed
+
+`dbgprint-log-strings.md` shows this one binary serves many boards - it is full
+of **NVP6134** (Nextchip analog AHD/CVBS decoder, 36 distinct error strings),
+**TECHPOINT** (TP28xx analog), and **SA7160** (analog tuner) paths. The I2C
+transaction trace is STATIC, so it spans every one of those boards, and the
+"233 transactions on 0x98" figure counts call sites that are gated on board IDs
+this card does not have.
+
+On top of that, `csc-matrices-and-format-table.md` shows the two matrices the
+driver actually sends to 0x98 (E4, E6) are **YCbCr->RGB**. A chip being handed
+YCbCr->RGB coefficients sits on a path that ends at a DISPLAY - the card's HDMI
+passthrough output - not between the MST3367 and the SoC's BT1120 input, which
+carries YCbCr and needs no such conversion.
+
+M83 remains true: something IS fitted at 0x98 on this board and answers with
+dense varied data (54/64 registers non-zero), and we have never written it. But
+"0x98 is where the capture blocker lives" was my inference from a transaction
+count, made before reading what the transactions were, and it does not survive
+the reading. Recorded as a retraction, not a refinement.
+
+#### What the read did NOT turn up
+
+No missing opcode in the capture path, no missing SET_VIC field, no host-side
+step between detection and streaming that we skip. The `0x02`/`0x08` pairing is
+the only concrete host-side gap the whole collection revealed.
+
+### M93 RESULT (hardware, 2026-08-20): op 0x08 is neutral
+
+`WINSEQ=0 OP8=1`. The command is accepted (`SET_BUF_8 ... ret=0`) and the result
+is byte-identical to the M88 baseline: buf0 760/1024 pages, head
+`11 11 11 11 11 10 11 11`, last @0x2f7000; bufs 1-3 untouched; EVENT, token and
+enc_stat all zero; `frame_events=0`.
+
+So the `host_ready` / `wency_ready` asymmetry between op2 and op8 is **not** a
+gate on the frame path. The only concrete host-side gap the entire Windows
+collection revealed is now tested and negative. `set_buf_op8` stays at default 0.
+
+**Where that leaves the host side.** Everything the Windows collection could
+give has been extracted and applied or eliminated:
+
+  - capture-start sequence, byte-exact        -> applied, and it needs op6 added
+                                                 back plus fw=5 to work at all
+  - SET_VIC field values                      -> applied (4 of 5); fw is ours
+  - SET_AIC aic_int_mode                      -> applied
+  - POST_PROC 0x31, sub-stream 0x2d           -> applied, neutral
+  - legacy INTx                               -> applied, neutral (and exposed
+                                                 a real teardown bug, M84)
+  - 64-bit DMA mask                           -> already correct
+  - EDID delivery                             -> DEAD, Windows never pushes one
+  - HDCP                                      -> DEAD, DSLR captures on Windows
+  - firmware version/image                    -> identical to Elgato's
+  - buffer-registration shape and size word   -> already correct (M92)
+  - op 0x02 / 0x08 pairing                    -> tested, neutral (this entry)
+  - I2C 0x98                                  -> retracted as a lead (M92)
+
+And the blocker is unchanged: the receiver holds a clean lock, every command is
+accepted, the encoder spawns and its capture loop runs - and the SoC's VIC
+reports no signal on BT1120. That verdict is produced by VIC hardware
+(MMR+0x30) and no host-side setting reaches it, which is what M76-M80 already
+established and what this whole session's host-side work has now re-confirmed
+from a second, independent direction.
+
+**The one unexplained divergence worth carrying forward** is fw. Windows sends
+6 (=> cfg output format 2/YUY2) or 7 (=> tinyvenc7); both make our VIC init fail
+before it writes a byte, while 5 (=> YV12, tinyvenc5) works. YUY2 is packed
+4:2:2, the natural format for a BT1120 bus, and YV12 requires a chroma
+downsample - so the card that cannot do the EASY one is telling us something
+about its VIC configuration. Nothing host-side can read that back.
+
+**Next instrument, not next parameter.** The remaining question is *why* the VIC
+says no signal, and the only thing that can answer it is the card's own console:
+`video_capture_mgr` op 0x6e (LOAD_FILES) is an arbitrary-offset read of
+/mnt/flash/PIC_ENC, M77 proved the transport works from the host, and M81 built
+a one-line firmware change that redirects the card's stdout into that file. It
+is built and NOT installed. That is the next move, and it is the same conclusion
+M80 reached before the Windows detour - which was itself worth taking, since it
+closed EDID, HDCP, the sequence and the interrupt model for good.
+
+### M94 RESULT (hardware, 2026-08-20): the Windows output-stage block does not
+### rescue b0=0x14 - but the negative locates the failure
+
+`WINSEQ=0 MSTOUT=1 VICB0=0x14`, with `MSTAD=0` and `MSTAD=1`. Both runs:
+0/1024 on every buffer, no splash. The block landed (`Windows block applied
+(b0=14 ae|=04 ad=00 b1=c0 b2=00 b3=00 b4=54) ret=0`) and read back correctly
+(`b0=14 b1=c0 b2=00 b3=00`), so this is a real negative, not a failed write.
+
+M80's isolated result stands: 0x14 is worse than 0x21, and the three registers
+we were missing (0xad, 0xae, 0xb4) do not change that. `mst_win_output` stays
+default 0.
+
+**What the negative proves, which is more than the positive would have.**
+`b0` decides how far the card gets:
+
+    b0 = 0x21  -> splash rendered      => VIC initialised, capture loop ran
+    b0 = 0x14  -> nothing written      => failed at VIC init
+
+A RECEIVER OUTPUT register deciding whether the SoC's VIC initialises means the
+VIC is looking at the BT1120 clock. If the receiver were not driving that bus,
+0x21 would fail exactly the way 0x14 does. **So at b0=0x21 the MST3367 IS
+clocking pixels onto BT1120, and the VIC is rejecting what arrives.**
+
+That reclassifies the blocker. The three VIC verdicts are:
+
+    (s & 0x14) == 0x14  "No signal !!"                  <- what we assumed
+    (s & 0x17) == 0x10  "(CCIR or width(%lu) chck fail)" <- what the evidence fits
+    (s & 0x12) == 0x12  "FIFO full (error frame)"
+
+We have been reasoning about the first for the whole project. The evidence -
+clock present, capture loop running, zero valid frames - fits the second:
+embedded sync present but the CCIR structure or the line width is not what the
+VIC was told to expect. Note the message names WIDTH specifically, and that the
+VIC's own width register comes from SET_VIC bytes 24..27, swept in M76 without
+success (including 3840 for the 8-bit double-rate theory).
+
+The card's splash is a NOSG fallback: tinyvenc5's `is_nosg` /
+`NOSG_LOGO_YUV422` / `/tmp/PIC_NOSG` path renders it precisely BECAUSE the
+capture found nothing usable. So "capture mode never triggers" is not what is
+happening - it triggers, initialises, finds nothing it will accept, and falls
+back. The user's other reading, that the card never gets usable data from the
+capture chip, is exactly right.
+
+**Consequence for the next step.** Which of the three verdicts fires is the
+single fact that would direct everything after it, and it exists only in the
+VIC's MMR+0x30 on the card, reachable only from the card's own console. That is
+now the only remaining instrument, and M77 already proved its transport.
+
+### M95 (2026-08-20): the vic_b0=0x20 test was confounded by a bad DEFAULT
+
+`sudo VICB0=0x20 ./mz0380-m55-real-capture.sh 4` returned 0/1024, no splash -
+and the result is worthless, because `win_seq` still defaulted to 1. The log
+shows it plainly: pre-STOP -> SET_VIC -> SET_AIC -> 2x SET_ENC -> POST_PROC, no
+op6. M90 had ALREADY established that `win_seq=1` renders nothing whatever else
+is set. The register did land (`b0=20` reads back in all three output-stage
+diagnostics); the run simply could not have produced a splash for any value of
+b0.
+
+Third instance of the same error in one session: the six-at-once M82 change,
+M87 "clearing" the ordering with `fw=7` still set, and now this. The first two
+were reasoning mistakes. **This one was a packaging mistake, and worse for it:**
+the driver's own defaults were a configuration known not to reach the splash,
+so any test run "with defaults" was silently confounded - including a test whose
+whole purpose was to be a clean single variable.
+
+**Fix: `win_seq` now defaults to 0.** Defaults track the best known-working
+configuration. `win_seq=1` remains available for work on the Windows ordering,
+but it must now be asked for. A default that cannot reach the measurement
+oracle is a trap, not a preference.
+
+The `vic_b0 = 0x20` question is therefore still **OPEN and untested**. Rerun on
+the corrected defaults:
+
+    sudo VICB0=0x20 ./mz0380-m55-real-capture.sh 4
+
+with the control immediately before or after it:
+
+    sudo ./mz0380-m55-real-capture.sh 4        # must give 760/1024
+
+---
+
+### M96 RESULT (hardware, 2026-08-20): vic_b0=0x20 is NEGATIVE - and bit0 is
+### finally identified as an output clock-rate / bus-width select
+
+Run, on a card freshly cold-booted at mains (spawn budget reset), with a
+verified control immediately before it. Every other knob confirmed at its
+known-good value *from the source*, not from memory: `vic_fw=5`, `win_seq=0`,
+`win_bufs_first=1`, `enc_sub=1`, `mst_win_output=0`, `irq_intx=1`.
+
+    sudo ./mz0380-m55-real-capture.sh 4               # control
+    sudo VICB0=0x20 ./mz0380-m55-real-capture.sh 4    # the test
+
+**Control reproduced the baseline exactly**: `760/1024 sampled pages touched,
+last @0x2f7000`, head `11 11 11 11 11 10 11 11`, bufs 1-3 untouched, `R55=0x7f`
+held for the whole 60 s, every command `ret=0`, `b0=21` read back at all three
+diag points.
+
+**The test: `b0=20` read back at all three diag points (the knob landed), and
+the splash STOPPED.** `0/1024` on every one of the four buffers, buf0 still
+solid `aa` poison end to end. `0x20` behaves exactly like `0x14`: it fails
+*before* the VIC ever initialises, whereas `0x21` at least reaches VIC init and
+lets tinyvenc5 render its NOSG fallback.
+
+So the hdcapm lead is closed. `0x21` remains the only value of the three that
+gets anywhere, and the table is now complete:
+
+| value | source | result |
+|---|---|---|
+| `0x21` | ours | reaches splash - the ONLY value that does |
+| `0x14` | Windows driver | nothing written (M80, M94) |
+| `0x20` | hdcapm, "YUV422 / 8-bit output" | nothing written (M96) |
+
+#### The real yield: what bit0 actually does
+
+Our own source comment has said for months that `0x20` and `0x21` "differ in
+bit0 alone and bit0 is unidentified". This run identifies it, from a side
+effect nobody was watching - the receiver's own timing counters.
+
+Control, all three polls:
+
+    hper=674 vper=599 lines=1125
+
+`b0=0x20`, first poll (still 674) and then from the second poll onward:
+
+    hper=337 vper=299 lines=1127
+
+`674 -> 337` and `599 -> 299` are both exactly half. Those two fields are not
+raw registers: `mst3367_measure_once()` derives them from raw counters against
+an internal reference (`vperiod = 1250000/raw`, `hperiod` off a 160 MHz
+reference - see the comment at mz0380-mst3367.c:1523). A displayed value that
+halves means the **raw counter doubled**, i.e. the reference the counters run
+on doubled, while the source in front of the card did not change (`htot=2200`,
+`hact=1920`, and the v4l2 modeline all identical across both runs).
+
+That is consistent with exactly one reading, and it is hdcapm's own comment:
+
+* `b0` bit0 = 1 -> 16-bit output, one sample per clock, 1x pixel clock.
+* `b0` bit0 = 0 -> **8-bit multiplexed** output, two bytes per sample, **2x**
+  clock. Hence hdcapm calling `0x20` "YUV422 / **8-bit** output".
+
+The change appearing at the *second* poll, after `START_STREAMING`, not at the
+first, fits: the retimed output clock only comes up once the output stage is
+actually running.
+
+**Consequence for the width hypothesis.** In 8-bit mode the VIC would see 3840
+bytes per active line where it was told 1920 - the precise shape of the
+`(CCIR or width(%lu) chck fail)` message. But the failure at `0x20` is the
+*harder* one (`0x14`-like, nothing written at all), not the splash-with-no-frame
+one. So `0x21` is already the correct bus width for our VIC config, and the
+width half of that ISR message is very likely NOT our failure. **That shifts
+the weight of the M94/M95 hypothesis onto the CCIR half** - the embedded SAV/EAV
+timing-reference codes.
+
+#### The next test this points at, and why M94 did not already run it
+
+Our driver has **no SAV/EAV or embedded-sync handling anywhere** (grep for
+sav/eav/656/ccir in mz0380-mst3367.c returns only prose). If the receiver emits
+separate H/V sync rather than embedded CCIR timing codes, the VIC sees a clock
+and rejects the structure - splash, no frame. That is our exact symptom.
+
+The Windows output-stage block writes three registers we never touch:
+`0xae |= 0x04`, `0xad`, `0xb4 = 0x55 & ~0x03 = 0x54`. Any of those is a
+candidate for the sync-structure select.
+
+M94 tested that block **only paired with `vic_b0=0x14`**, because that is what
+Windows sends. But `0x14` independently kills the splash - so M94 scored a new
+block against a knob already known to sit at a value that cannot produce the
+outcome being measured. That is method rule 1, violated a fourth time, in the
+opposite direction: not a bad default, a bad deliberate pairing.
+
+The block has never been tried at the only `b0` that works:
+
+    sudo MSTOUT=1 ./mz0380-m55-real-capture.sh 4     # vic_b0 stays at its 0x21 default
+
+`mst_win_output=1` writes `b0` as a plain write of `vic_b0` (0x21), where the
+default path writes `(b0 & 0xc2) | (vic_b0 & 0x3d)`. Hardware `b0 & 0xc2` reads
+0 on this card in both runs above, so both paths put the same 0x21 on the wire:
+the **only** deltas against the known-good baseline are `0xae |= 0x04`,
+`0xad = 0`, `0xb4 = 0x54`. A clean single-block bisect.
+
+`MSTAD=1` is the follow-up if `MSTAD=0` (the default) is neutral.
+
+#### Harness fix made in the same session (method rule 4, again)
+
+`mz0380-m55-real-capture.sh` still hardcoded five knobs directly in its insmod
+line: `vic_in_w=0 vic_in_h=0 vic_in_fmt=0 vic_b0=0x21 set_buf_opcode=2`. All
+five happened to equal the driver default, so nothing was confounded - but this
+is the identical trap that burned M89, sitting in the identical file, one knob
+over. All five now go through `add_opt`, so the driver default governs unless
+the caller sets the env var. `bash -n` clean; no behaviour change today.
+
+---
+
+### M97 (2026-08-20): the firmware-upload path is deleted from the tree, not
+### merely disabled
+
+Standing project constraint, now enforced by absence rather than by discipline.
+Previously the upload code was removed but its *interface* survived: an inert
+`firmware_upload` module parameter kept for script compatibility, the four
+download opcodes and the BAR0 blob aperture still defined in `mz0380-reg.h` as
+"RE documentation", the `.HEX` blob names still in the board table and in
+`MODULE_FIRMWARE`, and a neutered `m81` rootfs-repack script. All of that is
+gone:
+
+* `mz0380-core.c` - `firmware_upload` param and its `MODULE_PARM_DESC` deleted
+  (`modinfo` confirms absent); both `MODULE_FIRMWARE("mz0380/MZ038x.HD.HEX")`
+  replaced with the single `mz0380/MZ0380.FW.TXT` the driver actually reads;
+  the `/proc` state line now says "card's own flash image (host never uploads)"
+  instead of printing a blob filename.
+* `mz0380.h` - `extern bool mz0380_firmware_upload_enabled`,
+  `struct mz0380_board.firmware_name`, `.firmware_base_name`, and
+  `MZ0380_FW_STATE_UPLOADING` removed; the state-machine comment corrected (it
+  still claimed the card boots "from the uploaded blob").
+* `mz0380-reg.h` - `MZ0380_MB_FW_BUFFER`, `MZ0380_CMD_BEGIN_FW_DL`,
+  `MZ0380_CMD_COMMIT_FW`, `MZ0380_CMD_BEGIN_BASE_FW_DL`,
+  `MZ0380_CMD_COMMIT_BASE_FW` and the aperture-protocol prose all deleted, with
+  a comment left in their place marking 0x0b/0x0c/0x0e/0x0f as deliberately
+  undefined.
+* `mz0380-cards.c` - blob filenames dropped from both board entries.
+* `mz0380-fw.c` - header no longer points at reg.h for the protocol; the stale
+  "watched during a firmware-upload attempt" comments reworded.
+* Scripts - `firmware_upload=1` stripped from **32** files;
+  `mz0380-correlation.sh` lost its `--firmware-upload` flag, its usage lines and
+  a dead `insmod_args+=()` branch; `mz0380-m0m2-test.sh` lost its `m2` stage,
+  which *was* the upload attempt; `mz0380-bringup.sh`'s presence check moved
+  from the `.HEX` blob to the `FW.TXT` sidecar; the misleading
+  "waiting for firmware upload + boot..." banners now say the card is booting
+  its own flash image; `mz0380-m81-build-cardlog-fw.sh` deleted outright.
+
+`mz0380-re-dump.sh` is deliberately untouched: it unpacks the blob read-only on
+the host to read tinyvenc5 for RE. Reading the image is not sending it.
+
+Builds clean, 99 module params remain, `bash -n` passes on every script.
+
+### M98 (2026-08-20, observation): OBS sees the device and shows a black canvas
+
+Reported while an `m55` run was in flight: OBS lists the Elgato/PCIe device but
+renders nothing. Consistent with everything else - `captured 0 bytes`, `0/1024`
+or splash-only pages - and it does add one small thing: two independent V4L2
+consumers (m55's capture command and OBS) both get zero frames, so the failure
+is not something specific to how `m55` opens or negotiates the node.
+
+**But do not run OBS concurrently with `m55` again.** It is a second opener on
+`/dev/video0` competing for streaming state and buffer ownership, i.e. exactly
+the kind of uncontrolled variable method rule 1 is about. If OBS is wanted as a
+consumer, run it *instead of* the script's capture step, never alongside it.
+
+---
+
+### M99 RESULT (hardware, 2026-08-20): the Windows output-stage block is NEUTRAL
+### at b0=0x21 - and it accidentally bisected 0xad as well
+
+    sudo MSTOUT=1 ./mz0380-m55-real-capture.sh 4
+
+Block applied and logged: `b0=21 ae|=04 ad=00 b1=c0 b2=00 b3=00 b4=54 ret=0`.
+Result **bit-identical to the baseline**: `760/1024 sampled pages touched, last
+@0x2f7000`, head `11 11 11 11 11 10 11 11`, bufs 1-3 untouched, `R55=0x7f` held,
+every command `ret=0`. So `0xae |= 0x04`, `0xad` and `0xb4 = 0x54` are all
+neutral to the splash oracle. That closes the M94/M95 lead: pairing the block
+with a working `b0` does not rescue it, so the block was never the problem and
+`0x14` really is fatal on its own.
+
+The run also settled `0xad` for free, in both directions, by accident. Our
+`RxHdmiInit` already writes `0xad = 0x05` ("enable low-pass filter",
+mz0380-mst3367.c:333); the `mst_win_output` path then **overwrites** it with
+`mz0380_mst_ad`, which defaults to 0. So the MSTOUT=1 run was the low-pass
+filter OFF and the baseline is it ON, and the two are indistinguishable. Since
+`0xad` was the best candidate for the "find the register that forces
+4:4:4 -> 4:2:2 on the output" follow-up, that follow-up is now weak.
+
+Caveat recorded and fixed: `mst_wr()` returning 0 is NOT evidence a write
+landed - the card's firmware forces write ops to result 0x00, so a NAK is
+invisible. `0xad`/`0xae`/`0xb4` were never read back. `mz0380_mst3367_output_diag()`
+now reads all three, so every future run confirms them at no cost. On the next
+`MSTOUT=1` run they must read `ad=00 ae=<bit2 set> b4=54`; if they do not, this
+verdict needs re-scoring.
+
+Also confirmed in the same pair of runs: the driver loads and streams normally
+with the `firmware_upload` parameter deleted (M97).
+
+### M100 (2026-08-20): BANK0 0xb0 is FULLY DECODED, and M96's reading of bit0
+### was wrong
+
+Pulled `stoth68000/hdcapm` (`mst3367-drv.c`, 1154 lines - same receiver, values
+taken off a vendor I2C trace). At the end of its init function, three
+commented-out alternatives sit above the live write:
+
+    //mst3367_set(sd, BANK0, 0xB0, 0x25 ); /* RX_OUTPUT_YUV422 / 10.BITS / EXTERNAL SYNC */
+    //mst3367_set(sd, BANK0, 0xB0, 0x21 ); /* RX_OUTPUT_YUV422 / 08.BITS / EMBEDDED SYNC */
+    //mst3367_set(sd, BANK0, 0xB0, 0x24 ); /* RX_OUTPUT_YUV422 / 10.BITS / EXTERNAL SYNC */
+    mst3367_wr(sd, BANK0, 0xB0, 0x20 );    /* RX_OUTPUT_YUV422 / 08.BITS / EXTERNAL SYNC */
+
+Reading the four against each other:
+
+| bit | meaning |
+|---|---|
+| bit0 (0x01) | **EMBEDDED sync (1) vs EXTERNAL sync (0)** |
+| bit2 (0x04) | **10-bit (1) vs 8-bit (0)** |
+
+(0x24 and 0x25 carry the same comment text; by the bit rule 0x25 is the
+EMBEDDED one and hdcapm's comment is a copy-paste slip.)
+
+**This corrects M96.** M96 inferred from the receiver's period counters halving
+that bit0 was a bus-width / clock-rate select. The register-level decode from a
+vendor-derived source beats that inference: bit0 is the **sync mode**. The
+halving is a side effect of switching to external sync, not the definition of
+the bit. The rest of M96 stands - `0x20` is negative, the knob landed, the
+splash stopped.
+
+**And the decode explains every b0 result we have.** Both values that write
+nothing at all - Windows' `0x14` and hdcapm's `0x20` - have bit0 = 0, EXTERNAL
+sync. The single value that gets the VIC to initialise, `0x21`, is the
+EMBEDDED-sync one. The SoC's VIC wants CCIR timing codes in-stream. So on the
+`(CCIR or width chck fail)` message we are on the right side of the CCIR half,
+and the **width** half is back in play - the opposite of what M96 concluded.
+
+#### The next test: `vic_b0 = 0x25`
+
+`0x25` is `0x21` **plus bit2**: one bit off the only value known to reach VIC
+init, and the bit hdcapm labels 10-BITS. BT.1120 is natively a **20-bit**
+interface (10-bit Y + 10-bit C); 8-bit is the reduced BT.656-style variant.
+Feeding a 10-bit VIC an 8-bit stream is precisely a width/structure mismatch.
+
+    sudo ./mz0380-m55-real-capture.sh 4               # control
+    sudo VICB0=0x25 ./mz0380-m55-real-capture.sh 4
+
+`0x25 & 0x3d = 0x25`, so the mask in `commit_digital_output()` passes it intact;
+confirm `b0=25` in the output-stage diag before reading anything else. Note that
+Windows' `0x14` already has bit2 set - it is 10-bit/external - so 10-bit is not
+an exotic choice on this board, only the sync mode was ever wrong about it.
+
+Follow-ups, in order: `0x24` (10-bit external, weaker - external sync has failed
+twice); then `b1/b2 = 0xe0/0x08`, the sibling-board values hdcapm uses where we
+write `0xc0/0x00` from the HD60 Pro's own `FUN_14024dc28`.
+
+---
+
+### M101 RESULT (hardware, 2026-08-20): vic_b0=0x25 is NEUTRAL - 10-bit changes
+### nothing - but the new readback catches a write that never landed
+
+    sudo VICB0=0x25 ./mz0380-m55-real-capture.sh 4
+
+`b0=25` read back at all three diag points. Output **bit-identical to the
+baseline**: `760/1024 sampled pages touched, last @0x2f7000`, head
+`11 11 11 11 11 10 11 11`, bufs 1-3 untouched. So bit2 (10-bit vs 8-bit) is
+neutral to the splash oracle, and the `0xb0` table is now:
+
+| value | = | result |
+|---|---|---|
+| `0x21` | 8-bit, embedded | splash (baseline) |
+| `0x25` | 10-bit, embedded | splash, bit-identical (M101) |
+| `0x20` | 8-bit, external | nothing written (M96) |
+| `0x14` | 10-bit, external + bit4 | nothing written (M80, M94) |
+
+Clean separation on bit0 alone: **embedded sync reaches VIC init, external sync
+does not, and the bit-depth bit does not matter either way.**
+
+#### The readback earned its keep on its first run
+
+The diag line now reads `ab=15 ad=05 ae=20 b0=25 b1=c0 b2=00 b3=00 b4=54`.
+
+`0xae = 0x20` - **bit2 clear** - on a run where `RxVideoInit` executes
+`mst_set(dev, 0xae, 0x04)`. Meanwhile `0xad = 0x05` and `0xb4 = 0x54`, written
+by the same helper two lines below in the same bank, both read back exactly as
+written. The bus is fine; something specific to `0xae` bit2 is going on.
+
+**So M99's "0xae |= 0x04 is neutral" is withdrawn.** That register was never in
+the state we thought we were testing. It is UNTESTED, not neutral. Added an
+immediate read-back-and-log right after the init write to separate the two
+explanations: write-only/self-clearing strobe (would read 0x24 immediately, 0x20
+later) versus rejected write (reads 0x20 immediately).
+
+Also corrected: the M94 comment at mz0380-mst3367.c claiming `0xae/0xad/0xb4`
+sit "still at power-on" outside the Windows block. They do not - `RxVideoInit`
+writes all three, which the readback proves for two of them.
+
+### M102 (2026-08-20): the VIC is being told BT1120p while the receiver emits a
+### CCIR656-shaped stream
+
+Every sweep for months has been on the **receiver** side of the BT1120 link.
+The host side of the same interface is one byte of SET_VIC and has never been
+touched.
+
+`mz0380-dma.c:1116`: `in_fmt = mz0380_vic_in_fmt ?: (interlaced ? 7 : 6)`, and
+the enum is quoted in our own source from the card's SDK capture config
+(`re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg`):
+
+    input format (1:8-bits Raw, 2:CCIR656i, 3:CCIR656p, 4:Bayer,
+                  5:16-bits Raw, 6:BT1120p, 7:BT1120i)
+
+We send **6 = BT1120p**. But `b0 = 0x21` is, per hdcapm's own comment,
+`RX_OUTPUT_YUV422 / 08.BITS / EMBEDDED SYNC`. An 8-bit multiplexed YCbCr stream
+with embedded timing codes is **CCIR656**, not BT1120 - BT1120 is the wide
+(16/20-bit) HD interface. And the VIC ISR's complaint is, verbatim,
+`(CCIR or width chck fail)`.
+
+So the two ends of the link are configured for different structures, which is
+the exact shape of the failure, and it is a one-knob test:
+
+    sudo ./mz0380-m55-real-capture.sh 4                 # control
+    sudo VICINFMT=3 ./mz0380-m55-real-capture.sh 4      # CCIR656p
+
+`vic_b0` stays at its `0x21` default, so the pairing is coherent: receiver says
+8-bit embedded sync, VIC is told CCIR656p. Confirm `in_fmt=3` in the SET_VIC
+line before reading anything else.
+
+This also revises M100's closing claim. M100 argued that because we sit on the
+embedded-sync side, the CCIR half of the message was satisfied and the width
+half was the open question. Both halves are in play: 656-vs-1120 is a
+*structure* difference that would trip either check.
+
+Follow-ups if `in_fmt=3` is neutral:
+
+1. `VICINFMT=3` with `VICB0=0x25` - 10-bit 656.
+2. `VICINFMT=2` (656i) as a control on the enum itself - it should behave
+   *differently* from 3 on a progressive source; if 2 and 3 are
+   indistinguishable, the field is not reaching the VIC at all and that is the
+   finding.
+3. `b1`/`b2` = `0xe0`/`0x08`, hdcapm's sibling-board values against our
+   `0xc0`/`0x00`.
+
+---
+
+### M103 (2026-08-20): SET_VIC byte7 is the INTERLACE FLAG, we have sent 6 for a
+### progressive source for the whole project, and 0 was UNREACHABLE
+
+`VICINFMT=3` ran and landed (`in_fmt=3` in the SET_VIC line) and was
+**bit-identical to the baseline** - `760/1024`, `last @0x2f7000`, same head. So
+CCIR656p is neutral, exactly like BT1120p.
+
+That null result is the clue. Reading our own source for why, there is a
+contradiction sitting inside a single comment block in `mz0380-dma.c`:
+
+* The authoritative field map, from **M23/M71 - disassembling
+  video_capture_mgr's op-41 handler and decoding the card's own printf**
+  (`"[Video_MGR][ch%d] SET_VIC fw(%d), fps(%d), resolution(%dx%d)
+  interlace(%d), m(%d), ..."`) - says `[4]=ch [5]=fps [6]=fw [7]=interlace`,
+  and states that byte7 "is the INTERLACE FLAG, which is passed straight into
+  the encoder's argv".
+* **M72/M76 then overrode that** with the enum from
+  `re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg` - "input format
+  (1:8-bits Raw, 2:CCIR656i, 3:CCIR656p, 4:Bayer, 5:16-bits Raw, 6:BT1120p,
+  7:BT1120i)" - and sent 6/7 derived from the detected scan.
+
+**The config file describes a different struct.** It is the SDK demo
+application's capture config, not the SET_VIC mailbox command whose handler M71
+actually disassembled. A disassembly of the real handler beats a text file that
+happens to contain a plausible-looking enum. M72's own comment even concedes
+"the card's printf calls it interlace" and then argues the label is "merely
+loose" - that is the tell.
+
+Consequences:
+
+1. For a progressive 1080p60 source the correct byte7 is **0**. We have sent
+   **6** since the driver was written.
+2. Every value ever swept here - 3, 6, 7 - is **nonzero**, i.e. "interlaced" to
+   the encoder. That is precisely why M102's `in_fmt=3` came back
+   bit-identical to `in_fmt=6`, and why byte7 has looked inert all along.
+3. **0 was not expressible.** The code was
+   `in_fmt = mz0380_vic_in_fmt ?: (interlaced ? 7 : 6)`, so `VICINFMT=0`
+   selected the derived default. The one value that matters was unreachable
+   through the knob built to sweep this field. The M76 sweep could not have
+   found it.
+
+Fixed: `MZ0380_VIC_IN_FMT_AUTO` (`~0u`) is now the "derive it" sentinel and the
+parameter defaults to it, so the derived behaviour is byte-for-byte unchanged
+while `vic_in_fmt=0` is finally reachable.
+
+    sudo ./mz0380-m55-real-capture.sh 4              # control
+    sudo VICINFMT=0 ./mz0380-m55-real-capture.sh 4   # interlace=0, progressive
+
+Confirm `in_fmt=0` in the SET_VIC line. An encoder told to expect interlaced
+fields from a progressive source is a completely sufficient explanation for
+"capture initialises, runs, and accepts nothing", which is the symptom we have
+had for months.
+
+**Method note.** This is the `?:`-as-default idiom hiding a legal value, which
+is the same class of bug as method rule 4 (a harness carrying its own copy of a
+default) - a knob that silently cannot reach part of its own range. Worth
+grepping for elsewhere: `mz0380_vic_fw ?: (...)` has the identical shape, and
+`vic_fw=0` likewise means "auto" rather than 0.
+
+---
+
+### M104 RESULT (hardware, 2026-08-20): byte7 is the FORMAT ENUM after all -
+### M103 RETRACTED - but byte7 is now PROVEN CONSUMED
+
+    sudo VICINFMT=0 ./mz0380-m55-real-capture.sh 4
+
+`in_fmt=0` in the SET_VIC line, and the **splash STOPPED**: `0/1024` on all four
+buffers, buf0 solid `aa`. The first non-neutral result ever obtained from the
+host side of the SET_VIC struct.
+
+| byte7 | reading | result |
+|---|---|---|
+| 3 | CCIR656p | splash |
+| 6 | BT1120p (our default) | splash |
+| 7 | BT1120i | splash |
+| **0** | not in the enum | **nothing written** |
+
+**M103's reclassification is withdrawn.** It argued byte7 is the interlace flag,
+so 0 (progressive) should be correct. Under that reading 0 ought to work at
+least as well as the 6 we have always sent; instead it is strictly worse, and
+worse in the specific way that means tinyvenc never got far enough to render its
+NOSG fallback. Under the M72/M76 reading - byte7 is the capture INPUT FORMAT
+enum, valid range 1..7 - 0 is not a legal value, `VideoCap` fails to open, the
+encoder exits before it can draw anything. That fits exactly. M72/M76 were
+right and the SDK config's enum does describe this field.
+
+**What the run does establish, and it is new:** byte7 is *consumed*. Until now
+every value tried (3, 6, 7) was indistinguishable, which was equally consistent
+with "the field is ignored". 0 behaves differently, so the byte reaches the card
+and is acted on. That closes a question that has been open by default.
+
+Kept: `MZ0380_VIC_IN_FMT_AUTO`. The `?:`-as-default idiom genuinely could not
+express 0, and making it expressible is what produced this result. The derived
+default is byte-for-byte unchanged.
+
+### M105 CORRECTION (2026-08-20): the halved period counters in M96 were a
+### SOURCE RE-LOCK ARTIFACT, not a b0 effect
+
+The M104 run - `vic_b0` at its `0x21` default throughout, read back `b0=21` at
+all three diag points - produced this:
+
+    detect 55=a3 settling (auto-position on; timing not sampled)
+    detect 55=7f LOCKED ... hper=674 vper=599 lines=1125
+    detect 55=7f LOCKED ... hper=337 vper=299 lines=1127     <-- halved, at b0=0x21
+    detect 55=d6 settling (auto-position on; timing not sampled)
+    detect 55=7f LOCKED ... hper=674 vper=599 lines=1125
+
+The exact `hper=337 vper=299 lines=1127` sample that M96 attributed to
+`b0 = 0x20`, reproduced at `b0 = 0x21`, bracketed by partial-lock (`55=a3`,
+`55=d6`) rows - i.e. during a source re-lock. The m55 script explicitly asks the
+operator to power-cycle the source during exactly this window.
+
+So the halving is a transient measurement artifact of re-acquisition, and it has
+nothing to do with `0xb0`. M96 built a bus-width/clock-rate theory for bit0 on
+that single sample. M100 had already superseded the conclusion via hdcapm's
+decode (bit0 = embedded vs external sync); this retires the *evidence* as well.
+
+**Method note.** The sample was taken inside a window the harness itself
+destabilises. A measurement made while the operator is being told to unplug the
+source is not a controlled measurement, and one sample is not a trend - two
+separate failures of method rule 1 in the same observation.
+
+### M106 (static RE, 2026-08-20): the VIC failure test, read out of vpl_vic.ko
+
+Unpacked the card rootfs read-only on the host (`MZ0380.HD.HEX` is a gzip'd tar)
+and disassembled `yuan_demo_sdi/drivers/vpl_vic.ko` - ELF32 ARM, **not
+stripped**, symbols intact: `VIC_SetSizeToVIC`, `ISR`, `Open`, `Ioctl`,
+`VIC_DetectStd`, `VIC_AutoDetectStdTasklet`.
+
+The failure message lives in `ISR` (`.text 0x0fd8`, 4472 bytes) and the test in
+front of it is, verbatim:
+
+    1358: and  r0, r6, #23        @ r6 = dwVICMmrStat, 23 = 0x17
+    137c: cmp  r0, #16            @ 0x10
+    1384: beq  0x1814             @ -> the "(CCIR or width(%lu) chck fail)" printk
+
+confirming `(stat & 0x17) == 0x10` exactly as the handoff has claimed. The
+printk's five arguments decode as `ch = r9`, `Index = [[r8+0x68]+0x68]`,
+`dwVICMmrStat = r6`, `dwVICMmrCtrl = r4`, and **`width` = a driver local at
+`fp-0x4c`** - not a value the host supplies, so it cannot be steered directly
+from SET_VIC. The fail path also forces `[r8+0xc0] = 0x30` where the normal path
+stores `stat & 0x1f`, and `[r8+0x234]` is a printk rate-limit counter.
+
+Useful consequences:
+
+* The status word is genuine VIC hardware state. There is no host-reachable
+  register that changes which branch is taken - only the data actually arriving
+  on the bus does.
+* `VIC_SetSizeToVIC` (`.text 0x0000`, 340 bytes) is where the expected geometry
+  is programmed into the MMR, and it is the right target for the next static
+  pass: it will name which MMR fields the width check compares, and therefore
+  which SET_VIC bytes reach them.
+* The SDK cfg's field order was checked against video_capture_mgr's own SET_VIC
+  printf. The printf lists `flip`/`mirror` and has **no "field mode" argument**,
+  so the cfg's "field mode (0:two single fields, 1:one interleaved field)" is
+  not a byte of this struct. That hypothesis is dead before costing a run.
+
+Everything here was static: **zero encoder spawns, zero hardware runs.**
+
+---
+
+### M107 RESULT (hardware, 2026-08-20): WINBUFS=0 does not move the 16-byte
+### stall - but the 16 bytes are NOT a truncated splash
+
+    sudo WINSEQ=1 OP6=1 WINBUFS=0 ./mz0380-m55-real-capture.sh 4
+
+`1/1024 sampled pages touched, last @0x0`, i.e. the same "exactly 16 bytes
+written" stall M91 found with `WINSEQ=1 OP6=1` alone. Putting SET_BUF back after
+SET_VIC (the M23 placement, so the addresses op6 latches into the outbound iATU
+are ours) changes nothing. `win_bufs_first` is neutral on this branch.
+
+The 16 bytes themselves are new information:
+
+    splash (760/1024):  11 11 11 11 11 10 11 11 11 11 11 11 11 11 11 11
+    this run (16 bytes): 11 11 11 11 10 10 11 11 11 11 11 11 11 11 11 11
+                         then aa (poison) from byte 16 on
+
+**Not a prefix of the splash** - byte 4 differs. So the 16 bytes are not "the
+splash, truncated at one burst"; they are different data. Whatever the card
+emits on this path, it is not the NOSG logo.
+
+Also visible only on this path: `POST_PROC(op 0x31, mask=0x1f, fps=60, di=1)`.
+`di=1` is deinterlace-on for a progressive source; it comes from the recovered
+Windows sequence, so it is presumably what Windows sends, but it has never been
+varied.
+
+The M105 artifact reproduced again here (`hper=337 vper=299 lines=1127` plus a
+"vtotal moved during the pass" row, at `b0=21`, during re-lock).
+
+### M108 (static RE, 2026-08-20): the VIC's width test is a 2560 THRESHOLD on a
+### number the HOST supplies
+
+`VIC_SetSizeToVIC` (`vpl_vic.ko` `.text 0x0000`, 340 bytes), decoded:
+
+    a8: ldrh r2, [r12, #28]     @ per-channel MMR + 0x1c, LOW halfword
+    b0: cmp  r2, #2560          @ 0xA00
+    b4: ldr  r2, [r4]
+    b8: ldr  r1, [r2, #0x204]
+    bc: bhi  0x134              @ width > 2560
+    c0: tst  r1, #3             @ width <= 2560:
+    c4: ldreq r1, [r2, #0x204]  @   if (MMR[0x204] & 3) == 0
+    c8: orreq r1, r1, #1        @     MMR[0x204] |= 1
+    ...
+    134: and r1, r1, #3         @ width > 2560:
+    138: cmp r1, #1             @   if (MMR[0x204] & 3) == 1
+    140: biceq r1, r1, #3       @     MMR[0x204] &= ~3
+
+so **`MMR[0x204]` bits[1:0] are a wide-mode select driven purely by the
+programmed width, with a threshold at 2560**, and nothing about the arriving
+data participates in the decision.
+
+The per-channel block is `base + 0x40 + ch*0x38`; `MMR+0x1c` is built at +0x5c
+as `(height + y_start[9:0]) << 16 | (width + x_start[10:0]) & 0xffff`, from the
+function's own `r0` (width) and `r1` (height) arguments. Both call sites, in
+`Ioctl` at `0x40ac` and `0x4968`, pass `r0 = r10` and `r1 = r7` - a width and a
+height the ioctl was handed, i.e. **host-supplied**.
+
+#### Why this re-opens M76
+
+At 1920 the VIC takes the narrow branch and sets `MMR[0x204] |= 1`. If the
+receiver's 8-bit 4:2:2 output presents **two bytes per pixel**, a 1920-pixel
+line is 3840 samples - over the threshold - and the VIC has been configured for
+the wrong mode by a number we chose.
+
+M76 swept `vic_in_w` (SET_VIC bytes 24..27) including 3840 and recorded it
+negative. That verdict should not be trusted:
+
+* M76 **predates `win_seq`** (introduced M82) and **predates the `fw=5`
+  correction** (M88). The baseline it was scored against was never verified to
+  reach the splash - the same defect M95 identified in the first `vic_b0=0x20`
+  attempt.
+* M76 had no mechanism. It was "try 3840 because 8-bit might double the rate".
+  There is now a specific threshold, a specific register, and a specific
+  consequence.
+
+    sudo ./mz0380-m55-real-capture.sh 4                 # control
+    sudo VICINW=3840 ./mz0380-m55-real-capture.sh 4     # cross the 2560 threshold
+
+Everything else stays at today's verified defaults (`fw=5`, `win_seq=0`,
+`b0=0x21`, `in_fmt=6`). Confirm `vic_in=3840x1080` in the SET_VIC line.
+
+Open question the disassembly has not answered: **which** SET_VIC field becomes
+`r0`. `vic_in_w` (bytes 24..27) is the best candidate and the cheap one; the
+capture width (bytes 8..9) is the alternative, but it doubles as the H.264
+output width, so changing it is not a clean single-variable test. Tracing where
+`r10` and `r7` are loaded in `Ioctl` before `0x40ac` would settle it statically
+and costs no spawns.
+
+---
+
+### M109 RESULT (hardware, 2026-08-20): vic_in_w=3840 is NEUTRAL under a
+### verified baseline - M76's negative now stands
+
+    sudo VICINW=3840 ./mz0380-m55-real-capture.sh 4
+
+`vic_in=3840x1080` in the SET_VIC line, and the result is **bit-identical to the
+baseline**: `760/1024`, `last @0x2f7000`, head `11 11 11 11 11 10 11 11`.
+
+So SET_VIC bytes 24..27 are **not** the width that reaches
+`VIC_SetSizeToVIC`'s `r0`, or the 2560 threshold is not our failure. Either way
+M108's proposed test is answered in the negative, and - unlike M76, which ran
+before `win_seq` existed and before the `fw=5` correction - this one was scored
+against a baseline verified minutes earlier on the same source. **M76's negative
+is now trustworthy.** Do not sweep `vic_in_w` again.
+
+The remaining candidate for `r0` is the capture width (bytes 8..9), which
+doubles as the H.264 output width, so it is not a clean single-variable test.
+Settling it statically - tracing where `r10`/`r7` are loaded in `Ioctl` before
+the call at `0x40ac` - is still the zero-spawn option.
+
+### M110 (2026-08-20): the card's HDMI PASSTHROUGH output is dead, and we may be
+### holding the companion device in reset
+
+New observation from the operator, and it is not something the buffer oracle
+would ever have shown: **a monitor plugged into the card's HDMI OUT displays
+nothing at all while the driver runs - not even a "no signal" message.**
+
+This is not "the card does not boot". The card demonstrably boots: the mailbox
+answers, it reports firmware 1.11, MST3367 I2C works, the receiver locks and
+holds, the encoder spawns, and 760 of 1024 sampled pages of splash arrive by
+DMA. The passthrough is a **separate subsystem this driver has never enabled**.
+
+The suspect is `mz0380_mst3367_reset()`. Its last act, since the original
+bring-up and never varied since:
+
+    mz0380_gpio_set(dev, MZ0380_GPIO_RX_STRAP, 0);   /* pin 8 */
+
+`MZ0380_GPIO_RX_STRAP` is pin 8, documented in `mz0380-reg.h` as the "companion
+reset/power strap". Pin 9 immediately next to it is the MST3367 reset and is
+documented **ACTIVE-LOW**; the same function releases pin 9 to 1. If pin 8
+follows that convention, driving it 0 holds the companion device in reset for
+the whole session, which is a complete explanation for a dead passthrough.
+
+Caveat, and it is a real one: M83 found a chip at I2C 0x98 that **ACKs** and has
+54/64 registers non-zero, which is not obviously the behaviour of a part held in
+reset. So either pin 8 is not that chip's reset, or I2C survives the reset while
+the video path does not. The two are distinguishable.
+
+#### The free test first
+
+Causality before code. With no module loaded at all, does the monitor on the
+card's HDMI OUT show the source?
+
+    sudo rmmod mz0380      # then look at the monitor
+
+* Source appears with no driver, dies when the driver loads -> **we break it**,
+  and pin 8 is the first suspect.
+* Dead both ways -> the passthrough needs enabling and never has been; the
+  companion at 0x98 (never written by us) is where to look.
+
+#### The knob, now that it exists
+
+`rx_strap` was added because nobody ever chose 0 deliberately - it is an
+artefact of the original bring-up. 0 and 1 are both real levels, so
+`MZ0380_RX_STRAP_LEAVE` (`~0u`) is a third value meaning "do not drive pin 8 at
+all". Default is 0, i.e. **behaviour is unchanged** unless asked.
+
+    sudo RXSTRAP=1 ./mz0380-m55-real-capture.sh 4            # release the strap
+    sudo RXSTRAP=0xffffffff ./mz0380-m55-real-capture.sh 4   # never drive it
+
+Score BOTH oracles on these runs: the buffer scan as usual, **and the monitor on
+the card's HDMI OUT**. A passthrough that comes back is a real result even if
+the capture oracle does not move - it would prove the pin controls a live video
+path and that we have been disabling board hardware for the entire project.
+
+**Method note.** This is the first genuinely new *observable* in a long time.
+Every experiment for months has been scored on one number - pages touched in
+buf0 - and a whole subsystem was sitting there unmeasured. Worth asking what
+else on this board has state nobody has looked at.
+
+---
+
+### M111 (2026-08-20): THE OTHER HALF OF THE PROBLEM - one COMPLETE frame lands
+### and the host never delivers it. "captured 0 bytes" was never the card's fault
+
+Two results and one operator observation converged on a reframing that the
+buffer oracle has been hiding for months.
+
+**1. `RXSTRAP=1` is neutral** (bit-identical baseline) and the passthrough is
+dead **with no module loaded at all**. So we do not break it; it was simply never
+enabled. M110 closed in both directions. Pin 8 is not the companion's reset, or
+not the passthrough's gate.
+
+**2. `VICINW=3840` is neutral** (M109), which retires the 2560-threshold test.
+
+**3. The operator reports that on Windows, with NO SOURCE CONNECTED, OBS shows
+the card's "no signal" splash continuously.** Same card, same firmware. Windows
+streams that splash as video; we get nothing on screen.
+
+#### The arithmetic nobody did
+
+    last touched page @0x2f7000, 760 pages contiguous from page 0
+    1920 x 1080 x 1.5 = 3110400 = 0x2F7C00  ->  pages 0..759 = 760 pages
+
+`760/1024 sampled pages touched, last @0x2f7000` is **exactly one 1080p 4:2:0
+frame**, contiguous from offset 0. Not a partial write, not a scribble, not a
+logo fragment. The card renders a complete frame and DMAs all of it into our
+buffer.
+
+Every session has read that number as "the card fell back to its splash, so
+capture failed". It does mean the *content* is the splash rather than source
+pixels. It does **not** mean the frame path failed - a whole frame arrived.
+
+#### Why it never reaches userspace
+
+`mz0380-video.c` says it outright:
+
+    Fake-frame path: no completion IRQ exists (M41), so streaming is a
+    polling kthread that spawns the encoder itself, once per frame (M39).
+    The real path arms the encoder here and delivers from the MSI-driven
+    drain.
+
+The real path delivers **only** on a frame-completion event. `frame_events=0`,
+`EVENT[0x30]=0` in every run ever recorded. That event has never fired once in
+this project - which is precisely why the nosg path was written as a poller in
+the first place. The real path never got the same treatment, so a complete frame
+sits in buf0 and nothing hands it to vb2.
+
+That is `captured 0 bytes`. That is OBS listing the device and showing black.
+
+#### This splits the blocker in two
+
+| | problem | evidence | status |
+|---|---|---|---|
+| **content** | splash instead of source pixels | VIC rejects BT1120 structure | everything M76-M109 swept |
+| **delivery** | one frame lands, host never delivers it | `frame_events=0`, complete frame in buf0 | **never investigated** |
+
+The delivery half is host-side, costs no encoder spawns to work on, and has a
+perfect target: **match what Windows does with no source at all** - the splash,
+continuously, in OBS. That is a smaller, checkable goal than "capture the
+source", and reaching it validates SET_BUF, the outbound ATU, the DMA target,
+vb2 and the V4L2 format negotiation in one shot. It also turns the content
+problem into something visible in OBS at 60fps instead of one number per
+105-second m55 run.
+
+#### On the instrument
+
+The operator's own summary - "we stay stuck to this m55 part" - is correct and
+this finding is why. m55 is a 105-second, source-dependent ritual that reports a
+single end-of-run page count. It cannot distinguish "no frame" from "one frame,
+undelivered", and that distinction turns out to be the whole thing. The next
+instrument should need **no source** (Windows proves none is required to get
+pixels), run in seconds, and sample buffer state and the EVENT/token words on a
+timeline rather than once at the end.
+
+#### Next
+
+1. Give the real path a polling delivery fallback, as the nosg path already has:
+   if a frame's worth of buffer is dirty and no completion event arrived, hand it
+   to vb2. Param-gated so it can be bisected. Expected result: the splash appears
+   in OBS, matching Windows.
+2. Only then return to the content problem, with a live picture as the oracle.
+
+---
+
+### M112 (2026-08-20): poll-drain implemented - deliver the frame the card has
+### already written, and stop lying about its format
+
+Host-side only, no encoder spawns to develop. Three coupled defects, all found
+by following M111 into the delivery path:
+
+**1. Nothing ever calls the delivery code.** `mz0380_drain_frame_snapshot()`
+already knows how to turn "buffer idx holds a frame" into a vb2 delivery - infer
+the length from the poison suffix, copy, re-poison. The real path only ever
+reaches it from the MSI drain, which needs a completion event that has never
+fired. `mz0380_poll_drain_thread()` now synthesises the snapshot (token = buffer
+index, timestamp = now) and calls the SAME function, so the event-driven path is
+byte-for-byte unchanged and a frame is delivered exactly once - the re-poison
+inside the drain is what makes it idempotent. `mz0380_infer_frame_length()`
+returns `-ENODATA` on a fully-poisoned buffer, so it doubles as the "is there
+anything here" test.
+
+**2. The plane is too small for the frame.** `sizeimage = bitrate/8`, clamped -
+12 Mbit gives 1.5 MB, and m55's 4 Mbit gives 512 KB. The frame is **3110400
+bytes**. The drain's `len > plane` guard would have rejected every single
+delivery with "does not fit vb2 plane". With `poll_drain_ms` set, sizeimage is
+now `max(width*height*3/2, bitrate/8)`.
+
+**3. The node advertises H.264 for a raw payload.** buf0 holds planar 4:2:0, not
+a bytestream - 3.1 MB of `0x11` is not H.264, and a compressed splash would be a
+few KB. The nosg path already advertises NV12 for exactly this reason; the real
+path never did. `VIDIOC_ENUM_FMT`, `TRY_FMT`, `S_FMT` and `G_FMT` now report
+NV12 at the detected geometry when `poll_drain_ms` is set.
+
+`mz0380-m55-real-capture.sh` writes to `cap-m55.nv12` instead of `.h264` when
+`POLLDRAIN` is set - the same naming trap that made M57 "fail" ffprobe.
+
+Everything is gated on `poll_drain_ms != 0`, default 0, so every earlier result
+still reproduces exactly.
+
+#### The test, and it needs NO SOURCE
+
+Windows shows the no-signal splash in OBS with nothing plugged in, so the source
+is not required to get pixels - and leaving it out removes the last uncontrolled
+variable from the run.
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+
+Expect in dmesg:
+
+    poll-drain armed every 20 ms ...
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+
+and a non-zero `--- captured N bytes ---`. Then look at it:
+
+    ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 /tmp/cap-m55.nv12
+
+A visible splash is the first picture this project has ever produced, and it
+would validate SET_BUF, the outbound ATU, the DMA target, vb2 and format
+negotiation in one shot.
+
+**What it does NOT prove.** The card may still write only one frame - the
+delivery fix cannot manufacture frames 2..N. If exactly one frame arrives and
+then the count stops, the remaining problem is the card's frame cadence
+(credits/`enc_stat`/`host_ready`), which is a different investigation from the
+content problem and from this one. Three separate questions, now separable.
+
+---
+
+### M113 (2026-08-20): the no-source run was impossible - both the script and the
+### driver refused before the encoder was ever armed
+
+The first `POLLDRAIN=20` attempt never reached the capture step:
+
+    No coherent HDMI timing was locked during the 45s window.
+    (module unloaded)
+
+Two independent gates, and the instruction to disconnect the source ran straight
+into both:
+
+1. **m55 step 1** polls `--query-dv-timings` for `LOCKWAIT` seconds and
+   `exit 2`s if nothing locks. With nothing plugged in, nothing ever will.
+2. **`mz0380_video_start_streaming()`** does the same thing in the driver: no
+   lock, no `signal_cache_ms` hit, `goto error`. `mz0380_force_timings` does not
+   help - it only rescues a signal that IS locked but matches no table entry.
+
+Both fixed, both opt-in:
+
+* `stream_without_signal=1` (new, default 0) arms the real path at 1920x1080p60
+  with no lock at all, logging plainly that the card's splash is what to expect
+  rather than source pixels.
+* `NOSRC=1` in m55 skips the lock gate, drops `CAPWAIT` to 10s, defaults
+  `WATCH=0` (no HPD pulses, no receiver I2C - there is no source to provoke),
+  writes `cap-m55.nv12`, and stops printing power-cycle prompts.
+
+The timing change matters beyond convenience. A no-source run is ~15s instead of
+~105s, needs no operator action, and has **no source power-cycling mid-window** -
+which is what produced the M105 measurement artefact. It is a strictly better
+instrument for everything except source-content questions.
+
+    sudo NOSRC=1 POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 /tmp/cap-m55.nv12
+
+Expect: `arming anyway at 1920x1080p60 [stream_without_signal=1]`, then
+`poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering`,
+then a non-zero byte count.
+
+---
+
+### M114 RESULT (hardware, 2026-08-20): with NO source the card writes NOTHING -
+### the splash needs a lock, and the Windows "no signal" was misread
+
+    sudo NOSRC=1 POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+
+Everything armed exactly as intended - `arming anyway at 1920x1080p60
+[stream_without_signal=1]`, SET_VIC/SET_ENC_PARAMS/SET_AIC/START all `ret=0` -
+and the card wrote **nothing at all**: `0/1024` on all four buffers, buf0 solid
+poison, `captured 0 bytes`, and no `poll-drain: buf N holds ...` line because
+there was never anything to deliver.
+
+**So the NOSG splash is not a no-source behaviour.** It appears when the
+receiver holds a lock and the capture path then finds nothing it will accept.
+With no source at all the encoder produces no frame whatsoever. That is a real
+new fact about the card, and it narrows what the splash means: it is evidence
+the capture path RAN, which requires a lock.
+
+Two supporting details from the same run, both consistent:
+
+* `b0=20` at all three diag points, not our `0x21` - with no lock,
+  `commit_digital_output()` never runs, so the receiver sits at its own default.
+* `B1 01=80` (DVI), `48=00` (RGB), `0b=00`, `0c=00` - the link layer reading
+  nothing, as expected with an empty connector.
+
+#### Correction: the premise of the no-source test was mine and it was wrong
+
+M111 built on the operator's report that Windows shows "no signal" in OBS with
+nothing connected, and treated it as "the card streams its splash with no
+source". This run disproves that for our stack, and the likeliest explanation is
+that the Elgato **software** draws that overlay host-side - it is a different
+driver stack, and an application-drawn placeholder is the ordinary way that is
+done. An anecdote about another stack's UI was given the weight of a measurement
+about card behaviour, and it aimed the test at the wrong scenario.
+
+`stream_without_signal` and `NOSRC` are kept - they are correct as features, the
+run did what it was asked, and "the card writes nothing without a lock" is worth
+having established. But a no-source run cannot test frame DELIVERY, because
+there is no frame.
+
+#### What is still untested: M112, with the source connected
+
+M111's finding is untouched by this. With a source locked, the card DMAs
+**exactly one complete 1920x1080 4:2:0 frame** (760 contiguous pages ending at
+0x2f7000 = 3110400 bytes) and `frame_events=0` - the completion event never
+fires, so `mz0380_drain_frame_snapshot()` is never called and userspace gets
+nothing. That is what the poll-drain exists to fix, and it has not yet been run
+in the situation it was written for:
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4     # SOURCE CONNECTED, no NOSRC
+
+Expect `poll-drain: buf 0 holds 3110400 bytes with no completion event;
+delivering` and a non-zero byte count, then:
+
+    ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 /tmp/cap-m55.nv12
+
+(An empty file makes ffplay hang on the rawvideo demuxer waiting for a frame -
+that is what "stuck" looked like here, not a decode problem.)
+
+---
+
+### M115 RESULT (hardware, 2026-08-20): **FIRST PIXELS.** The poll-drain works -
+### 3903488 bytes captured, and the card's splash renders
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+
+    --- captured 3903488 bytes ---
+    frame token 0 inferred length=794368  from 4-byte poison boundary
+    frame token 0 inferred length=3110400 from 4-byte poison boundary
+
+**The first bytes this project has ever pulled off the card**, and the operator
+confirms the card's own "no signal" screen renders in ffplay. `frame_events=0`
+and `EVENT[0x30]=0` as always - the completion event still never fires - and it
+no longer matters, because the poll-drain delivers without it.
+
+M111 is confirmed end-to-end: the card had been writing a complete frame all
+along and the host was throwing it away. `captured 0 bytes` was never the card's
+fault. Everything downstream of the DMA is now proven working - SET_BUF, the
+outbound ATU, the DMA target, the poison-boundary length inference, vb2, and
+V4L2 format negotiation.
+
+#### The one defect in the first run: a torn frame
+
+3903488 = **793088 + 3110400**, exactly. Two deliveries, and the first was a
+fragment:
+
+    [rawvideo] Invalid buffer size, packet size 793088 < expected frame_size 3110400
+
+The poison boundary marks how far the DMA has **got**, not that it has
+**finished**, so a poll that lands mid-burst returns a torn prefix. The nosg path
+has always guarded against this (`mz0380_nosg_frame_landed()` requires two
+untouched tail dwords at the known frame size); the real path shipped without
+the equivalent.
+
+Fixed: the poll-drain now requires `len >= source_width * source_height * 3/2`
+before delivering, and logs `holds N of M bytes - DMA still in flight, waiting`
+otherwise. The expected size is exact and known, so this needs no heuristic.
+
+`m55` step 4 also stopped running an H.264 NAL check and `ffprobe` over raw NV12 -
+that is what produced the run's "ADPCM Nintendo Gamecube DTK" line, which is
+ffprobe guessing at planar YUV. It now reports whole-frame counts and warns on a
+partial tail.
+
+To view the good frame from the existing capture without another run:
+
+    tail -c 3110400 /tmp/cap-m55.nv12 > /tmp/frame.nv12
+    ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 /tmp/frame.nv12
+
+#### Where the three problems now stand
+
+| | question | status |
+|---|---|---|
+| **delivery** | frame lands, host never hands it over | **SOLVED** (M112/M115) |
+| **cadence** | does the card write frames 2..N? | **NO** - one frame in a 60s window |
+| **content** | splash instead of source pixels | still open, unchanged |
+
+The cadence problem is now cleanly isolated for the first time. One complete
+frame arrived in sixty seconds, and buffers 1-3 were never touched, so the card
+is not rotating through the registered buffers. That points at the credit /
+ownership handshake - `enc_stat`, `host_ready`/`wency_ready`, op2/op8 - which was
+examined in M92/M93 and called neutral **on an oracle that could not see it**:
+"one frame lands" looks identical whether or not credits are returned. That
+verdict should be re-tested now that a second frame is a visible outcome.
+
+---
+
+### M116 RESULT (hardware, 2026-08-20): op 0x08 is neutral for CADENCE too -
+### re-tested on an oracle that can see it
+
+    sudo OP8=1 POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+
+    SET_BUF_8(op 0x08, window0 slots 5..8, sets wency_ready) ret=0
+    frame token 0 inferred length=3110400 ...
+    --- captured 3108864 bytes ---
+
+**Exactly one frame**, same as without op8, and bufs 1-3 never went non-poison.
+M93 called op8 neutral using the pages-touched oracle, which could not
+distinguish "one frame" from "one frame and no credits". This run scored it on
+frame COUNT, the oracle that can, and the answer is the same: **op 0x08 does not
+affect cadence.** The `host_ready` / `wency_ready` asymmetry is now eliminated
+twice, on two different oracles. Stop testing it.
+
+Also note the poll-drain's completeness gate (M115) worked: exactly one
+`length=3110400` delivery this run, no torn 794368-byte prefix.
+
+#### A harness bug that ate the frame: 1536 bytes short
+
+The driver delivered a **full 3110400** bytes - the log says so - but the file
+held **3108864**, short by exactly **1536**. ffplay rejected the whole capture,
+and `tail -c 3110400` could not rescue it because the missing bytes were never
+written.
+
+`v4l2-ctl --stream-mmap --stream-count=4` blocks until four frames arrive. The
+card delivers one. So `timeout` SIGTERMs v4l2-ctl at CAPWAIT, **mid-write**, and
+the last frame loses its unflushed stdio tail. Nothing to do with the card, the
+DMA or the poll-drain - the measurement destroyed its own result.
+
+This is the same class as method rule 4 (a harness carrying its own copy of a
+default): the harness asked for an outcome the system could not produce and then
+mangled the outcome it did produce. Fixed three ways:
+
+* `timeout -s INT --foreground` so v4l2-ctl gets a chance to close the file.
+* Step 4 trims a partial tail when at least one whole frame survived, so the
+  file is playable.
+* When NOT ONE whole frame survived, it now says so explicitly and prints the
+  fix - ask for a count the card can deliver:
+
+      sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1
+
+**While cadence is one-frame-per-stream, request ONE frame.** Asking for four
+guarantees the kill-mid-write every time.
+
+#### Cadence: what is left to test
+
+Eliminated: op 0x08 / `wency_ready` (M93, M116). Still untried:
+
+1. `credit_kick_ms` - already a parameter, never used in anger. It fires the
+   full ack sequence (BAR5[0xdc]=2, BAR0[0x30]=0, doorbell 0x400) on a timer.
+   If the card is waiting for an ownership ack that only the completion path
+   sends, this is exactly the missing kick - and the completion path has never
+   run once.
+2. `enc_stat` (BAR0+0x50+idx): the per-frame "may I encode into the host buffer"
+   handshake. M40 notes the card only ever SETS it and never clears it, so a
+   stale 1 makes the encoder retry 10x then skip every frame. The driver clears
+   it at stream start - but nothing clears it **after each delivered frame**,
+   which is what a running stream would need.
+
+(2) is the strongest untested hypothesis on the board: it is a per-frame
+handshake, the card never clears it itself, and we only ever clear it once at
+start. That is a precise fit for "exactly one frame, then silence".
+
+### M117 (2026-08-20): the poll-drain never acked enc_stat - the exact
+### documented cause of "one frame then nothing"
+
+Found by reading our own code after M116 measured one-frame cadence with op8
+eliminated. `mz0380_enc_stat_ack()` has carried this comment since M40:
+
+    M40. Acknowledge consumed bitstreams: write 0 to the card's per-stream
+    enc_stat bytes (BAR0 + 0x50 + idx). ... without this ack the card's
+    encoder produces exactly one bitstream and then skips every subsequent
+    frame.
+
+That is the measured symptom, word for word: one frame per stream, buffers 1-3
+never touched.
+
+`mz0380_dma_drain_video()` acks after its drain batch. The poll-drain calls
+`mz0380_drain_frame_snapshot()` **directly**, bypassing the batch wrapper, so it
+never acked. The card sets `enc_stat` and never clears it itself; the driver
+clears it once at stream start (mz0380-dma.c:1365) and, on this path, never
+again.
+
+So M112's delivery fix was half a fix: it took the frame out of the buffer but
+never told the card the slot was free. Fixed - the poll thread now acks once per
+pass in which it delivered anything, mirroring the event path's batch ack.
+
+**This is a prediction, not a result.** If it is right, the next run gives more
+than one frame and buffers 1-3 start seeing traffic. If cadence stays at one
+frame, `enc_stat` is not the gate and `credit_kick_ms` is next.
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+
+Ask for 4 frames deliberately this time: if the fix works, v4l2-ctl gets its
+four and exits cleanly, and the M116 kill-mid-write problem disappears on its
+own. If only one arrives it will be trimmed and reported as before.
+
+---
+
+### M118 RESULT (hardware, 2026-08-20): the enc_stat ack does NOT fix cadence -
+### M117 refuted. And the 1536-byte shortfall is fully explained
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+
+One `frame token 0 inferred length=3110400` delivery. **Still exactly one
+frame**, bufs 1-3 still untouched. M117's prediction was wrong: acking
+`enc_stat` after each poll-drained frame changes nothing.
+
+The ack was still a real bug and the fix stays - the poll path bypassed the
+batch wrapper that the event path acks from, and the card genuinely does need
+that slot handed back. It simply is not what is holding cadence at one frame.
+
+#### The 1536 bytes: arithmetic, not mystery
+
+    3108864 = 759 x 4096   (the frame is 759.375 stdio blocks)
+
+v4l2-ctl buffers to a stdio `FILE*`. When `timeout` kills it, whole 4 KiB blocks
+have been flushed and the final **partial** block - 1536 bytes - has not. Same
+value twice, exactly, because it is deterministic. `timeout -s INT` did not help:
+v4l2-ctl installs no handler, so SIGINT terminates it just as abruptly.
+
+**Consequence for method: the captured file size is a bad oracle while cadence is
+broken.** The honest count is the driver's own delivery lines:
+
+    dmesg | grep -c 'inferred H.264 length='
+
+That is independent of how v4l2-ctl dies. Score cadence on that from now on.
+
+To get a clean playable file, ask for a count the card can deliver, so v4l2-ctl
+exits normally and flushes:
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1
+
+#### What is left, and why credit_kick_ms could not have been tested as-is
+
+`credit_kick_ms` fires only inside `mz0380_event_thread()`, which runs only
+after `echo start > /proc/mz0380-events`. m55 never starts it, so setting the
+parameter alone would have done nothing - a trap worth recording before someone
+"tests credit_kick_ms" and reads a false negative.
+
+So the sequence moved into the path that actually runs. `mz0380_credit_rearm()`
+is now lifted out of the ISR (it was inline in the interrupt handler) and the
+poll-drain fires it after a delivered batch under `poll_drain_credit`:
+
+    BAR5[0xdc] = 2 ; BAR0[0x30] = 0 ; doorbell 0x400
+
+That drives the card's `pciep_isr_clrint` and restores `msi_enable = 1`. The
+completion channel is a **one-shot**: posting an event consumes the credit and
+only this doorbell restores it. On our path no event ever posts, so nothing has
+ever restored it - the card may be sitting on a spent credit, unable to signal
+the next frame, which fits "exactly one frame" as well as enc_stat did and is
+the last part of the ISR the poll path does not reproduce.
+
+    sudo POLLDRAIN=20 POLLCREDIT=1 ./mz0380-m55-real-capture.sh 4
+
+Score with `dmesg | grep -c 'inferred H.264 length='`, and watch bufs 1-3.
+
+### M119 (2026-08-20): every host-side ack is eliminated - the cadence gate is
+### the per-frame WAKE-UP, and op 0x06 is it
+
+    sudo POLLDRAIN=20 POLLCREDIT=1 ./mz0380-m55-real-capture.sh 4
+    sudo dmesg | grep -c 'inferred H.264 length='   ->  1
+
+The completion credit re-arm (BAR5[0xdc]=2, EVENT=0, doorbell 0x400) fired after
+every delivered frame and cadence stayed at **exactly one**. Combined with M116
+and M117 that closes the whole host-side ack surface:
+
+| candidate | verdict |
+|---|---|
+| op 0x08 / `wency_ready` | neutral (M93 on pages, M116 on frame count) |
+| `enc_stat` slot ack | neutral (M117) |
+| completion credit re-arm | neutral (M118/M119) |
+
+None of them is the gate. Which fits what M41 already recorded and this session
+kept reading past: *"the card DMAs one contiguous burst into buf0 and then its
+encoder loop parks forever, IRQ-less, for a card-internal reason no host action
+can fix"*, and M39: *"a fresh encoder spawn reliably yields exactly one more
+frame."* **One frame per wake-up is the card's actual behaviour.** The nosg path
+has always worked around it by respawning the encoder per frame, which is why
+that path eats the spawn budget.
+
+#### The cheap wake-up nobody tried
+
+From M22, and sitting in our own comment at mz0380-dma.c:1294:
+
+    tinyvenc5 then blocks on /sys/vpl_pciep/epint waiting for a separate
+    START_STREAMING (op 0x06) before it DMAs any frame
+
+and ep.ko's op6 handler (@0x1854) does **nothing but** `sysfs_notify(epint)`.
+So: one notify, one frame. We have always sent exactly one op6, at stream start,
+and we have always received exactly one frame. The correlation has been sitting
+in plain sight the whole time.
+
+op6 is fire-and-forget - it posts no mailbox completion - and crucially it does
+**not** fork an encoder; SET_VIC does that. So re-sending it is cheap and costs
+**no spawn budget**, unlike the nosg respawn workaround.
+
+`op6_kick_ms` re-fires it on a timer from inside the poll-drain thread (the only
+thread that reliably runs for the whole stream), and the stop line now reports
+the kick count alongside deliveries.
+
+    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4
+
+16 ms is one frame period at 60fps. Score with:
+
+    sudo dmesg | grep -c 'inferred H.264 length='
+
+More than one is the result. If frames now flow, cadence is solved and the
+remaining problem is content alone. If it is still one, the wake-up is not a
+notify either and the next step is static: read tinyvenc5's frame loop in the
+unpacked blob to find what it actually blocks on after frame one.
+
+**Note:** `dmesg` needs `sudo` on this kernel (`read kernel buffer failed:
+Operation not permitted` otherwise, which silently reports 0).
+
+### M120 RESULT (hardware, 2026-08-20): a free-running op6 kick is WORSE than
+### none - zero frames and a lost receiver lock
+
+    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4
+    sudo dmesg | grep -c 'inferred H.264 length='   ->  0
+
+A regression from the reliable one frame, and the receiver came apart with it:
+
+    detect 55=83 no-lock  (t+3.5s)
+    detect 55=03 no-lock  (and stayed there for the rest of the run)
+    output stage [at stop]: R55=03 no-lock ... b7=02
+    link [at stop]: B1 01=80 -> DVI (source fell back)
+
+The cause is written in our own source at the op6 send site
+(mz0380-dma.c:1296): op6 must land **after** the freshly `system()`-forked
+tinyvenc5 has exec'd, opened epint and consumed the `SET_VIC(0x29)` it reads
+first, *"rather than racing its start-up read"*. A timer that starts at stream
+start races exactly that, 62 times a second, and `start_delay_ms` exists
+precisely because the timing of the FIRST op6 is delicate.
+
+So the hypothesis is not refuted - the *shape* of the test was wrong. M119
+turned a one-shot handshake into a flood.
+
+Whether the lock loss is causal or coincidental is not established. The script
+pulses HPD three times during the capture window by design (`WATCH=1`) and the
+source has recovered from that in every previous run; this time it did not. A
+mailbox saturated at 62 commands/second contending with the detect and HPD work
+is a plausible mechanism, but a flaky source is not excluded. `b7=02` at stop is
+new and unexplained.
+
+#### The right shape: one kick per consumed frame
+
+`op6_kick_ms` is now a **minimum spacing**, not a period, and kicks fire only
+**after a delivered frame**. That makes the start-up race impossible - the first
+kick cannot occur until the first frame has already arrived - and it matches what
+the handshake actually is: consume a frame, ask for the next.
+
+    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4
+    sudo dmesg | grep -c 'inferred H.264 length='
+
+Expect at least the usual one delivery (the kick cannot make the first frame
+worse now). More than one means the notify is the cadence gate. Exactly one
+means the wake-up is something else, and the next step is static: read
+tinyvenc5's frame loop for what it blocks on after frame one.
+
+**Cold-boot at mains before this run.** Roughly 14 encoder spawns since the last
+power cycle, the wedge band is 8-18, and the card just had a bad run.
+
+### M121 (2026-08-20): two zero-frame runs in a row, no cold boot between them -
+### the card is in the wedge band and the last two results are VOID
+
+    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4   (reshaped kick)
+    sudo dmesg | grep -c 'inferred H.264 length='   ->  0
+
+**No op6 kick could have fired.** M120's reshaped kick only fires after a
+delivered frame, and nothing was delivered, so `op6_kick_ms` was inert for the
+whole run. The reshaped kick is therefore **still untested**, and the zero-frame
+result cannot be attributed to it.
+
+What it can be attributed to: the card. Uptime is continuous across M119 and
+M120 - the recommended mains-off cold boot did not happen - putting this at
+roughly **15 encoder spawns since the last power cycle**, inside the documented
+8-18 wedge band. The signature fits:
+
+* two consecutive zero-frame runs after a long, reliable run of exactly-one-frame
+  results;
+* the receiver lock flapping through `55=df`, `55=d7`, `55=c7` and repeated
+  `hper=337 vper=299 lines=1127` re-lock transients (the M105 artefact) where
+  earlier runs held `55=7f` steady for 60 s.
+
+**Both M119's and M120's runs are void as cadence evidence.** M119 additionally
+had a real confound (the free-running flood raced tinyvenc5's start-up read), but
+its zero-frame result and this one share a simpler explanation that has to be
+excluded first.
+
+#### Method note
+
+The rule this session keeps paying for, in a new costume: *a bisect step is only
+informative if every other variable sits at a value already known to permit the
+outcome you are measuring.* Card health is one of those variables, and it is the
+one nobody lists. Two runs were spent measuring a degraded card.
+
+Also fixed: m55's step-3 grep filtered out the poll-drain's own summary line, so
+`poll-drain stopped after N deliveries, M op6 kicks` - the thing that would have
+shown the kicks never fired - was invisible in the run output. It is in the grep
+now.
+
+#### Sequence to resume
+
+1. **Mains-off cold boot.** Slot standby survives a soft power-off.
+2. `sudo ./mz0380-m77-cardlog.sh` - zero-spawn health check. Healthy = op 0x6e
+   answers with the untouched sentinel; `-110` means still wedged.
+3. Control, and ask for one frame so v4l2-ctl exits cleanly:
+   `sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1`
+   Expect exactly one `inferred H.264 length=3110400` and a clean 3110400-byte
+   file. **If this does not give one frame, stop - the card is still unhealthy
+   and nothing measured after it means anything.**
+4. Only then: `sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4`
+   and check `poll-drain stopped after N deliveries, M op6 kicks` in the output.
+   M > 0 is the proof the kick actually ran.
+
+### M122 (2026-08-20): m77 gives a FALSE all-clear, and the reference projects
+### do not have our problem
+
+**The control failed.** After m77 reported the card healthy (op 0x6e answered
+with the untouched sentinel), the control run delivered **0 frames**:
+
+    poll-drain stopped after 0 deliveries, 0 op6 kicks
+
+Uptime is continuous - the mains-off cold boot still has not happened - putting
+this at ~17 spawns since the last power cycle, at the very top of the 8-18 wedge
+band.
+
+**So m77 healthy != the card can still spawn an encoder.** m77 exercises the
+mailbox transport only; the spawn budget is a separate resource it cannot see.
+Recording this because the handoff has called m77 "the health check" and it just
+issued a false all-clear that would have licensed interpreting two more void
+runs. A real health check has to be the control capture itself.
+
+The M120 reshaped op6 kick is **still untested**: `0 op6 kicks` confirms it never
+fired, because it fires only after a delivered frame and nothing was delivered.
+
+#### The reference projects, assessed (zero hardware cost)
+
+`elgato-gchd` (plus the `_2` and `_3` forks) - **wrong silicon.** Fujitsu
+MB86H57 / MB86M01 over USB, host-uploaded firmware. `GCHD::stream()` is a bare
+`libusb_bulk_transfer`; it is continuous because USB bulk is continuous, so there
+is no per-frame handshake to learn from. The forks differ only in
+`settings.cpp`, `psi_pat/psi_pmt` and `utility.cpp` - nothing touching the
+stream path.
+
+`sc0710` (already in this repo - Elgato 4K60 Pro mk.2, Yuan, PCIe) - closer, but
+its answer is architectural rather than portable. It **never asks the card for
+frames**: an XDMA descriptor chain writes continuously and
+`sc0710_thread_dma_function` services it every 2 ms, while
+`sc0710_thread_hdmi_function` polls I2C status every 200 ms and does nothing
+else. That is the "keep it listening" model - two poll threads and a hardware
+ring - but the MZ0380 has no such ring: an ARM SoC runs Linux and `tinyvenc5`
+decides when a frame happens.
+
+Neither project has an on-card process blocking on a sysfs notify, because
+neither has an on-card process. **The reference that can answer this is
+tinyvenc5 itself**, which is already unpacked:
+
+    tar xzf /usr/lib/firmware/mz0380/MZ0380.HD.HEX -C <scratch>
+    llvm-objdump -d --triple=armv5te-linux-gnueabi <scratch>/yuan_demo_sdi/tinyvenc5
+
+Read its frame loop for what it blocks on after frame one - whether that is the
+epint notify (making M120's kick right in principle) or something else entirely.
+Static, no spawns, and it can be done while the card is powered off.
+
+### M123 (2026-08-20): elgato-gchd DOES drive an MST3367-family receiver -
+### M122's dismissal was wrong. But its values need decoding, not copying
+
+The operator pushed back on M122's "wrong silicon" verdict, correctly. M122
+judged gchd by its encoder and USB transport and never looked at its HDMI
+front-end, which is a separate chip.
+
+gchd's `mailWrite(0x4e, {reg, val})` port drives a receiver with the **MST3367
+register set**: `0x00` as bank select, plus `0xab`, `0xad`, `0xae`, `0xb0`,
+`0xb1`, `0xb2`, `0xb3`, `0xb4` - the exact output-stage registers this project
+has been sweeping all session. `readHdmiSignalInformation()` reads a signal
+block and an RGB bit, `configureHDMI()` walks the same bring-up shape.
+
+So it is a genuine reference for the CONTENT problem. Two caveats found while
+checking, both of which matter:
+
+**1. RETRACTED, mid-analysis: "we clobber the bank register's upper bits."**
+gchd writes bank selects as `0xcc` / `0xcd` / `0xce` where we write bare
+`0x00` / `0x01` / `0x02`, and the low bits line up as banks 0/1/2 - which looked
+like proof that we zero four control bits on every bank switch. It is not.
+`hdcapm`, which is unambiguously MST3367 and matches our whole register map
+(`0x55` detect, `0xb0` output, banks 0-3), writes **bare bank numbers**:
+
+    static void mst3367_switch_bank(...)  { u8 buf[] = { 0x00, bank }; ... }
+
+Our encoding is corroborated by the reference that is definitely the same part.
+The claim was made on a coincidence and withdrawn within the same pass.
+
+**2. gchd's register VALUES do not transfer.** For the same registers:
+
+| reg | hdcapm | gchd |
+|---|---|---|
+| `0xb1` | `0xe0` | `0x0c` |
+| `0xb2` | `0x08` | `0xcc` |
+| `0xb3` | `0x00` | `0xcc` |
+| `0xb4` | `0x55` | `0x99` |
+
+and `0xcc` recurs across unrelated registers (`0x25`, `0x26`, `0x27`, `0x31`,
+`0x32`, ...) far too often to be register content. That points at padding or an
+encoding inside gchd's mail protocol, not raw values. Copying them over would be
+method rule 3 exactly - byte-for-byte parity treated as a rule rather than a
+hypothesis generator.
+
+**What gchd is actually worth, then:** its *structure* - the order of the
+bring-up, which registers are touched for HDMI versus component, what it reads
+back and when, and `readHdmiSignalInformation()`'s notion of a valid signal.
+Decoding `mailWrite`'s wire format first is a prerequisite for anything
+value-level, and that is a self-contained task that costs no hardware runs.
+
+`sc0710` (in this repo) remains a structural reference only: two poll threads
+(HDMI status at 200 ms, DMA at 2 ms) and an XDMA descriptor chain that writes
+continuously. No per-frame handshake, because it has no on-card process.
+
+---
+
+### M124 (static, 2026-08-20): systematic hunt for missing pieces across all
+### three reference projects - one big finding, one clean negative
+
+Operator asked for a broad sweep of the reference projects for anything this
+driver lacks. Entirely static: **zero encoder spawns, zero hardware runs.**
+
+#### 1. CLEAN NEGATIVE: the MST3367 init is COMPLETE
+
+Diffed every `(bank, register)` hdcapm writes against every one we write, with
+symbolic names resolved and hdcapm's `#if 0` blocks stripped:
+
+    hdcapm (live code only): 59 pairs      ours: 66 pairs
+    written by hdcapm, never by us:        NONE
+
+Our receiver init is a **superset** of hdcapm's. Value diff over the shared
+registers found only ordering/duplication artefacts plus two deliberate
+differences already documented in our source (`0xb1` = `0xc0` vs hdcapm's
+`0xe0`, `0xb2` = `0x00` vs `0x08`) - the HD60 Pro's own Windows values from
+`FUN_14024dc28`, versus hdcapm's sibling board.
+
+**"We are missing an MST3367 register" is closed.** After a session of sweeping
+that chip, this is worth having: the receiver side is done, and effort should go
+elsewhere.
+
+#### 2. gchd drives a DIFFERENT receiver - do not copy its values
+
+`mailWrite(port, {reg, val})` writes raw bytes, so gchd's values are real
+register writes, not an encoding (M123 left this open). But they disagree with
+hdcapm on the same register numbers (`0xb1`: `0x0c` vs `0xe0`; `0xb2`: `0xcc` vs
+`0x08`; `0xb4`: `0x99` vs `0x55`) and its bank selects carry a `0xcc` base where
+both hdcapm and we write bare bank numbers. Game Capture HD is older hardware
+with an overlapping register map. **Its structure is worth reading; its values
+are not transferable.**
+
+#### 3. sc0710 - architectural reference only
+
+Two poll threads (HDMI status 200 ms, DMA 2 ms) over an XDMA descriptor chain
+that writes continuously. No per-frame handshake, because it has no on-card
+process. Confirms polling is a legitimate shape; offers nothing to copy.
+
+#### 4. THE FINDING: hdcapm acks every buffer with a FIRMWARE COMMAND
+
+`hdcapm` is the true architectural sibling - PCIe capture card, on-board encoder,
+host-pull model with no completion interrupt. Its loop polls a status block
+(`REG_06B0`), and when a buffer is ready it reads address and length from that
+block. Then, after every transfer:
+
+    /* Acknowledge the buffer back to the firmware. */
+    hdcapm_read32(dev, 0x800, &val);
+    hdcapm_write32(dev, 0x800, val);              /* clear latched status   */
+    hdcapm_write32(dev, REG_FW_CMD_ARG(0), 0x83);
+    hdcapm_write32(dev, REG_FW_CMD_ARG(1), arr[4]);   /* dwords consumed    */
+    hdcapm_write32(dev, REG_FW_CMD_ARG(2), 0x2aaaaaaa);
+    hdcapm_write32(dev, REG_FW_CMD_BUSY, 1);
+    hdcapm_write32(dev, REG_FW_CMD_EXECUTE, 0x30);
+    hdcapm_write32(dev, 0x6c8, 0);                /* clear buffer-ready flag */
+
+A **per-buffer acknowledge sent as a mailbox COMMAND, carrying the consumed
+length.** We have never done anything of that shape. Our acks are raw register
+pokes - `enc_stat` (M117) and the credit doorbell (M118) - and both were
+measured neutral. A command-level "I consumed buffer N, length L" is a different
+mechanism entirely, and it is exactly the kind of thing a card would wait on
+before producing frame two.
+
+#### 5. Twelve opcodes the card accepts that we have NEVER sent
+
+Disassembled `ep.ko`'s `pciep_isr` (the real host-command dispatcher, `0x1210`)
+and enumerated its opcode compares:
+
+    0x01 0x02 0x04 0x06 0x08 0x09 0x0a 0x0b 0x0f 0x14 0x15 0x17 0x22
+    0x29 0x2a 0x2d 0x2f 0x31 0x50 0x52 0x60 0x61 0x62 0x64 0x6e 0x7b
+
+Never sent by this driver:
+
+    0x09  0x0f  0x22  0x2f  0x50  0x52  0x60  0x61  0x62  0x64  0x7b
+    (0x0b is firmware download - stays untouched, permanently)
+
+**`0x09` and `0x2f` are the standout pair.** They share a handler at `0x1824`
+which gates on the same flag byte `[r5+0x71c]` as the op 0x06 handler at
+`0x1854` and then falls into the path at `0x1830` that op 0x31 (POST_PROC) also
+enters - i.e. the same *class* of operation as START_STREAMING, with a different
+command code. If the card has a "frame consumed, send the next" command, it is
+in this group, and it would be the MZ0380 analogue of hdcapm's `0x83` ack.
+
+**Caveat on the extraction:** the opcode scan covered `pciep_isr+0x00..0x250`
+only, and it lists `0x03`, `0x05`, `0x07`, `0x1a`, `0x1b`, `0x1e`, `0x1f` as
+"not in the dispatcher" even though I2C demonstrably works over `0x1a`/`0x1b`.
+So the compare list is INCOMPLETE - there are more handlers further in, and the
+"never sent" list is a lower bound, not a closed set. Re-run over the whole
+function before treating it as exhaustive.
+
+#### Next, in order, all static until the last step
+
+1. Decode the `0x09` / `0x2f` handler at `0x1824` fully - what it reads from the
+   command block and what it notifies. This is the best candidate for a
+   per-frame ack and costs nothing.
+2. Complete the opcode scan over all of `pciep_isr`.
+3. Check `video_capture_mgr` / `tinyvenc5` for which of `0x09`/`0x2f`/`0x22`
+   they expect between frames.
+4. Only then test on hardware - and only after a mains-off cold boot, with the
+   one-frame control passing first.
+
+### M125 (static, 2026-08-20): op 0x09 / 0x2f are a SECOND WAKE-UP, and there
+### are TWO epint nodes
+
+Completed the opcode scan over all of `pciep_isr` (M124's was truncated - `0x07`
+is present after all) and decoded the wake-up handlers.
+
+Full dispatcher opcode set:
+
+    0x01 0x02 0x04 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0f 0x14 0x15 0x17
+    0x22 0x29 0x2a 0x2d 0x2f 0x31 0x50 0x52 0x60 0x61 0x62 0x64 0x6e 0x7b 0x7c
+
+Never sent by this driver: `0x09 0x0f 0x22 0x2f 0x50 0x52 0x60 0x61 0x62 0x64
+0x7b 0x7c` (`0x0b` is firmware download and stays untouched).
+
+#### The wake-up handlers, decoded
+
+Every one has the shape `sysfs_notify(kobj=[r5+0x678], NULL, <name>)`. Resolving
+the literal pool through the ELF relocations gives the names:
+
+| pool slot | string |
+|---|---|
+| `0x1990` | `epint` |
+| `0x1998` | `epint_1080p` |
+| `0x199c` | `audio_ctrl` |
+| `0x1988` | `"$$$ cmd(%d) => no signal \n"` |
+
+* **op 0x06** (`0x1854`): notifies `audio_ctrl`, **then** `epint` or
+  `epint_1080p`, selected by a word at `.data+4` compared against 7.
+* **op 0x09 / 0x2f** (`0x1824`): the same `epint` / `epint_1080p` notify,
+  **without** the `audio_ctrl` notify.
+* **op 0x2a** (SET_AIC, `0x17cc`): logs `$$$ SET_AIC INT MODE(%d)`, then the
+  same epint notify pair.
+
+So **0x09 and 0x2f are a second, cheaper wake-up** - op6 minus the audio side
+effect. If the card has a "produce the next frame" command distinct from
+"start", this is it, and it is the natural thing to fire per frame where M119
+and M120 fired op 0x06.
+
+#### Two epint nodes, selected by a mode word
+
+`epint` versus `epint_1080p` is chosen by `[.data+4] == 7`. Our SET_VIC byte6
+(`fw`) is the encoder selector - 7 spawns `./tinyvenc7`, else `./tinyvenc5`
+(M71) - so the `== 7` test is very likely that same value, meaning **tinyvenc5
+listens on `epint` and tinyvenc7 on `epint_1080p`.** That is a clean, testable
+account of M88's otherwise unexplained result that `fw=7` produces nothing:
+wrong encoder binary AND a notify aimed at the node it is not blocked on.
+
+#### The no-signal gate
+
+All three handlers first read a flag byte at `[r5+0x71c]` and, if it is nonzero,
+jump to `printk("$$$ cmd(%d) => no signal")` and do nothing else. **The card
+refuses START and both wake-ups outright while it believes there is no signal.**
+Worth knowing before firing any kick: a wake-up sent while that flag is set is
+silently discarded, which would look exactly like "the kick did not help".
+
+#### Next (static first, hardware last)
+
+1. Find what sets/clears `[r5+0x71c]` and whether the host can read it. If it can,
+   it is a far better streaming oracle than the buffer poison scan.
+2. Confirm `[.data+4]` is SET_VIC byte6 by finding its writer in the 0x29 handler.
+3. Then, on hardware after a cold boot: send op `0x2f` (or `0x09`) after each
+   poll-drained frame instead of op `0x06`. The plumbing already exists -
+   `op6_kick_ms` fires post-delivery (M120); only the opcode changes.
+
+
+---
+
+## M126 - the splash frame measured, and the receiver output stage reopened
+
+Sources cross-referenced this milestone: the Windows collection
+(`/run/media/wolffyx/Work/hd60-trace/collect-2026-08-19/`) and
+`elgato-gchd` (`src/gchd/configure_hdmi.cpp`).
+
+### The delivered frame is a splash, and we now know its shape
+
+Decoded `/tmp/cap-m55.nv12` (3110400 bytes, the M112 baseline capture) instead
+of eyeballing it in ffplay:
+
+| plane | content |
+|---|---|
+| Y | `0x11` everywhere except one band |
+| UV | `0x80` everywhere, **one unique value in the whole plane** |
+| ink | rows **437-641**, cols **5-1100**, 180 rows, a few hundred pixels each |
+
+So: video black, strictly monochrome (UV never deviates), with an
+anti-aliased text band vertically centred on line 539. The card composited a
+full 1920x1080 surface and drew its own splash into it. Its compositor and its
+DMA are both healthy; the VIC simply never wrote live pixels into that surface.
+
+**This also corrects the M125 ordering.** The `[r5+0x71c]` no-signal flag was
+demonstrably **CLEAR** during this run - if it were set, op 0x06 would have
+been discarded too and no frame would exist at all. The flag is not what
+produces the splash. Cadence (op 0x2f) and content (VIC input) are two
+independent gates, and the 0x2f lead is unaffected by the splash.
+
+### gchd is at the same I2C address, so its structure IS comparable
+
+`configure_hdmi.cpp` drives 7-bit **0x4e** = our 8-bit **0x9C**, banked through
+register `0x00` with a `0xcc` base (`0xcc`/`0xcd`/`0xce` = bank 0/1/2). Bank-0
+register numbers therefore line up with ours directly. M123's "values are not
+transferable" stands; the structure was never checked.
+
+What the structure says (`configure_hdmi.cpp:170-186`, `:205-211`):
+
+```
+0x00 = 0xcc                                  # bank 0
+0xb2 = 0xc4 (1080) / 0xcc (720) / 0xcf (SD)  # RESOLUTION-DEPENDENT
+0xb5 = 0xd0 (1080) / 0xcc (720) / 0xcc (SD)  # RESOLUTION-DEPENDENT
+...
+0xb0 = 0xe8      # config written with bit0 CLEAR
+0xb1 = 0x0c
+0xad = 0xc9
+0xb0 = 0xe9      # bit0 set LAST, as the final write of the bring-up
+```
+
+Two things we do differently and have never tested:
+
+1. **0xb2 and 0xb5 are fixed constants in our driver** (`0x00`, `0x0c`) where
+   gchd derives both from the input resolution.
+2. **We commit 0xb0 in one write with bit0 already set**, inside the `0xab`
+   bit7 freeze. gchd treats bit0 as the last thing asserted, after the config
+   is in place. That is not the M96 experiment - M96 measured `0x20` as a
+   *terminal* value and (correctly) got nothing.
+
+Four-way comparison:
+
+| reg | ours | hdcapm | gchd 1080p | Windows `0x9c` trace |
+|---|---|---|---|---|
+| `0xb1` | `0xc0` | `0xe0` | `0x0c` | `0xc0` **confirmed** |
+| `0xb2` | `0x00` | `0x08` | `0xc4` | value unresolved (`?`) |
+| `0xb5` | `0x0c` | - | `0xd0` | not seen |
+
+`0xb2` is the only one of the three with no Windows reference value at all, and
+the only one both siblings write non-zero while we write zero.
+
+### Device 0x98 - static verdict: board-gated, but not settled
+
+M124 retracted "0x98 is the blocker" on the grounds that its traffic is CSC
+matrices for a display path. That retraction covered `0x1402625f4` /
+`0x140262834`. It does **not** cover `0x14024cdc0`, which is a different
+function entirely - disassembled this milestone:
+
+* It is **table-driven** from a 24-byte-per-entry table at `0x1402D3B90`,
+  keyed by a mode id in byte 0. Byte 20 of each entry is the frame rate
+  (`0x3c`/`0x32` = 60/50) and bytes 16-19 are the pixel clock, little-endian:
+  entry `0x01` = 25,175,000 (VGA), `0x04` = 74,250,000, **`0x10` =
+  148,500,000 = 1080p60**. The decode is self-verifying.
+* It writes device `0x98` registers `0x90 0x91 0x95 0x96 0x97 0xa0 0xa1 0xa2
+  0xa3 0xa6` from that table, then **`0xb1 = 0x0c` and `0xb2 = 0xea` as hard
+  constants**.
+* `0xb1 = 0x0c` is byte-identical to gchd's `0xb1` on its receiver, and gchd
+  writes the same 0x98-side registers (`0x0c 0x0e 0xa2 0xc0`) that the Windows
+  trace touches on `0x98`.
+
+**But it is gated.** Entry does `test r8b, 2; je <return>`, branches on
+`byte [ctx+0x12]` (against 0 and against 2), and its only caller
+(`0x14024d29c`, itself called from `0x14024c74c`) first reads `0x98` register
+`0x09` and compares the result to `0xb2` - a chip-ID probe. `[ctx+0x12]` is a
+board/decoder-type selector, and this driver serves NVP6134 / TECHPOINT /
+SA7160 boards as well as ours. Static analysis cannot say which arm our board
+takes.
+
+**Cheap discriminator, zero card spawns:** read `0x98` registers `0xb1` and
+`0xb2` on our board with `/proc/mz0380-periph-scan` (`periph_chip=0x98`,
+`mz0380-m83-i2c-devscan.sh`). If they already read `0x0c` / `0xea`, something
+already programmed them and the avenue is closed for good. If they read
+anything else, the block is unwritten on our card and worth one spawn.
+
+### Implemented (no behaviour change at defaults)
+
+New module parameters, defaults equal to the previously hard-coded values:
+
+| param | default | m55 env |
+|---|---|---|
+| `mst_b1` | `0xc0` | `MSTB1` |
+| `mst_b2` | `0x00` | `MSTB2` |
+| `mst_b5` | `0x0c` | `MSTB5` |
+| `mst_b0_late` | `0` | `B0LATE` |
+
+`mst_b0_late=1` writes `0xb0` as `value & ~1` inside the `0xab` freeze, then
+re-writes it with bit0 set after the unfreeze - gchd's order.
+`mz0380_mst3367_output_diag()` now also reads back `0xb5`, so every register in
+the sweep appears on the existing output-stage line.
+
+
+### M126 results (hardware, 4 spawns, one cold session)
+
+Baseline + three single-variable runs, every other knob at its default, scored
+with `mz0380-m126-score.py` on the chroma plane rather than on file size.
+
+| run | `0xb2` readback | frame |
+|---|---|---|
+| control | `00` | splash |
+| `MSTB2=0x08` (hdcapm) | `08` | splash |
+| `MSTB2=0xc4` (gchd 1080p) | `c4` | splash |
+| `B0LATE=1` | `00`, `b0=21` | splash |
+
+The readbacks confirm every write landed - `0xb2` is not being rejected. And
+the four captures are not merely "all splash": they are **byte-identical**.
+Every run reports the same histogram to the sample - `Y 17 x2059998, 15 x989,
+12 x694`, 200 unique luma values, 180 non-flat rows, one unique chroma value.
+
+**`0xb2` is NEUTRAL and is now closed**, across the full spread of values any
+sibling driver uses. `B0LATE` likewise produced no change (see the caveat
+below).
+
+That the frame is bit-identical under three different receiver output-stage
+configurations is the stronger result: the splash is a fixed card-side asset,
+and **no register in the receiver's output stage influences what the encoder
+consumes.** Taken with M99 (Windows block), M100/M101 (`0xb0`, all four
+values), M96 (`0xb0` external sync), M99 (`0xad`, `0xb4`) and M124 (our init
+is a superset of hdcapm's), the MST3367 output stage is now empirically
+exhausted as a content lever. Stop sweeping it.
+
+**Caveat on `B0LATE`, stated rather than glossed:** the run shows `b0=21` at
+all three diag points, which is the expected end state either way, and the
+`0xb0 committed in two steps` line is printed at mode-commit time, outside the
+sections `m55` greps. The run is therefore consistent with the two-step commit
+having happened and having done nothing, but it does not prove the path
+executed. `sudo dmesg | grep 'two steps'` after a `B0LATE=1` run settles it.
+
+### M126: what the I2C device scan actually showed
+
+| device | result |
+|---|---|
+| `0x9c` MST3367 | 38/64 zero, structured values - positive control good |
+| `0x98` | 10/64 zero, varied high-entropy values - **fitted and ACKing** |
+| `0x90` | **64/64 zero - does not ACK. Not fitted on this board.** |
+
+So the board carries two I2C slaves, not the four the static Windows trace
+suggests: `0x9c` and `0x98`. `0x90`, the "alternate CSC path" that M124 already
+doubted, is absent - that half of the four-device map is settled.
+
+One useful byte: `0x98` register `0x09` reads **`0xff`**. The Windows caller
+chain (`0x14024c74c` -> `0x14024d29c` -> `0x14024cdc0`) *writes* `0x09 = 0xb2`
+(at `0x14024c642`) and then *reads it back* and compares against `0xb2` - a
+write-and-verify presence test, not a hard-wired chip ID. `0xff` means nothing
+has ever written it, on this board, by anything.
+
+**Correction to my own plan:** the discriminator I proposed - read `0x98`
+`0xb1`/`0xb2` and see whether they already hold `0x0c`/`0xea` - was NOT
+answered by this scan. `mz0380-m83-i2c-devscan.sh` scans `0x00..0x3f` only, and
+both registers sit above that window. The scan as run cannot speak to it.
+`periph_start` already existed as a module parameter; the script now plumbs it
+through as `START`, so `START=0x90 sudo ./mz0380-m83-i2c-devscan.sh 0x40`
+covers `0x90..0xcf` and actually runs the test. Zero spawns.
+
+### M126: `kick_opcode`
+
+`op6_kick_ms` now fires `kick_opcode` (default `0x06`, unchanged) instead of a
+hard-coded `MZ0380_CMD_START_STREAMING`, so M125's lead can be run:
+
+    sudo POLLDRAIN=20 OP6KICK=16 KICKOP=0x2f ./mz0380-m55-real-capture.sh 3
+    sudo dmesg | grep -c 'inferred H.264 length='   # cadence: want > 1
+
+Score on the delivery count, never the file size (M118). The poll-drain summary
+line now names the opcode it fired.
+
+
+### M126: op 0x2f measured - neutral as a single post-frame kick
+
+    poll-drain stopped after 1 deliveries, 1 kicks (op 0x2f)
+
+One frame delivered at t+0.15 s, one kick fired immediately after it, and the
+drain then polled for a further **56 seconds** and saw nothing. The stop poison
+scan shows all four buffers untouched, so no second frame landed anywhere -
+buf0 reading `aa` at stop is the M38 re-poison after delivery, not a
+contradiction.
+
+**But this is a one-kick experiment.** The kick lives inside the `if (handled)`
+branch (M120), so a one-frame stream fires exactly one wake-up. That cannot
+separate "the card ignored 0x2f" from "we only ever asked once, and tinyvenc5
+had already exited". Verdict on 0x2f: **not yet earned.**
+
+Added `kick_repeat` (def 0): once the FIRST frame has been delivered, repeat the
+kick every `op6_kick_ms` regardless of whether a new frame arrived. The
+M119/M120 hazard was kicking *before* the first frame and racing tinyvenc5's
+start-up read of SET_VIC; gating on `delivered > 0` keeps that impossible. The
+first kick's return code is now logged, so a rejected command is visible
+instead of being swallowed by the async send.
+
+    sudo POLLDRAIN=20 OP6KICK=16 KICKOP=0x2f KICKREP=1 ./mz0380-m55-real-capture.sh 3
+    sudo dmesg | grep -c 'inferred H.264 length='
+
+### M126 gotcha: sudo resets the environment
+
+`START=0x90 sudo ./mz0380-m83-i2c-devscan.sh 0x40` ran, printed a full scan,
+and **silently scanned `0x00..0x3f` anyway** - `sudo` does not forward
+environment variables from the caller. Every knob has to sit AFTER `sudo`,
+which is why `sudo POLLDRAIN=20 ./mz0380-m55-...` has always worked:
+
+    sudo START=0x90 ./mz0380-m83-i2c-devscan.sh 0x40
+
+The scan header prints the register window it actually used
+(`regs 0x00..0x3f`). Read it before reading the values - this class of failure
+looks exactly like a completed experiment.
+
+Related: `sudo dmesg | grep 'two steps'` returning nothing does NOT settle
+whether `B0LATE` executed. `m55` and `m83` both run `dmesg -C`, and an m83 scan
+ran between the `B0LATE` capture and the grep. The evidence was cleared, not
+absent. Grep in the same shell command as the run, or not at all.
+
+
+### M126: op 0x2f, repeated - accepted, useless, and it DESTROYS THE LOCK
+
+    poll-drain: first kick op 0x2f ret=0
+    poll-drain stopped after 1 deliveries, 1171 kicks (op 0x2f)
+
+1171 wake-ups over ~56 s, every one accepted by the mailbox, **one frame**. All
+four buffers untouched at stop.
+
+And the input path came apart under it:
+
+| | before START | after START | at stop |
+|---|---|---|---|
+| `R55` | `7f` LOCKED | `7f` LOCKED | **`03` no-lock** |
+| link | HDMI | HDMI | **DVI** (`B1 01=80`) |
+| `0xb7` | `00` | `00` | **`02`** |
+
+`R55` went `7f` -> `83` -> `03` about 3.5 s after the kicks began and never
+recovered, through the whole operator power-cycle window - in every other run
+this session it returned to `7f` within 400 ms. This is the **same signature as
+M120's free-running op 0x06**: zero further frames and a lost lock. `0xb7`
+moving is new; nothing in this driver writes it.
+
+So the two "cheaper wake-up" opcodes behave like op 0x06, including its damage.
+**The host-side wake-up avenue is closed.** Do not flood these opcodes again.
+
+#### What one-frame-then-silence actually means
+
+Put together with the splash: the card emits exactly one frame per stream, its
+content is a card-side asset, no host ack / credit / wake-up changes either
+fact, and each fresh `m55` run - i.e. each fresh encoder spawn - yields exactly
+one more frame.
+
+That is the profile of **tinyvenc5 exiting after its first frame**, not of a
+running encoder waiting to be nudged. Its own string is
+`"Can't create video capture -> exit"`, and `vpl_vic.ko` fails init with
+`(CCIR or width chck fail)` when `stat & 0x17 == 0x10`. A process that fails
+VIC init, emits the no-signal splash once and quits explains every
+observation - and explains why M117, M118, M119, M120, M124's buffer-ack idea
+and now M125's 0x2f are all neutral: there is nothing left alive to wake.
+
+**Cadence and content are one bug, not two.** The M126 opening claim that they
+are independent gates was wrong - they are independent *symptoms* of the same
+failure. The target is VIC init.
+
+#### Which re-opens the geometry, with a number this time
+
+M76 swept `vic_in_w` over exactly two values, 1920 and 3840, and scored every
+pass as `captured 0 bytes`. That scoring is the pre-M112 delivery bug: **no
+setting could have produced a non-zero result in that harness**, so M76's
+"width hypothesis DEAD" verdict is a rule-1 violation of the kind this file
+already documents, not a measurement.
+
+The Windows `DriverEntry` trace supplies a geometry M76 never tried:
+
+    [MEMORY] [00466000] [0034BD00] [0034BD00]
+    0x466000 = 2048 x 1125 x 2   + 4096
+    0x34BD00 = 2048 x 1125 x 1.5 + 256
+
+**stride 2048, height 1125** - the vtotal, not the 1080 active lines. Windows
+sizes its capture surfaces for a 2048x1125 frame while we declare 1920x1080,
+and `VIC_SetSizeToVIC` picks its wide/narrow mode from the programmed width at
+a 2560 threshold (M106/M108), so width is a value the VIC genuinely acts on.
+
+Now testable properly: `POLLDRAIN` delivers, and `mz0380-m126-score.py` scores
+on the chroma plane instead of on a byte count that used to be structurally
+zero.
+
+    sudo POLLDRAIN=20 VICINW=2048 VICINH=1125 ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICINW=2200 VICINH=1125 ./mz0380-m55-real-capture.sh 1
+
+#### 0x98 above 0x3f - read, and it is untouched
+
+`START=0x90` (after `sudo`) covered `0x90..0xcf`:
+
+    0x9c: b0=20 b1=c0 b2=00 b3=00 b4=54 b5=0c   <- exactly what we wrote, module unloaded
+    0x98: b1=6a b2=77                            <- NOT 0x0c / 0xea
+
+The `0x9c` window doubles as a control and passes: it reads back our own init
+values with the driver gone. `0x98`'s `0xb1`/`0xb2` are **not** the constants
+`0x14024cdc0` writes, so nothing on this board has ever run that block.
+
+The scan is also reproducible - the two `0x00..0x3f` passes are byte-identical -
+so `0x98` is a real, stable register file, not bus noise.
+
+**Caveat before anyone writes it:** the readout is high-entropy with almost no
+zeros, which is not what a video chip's power-on defaults usually look like,
+and this driver has never written this device. It could equally be a
+configuration EEPROM. Windows' own probe is a write-and-verify
+(`0x09 = 0xb2`, read back, compare), so the safe first move is that single
+register, not the `0x14024cdc0` block.
+
+
+### M126: geometry is neutral too - six byte-identical splashes
+
+    vic_in=2048x1125   ret=0   splash
+    vic_in=2200x1125   ret=0   splash
+
+Both echoed back by SET_VIC, both scored on chroma. Every capture this session -
+control, `MSTB2` at `00`/`08`/`c4`, `B0LATE=1`, `2048x1125`, `2200x1125` - is
+**byte-identical**: `Y 17 x2059998, 15 x989, 12 x694`, 200 unique luma, 180
+non-flat rows, one unique chroma. Six configurations, one frame.
+
+So the Windows `[MEMORY]` geometry does not move it either, and M76's verdict -
+reached on an oracle that could not have produced any other answer - happens to
+have been right. It is right *now*, on a sound measurement.
+
+### M126: opcode 0x50 decoded - it is SET_OSD, and that closes it
+
+M32 listed `0x50` as "the only host->card channel never decoded... this is where
+a bitstream-buffer / encoder-config handoff would live". Disassembled
+(`0x140289f94`, callers `0x14028caa1` / `0x14028e10e`):
+
+* sends the command **twice**, count 12 each time, 32 payload bytes per send
+  from `movups xmm0/xmm1` - i.e. a **64-byte string**, split in two chunks, with
+  a chunk bit (`ebx |= 0x10`) on the second;
+* `strlen()` of the string is computed inline and packed into word[2] together
+  with three small integers; word[3] carries two more;
+* the caller loops `edi` from 0 to **0x18 (24)** over a table at **stride 0x41
+  (65 bytes)** - 24 strings of up to 64 chars plus NUL - reading four parallel
+  dword arrays at stride 0xc00 for the integers.
+
+tinyvenc5 names it outright:
+
+    [tiny5] SET_OSD [%02x] ch[%d], line[%d], psz_length=%d, font_style=%d,
+            font_size=%d, position(x,y)=(%d,%d)
+
+String plus length plus font style, font size and an (x,y) - exactly the shape
+above, 24 OSD lines. `libtextrender.so.0` is in the card rootfs. **Opcode 0x50
+is on-screen-display text, not a capture handoff.** M32's remaining-lead #1 is
+closed; do not spend a spawn on it.
+
+### M126: the VIC's config file is IN THE BLOB, and it is nearly all fixed
+
+`tinyvenc5` reads `nullsensor_1920x1080.cfg`, copies it to
+`/tmp/nullsensor_yuan.cfg`, and patches exactly nine keys - its own string
+table lists them:
+
+    input format / output format / start x position / start y position /
+    input frame width / input frame height / maximum frame width /
+    flip video / mirror video
+
+The template (readable, `yuan_demo_sdi/nullsensor_1920x1080.cfg`):
+
+    1920   // maximum frame width      <- patched
+    1080   // maximum frame height     <- NOT patched
+    1920   // captured frame width     <- NOT patched
+    1080   // captured frame height    <- NOT patched
+    0 / 0  // start x / y position     <- patched
+    1      // output format (1:YUV420, 2:YUV422)
+    6      // input format (6: BT1120p, 7: BT1120i)
+    1920   // input frame width        <- patched
+    1080   // input frame height       <- patched
+    1      // field mode (1: one interleaved field)
+
+So the capture geometry the VIC actually uses is **hard-coded 1920x1080 in the
+template**, and `input frame width/height` - the only width the host can move -
+is a separate declaration. That is the concrete form of M106/M108's "the printed
+width is a driver local, not host-supplied", and it explains why 1920, 2048,
+2200 and 3840 all produce the same result: none of them changes what the VIC
+captures.
+
+The library's own constraint strings, for the record:
+
+    The sum of the capture width and the start pixel must be less or equal to input width.
+    The max frame width must be larger or equal to capture width.
+    [VIDEOCAP][ERROR]: Fail to do vpl_vic device driver ioctl (IO Number %d) !!
+    [tiny5] Can't create video capture-------------> exit !!!
+
+**Consequence: the host-reachable VIC configuration surface is now fully
+enumerated and fully swept.** Nine keys, all of which we already drive, none of
+which changes the outcome. The failure is not in what we tell the VIC.
+
+#### Correction made and withdrawn within this milestone
+
+On first reading `video_capture_mgr`'s SET_VIC printf I took `nosg` to mean "no
+signal" and suspected we were asking for the splash. We are not:
+`is_nosg` is byte 31 and comes from `stream_nosg`, which defaults to 0
+(mz0380-dma.c:1223), and `vic_nosg` only colours that path. The project's field
+map was already correct. The name does mean "no signal" rather than
+"no scatter-gather", which is worth having straight, but nothing follows from it.
+
+---
+
+## M127 - the card-side pipeline read end to end; three prior verdicts corrected
+
+Static only. Zero hardware, zero encoder spawns, no upload. Everything below is
+read out of the stock blob (`MZ0380.HD.HEX.stock`) with `llvm-objdump` plus a
+literal-pool/GOT string resolver; every file involved is unstripped.
+
+### 1. What actually runs on the card, and when
+
+`etc/rc.local` is the steady-state boot path. It starts **`video_capture_mgr -D -P 5`**
+and does *not* start tinyvenc5. `yuan_start_process.sh` - which does launch
+`./tinyvenc5 -D -c nullsensor_1920x1080.cfg` - is the first-boot / restore path
+only.
+
+So `video_capture_mgr` is the resident daemon. It polls `/sys/vpl_pciep/epint`,
+and on SET_VIC it writes `/tmp/nullsensor_yuan<N>.cfg` and then
+`system("./tinyvenc5 -D [-L] -a .. -w ..")`. It also has `killall -9 tinyvenc5`
+and `[Video_MGR] timeout ---->break(%d)`. **tinyvenc5 is per-stream, and it is
+video_capture_mgr - not tinyvenc5 - that owns the cfg.**
+
+`EncodingGroup::Start` ends its failure path in `exit()` (0x11260). tinyvenc5
+dying is therefore consistent with the hard wedge (a wall of `SET_VIC ret=-110`,
+nothing left to ACK), but it cannot be what happens on a *normal* stream,
+because a normal stream returns a frame.
+
+### 2. SET_VIC (0x29) - the complete 40-byte layout, verified from two sides
+
+`ep.ko`'s `epint_show` memcpy's `rodata[0xa0 + cmd]` bytes of the mailbox to the
+card's userspace. That table is the per-opcode payload length:
+
+| cmd | 0x06 | 0x07 | 0x09 | 0x29 | 0x2a | 0x2d | 0x2f | 0x31 | 0x50 | 0x51 | 0x52 | 0x60 | 0x61 | 0x62 | 0x6e |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| len | 8 | 8 | 8 | **40** | 20 | 44 | 44 | 20 | 44 | 20 | 7 | 16 | 8 | 12 | 24 |
+
+`video_capture_mgr`'s own SET_VIC printf marshals those 40 bytes, and the
+offsets fall out of the disassembly exactly:
+
+```
+ 0..3  cmd = 0x29        20..21 x_start            32     vanc_lines
+ 4     ch                22..23 y_start            33     fast_kill
+ 5     fps               24..25 input_frame_width   34     -
+ 6     fw                26..27 input_frame_height  35     is_slave
+ 7     input format      28     bitstream_num       36     nosg_back_color
+ 8..9  width             29     osd_enabled         37     nosg_y
+10..11 height            30     osd_size            38     nosg_u
+12     m                 31     is_nosg             39     nosg_v
+13     flip
+14     mirror
+16..19 color_info[4]
+```
+
+This matches the project's existing map. Two notes:
+
+- **Byte 7 is the cfg `input format` enum, not an interlace bool.**
+  `video_capture_mgr` labels it `interlace(%d)` in its printf, which invites the
+  wrong conclusion. Follow the value, not the label: it is passed as the 5th
+  argument to the cfg writer and `sprintf`'d **raw** into the line matching
+  `"input format"` (patcher at 0xa3a8, arg resolved at 0xa5f8-frame +0x00 =
+  `ldrb [r12,#7]` at 0x91f0). `6 = BT1120p, 7 = BT1120i` stands. Our driver is
+  right; do not "fix" this.
+- Bytes 40..41 exist in video_capture_mgr's *per-channel* struct but are past
+  the 40-byte epint payload, so they are not host-settable through SET_VIC.
+
+### 3. The cfg is patched far more than "nine keys" - M126's claim is wrong
+
+M126 concluded the capture geometry is hard-coded in the template and only nine
+keys are patched. That was read off tinyvenc5's string table. The patcher is in
+`video_capture_mgr` (0xa290) and it works two ways:
+
+- **by comment**: `input format`, `output format` (a hard `1`), `start x position`,
+  `start y position`, `input frame width`, `input frame height`, `flip video`,
+  `mirror video`, `maximum frame width`.
+- **by value**: it `atoi()`s every line and rewrites **any line whose value is
+  1080** with SET_VIC `height` (bytes 10..11), and any line valued 1920 with
+  either `maximum frame width`'s source or SET_VIC `width` (bytes 8..9).
+
+So `captured frame width/height` and `maximum frame height` *are* driven from
+the host - through SET_VIC bytes 8..11, not through `input frame width/height`
+(bytes 24..27, the `vic_in_w`/`vic_in_h` knobs M76 swept). **The width
+experiments moved the wrong field.**
+
+### 4. ep.ko's sticky `no_signal` latch
+
+`pciep_isr` op 0x29 (0x171c): if `width == 0 || height == 0` it prints
+`SET_VIC (CH %d) NOSG ... size(%dx%d)`, sets a global `no_signal = 1`, MSIs the
+host and **does not `sysfs_notify`** - nothing spawns. Once latched, ops
+`0x06, 0x2a, 0x2f, 0x31, 0x50, 0x51, 0x52, 0x60, 0x61, 0x62` all early-out with
+`cmd(%d) => no signal`. Only a SET_VIC with non-zero w/h clears it.
+
+On the success path it stores `(fw == 7) ? 7 : 5` and notifies `epint_1080p`
+when that is 7, otherwise `epint`. That is the whole of what `fw` does in ep.ko.
+
+### 5. tinyvenc5's command surface
+
+`main` opens `/sys/vpl_pciep/epint`, `read()`s 44 bytes, and requires word0 ==
+41 (`GOT command 0x%X, why?????? should be SET_VIC_PARAMS`). It ACKs by
+`pwrite`ing the same 44 bytes back. Then `poll()` + `pread()` in a loop, with a
+jump table for cmd 6..98. Implemented commands, exhaustively:
+
+`0x06 0x09 0x2a 0x2d 0x2f 0x31 0x50 0x51 0x52 0x62` - everything else is ignored.
+
+### 6. Where the splash comes from - and it is not a VIC-init failure
+
+`NOSG_LOGO_Y` / `NOSG_LOGO_YUV422` are **data symbols inside tinyvenc5**, drawn
+by `EncodingGroup::fake_frame_process`. `init_func` starts that thread whenever
+`preview_params_settings[ch].byte[0x0a] == 0`, which `main` zeroes at startup -
+so the fake-frame thread is *always* running alongside `encode_handler`. It is
+the standby source, not an error path.
+
+The real path drops frames in `libtkmf_video_source.so.0`:
+
+```
+[yuan][tkmf] (Drop this frame) Tiny_Set(%d x %d)!= VIC_Get( %d x %d)(stride %d),
+  Count = %d, idx = %d, Time = %d:%03d , dwInWidth: %d,
+  bCCIRErr: %d, bNoSignal: %d, bFifoFull: %d
+```
+
+and `VideoCap_GetBuf` (libvideocap 0x43f0) reads those flags out of the buffer
+descriptor: `+0x28 = bFifoFull`, `+0x2c = bNoSignal`.
+
+`bCCIRErr` originates in `vpl_vic.ko`'s ISR. `dwVICMmrStat = MMR[0x30] >> (ch*8)`
+for ch<=3 (`MMR[0x34] >> (6*ch-24)` above that), and the failing test is
+`(stat & 0x17) == 0x10` at 0x1358/0x137c - bit 4 set with bits 0..2 clear. The
+message is rate-limited by `dwErrPrintPeriod`.
+
+**So the model is: capture initialises fine, real frames are rejected, and the
+standby thread emits the built-in no-signal logo.** M126's "the target is the
+VIC init failure" does not survive - if `TKMF_VideoSrc_Init` had failed,
+tinyvenc5 would have `exit()`ed and there would be no frame at all.
+
+### 7. Host-readable card state (already wired, worth using)
+
+`store_channel_done` (ep.ko 0xdc8, reached from `livectrl_ioctl`) writes the
+card's own view into BAR0: per-channel nibble counters at `0x40/0x44/0x48/0x4c`
+and the EVENT word at `0x30`. `encode_status_storeN` writes
+`/sys/vpl_pciep/enc_stat<N>` to `BAR0 + 0x50 + N`. The driver already reads
+both (`MZ0380_MB_FRAME_TOKEN`, `MZ0380_MB_ENC_STATUS`).
+
+### M127b - the splash identified by byte identity, not inference
+
+Run: `sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1`, card healthy, one frame,
+receiver `R55=0x7f` LOCKED 1920x1080p60 HDMI, `htot=2200 vtot=1125`.
+
+The captured Y plane is **`NOSG_LOGO_Y`, the 320x240 data symbol at tinyvenc5
++0x6b10c (0x12c00 bytes)**, blitted into an otherwise `0x11` frame:
+
+- histogram match is exact - the asset has `15 x989, 12 x694`, the capture has
+  `15 x989, 12 x694`;
+- 179 of the asset's 240 rows are found **verbatim** in the capture (the rest are
+  flat rows, which match trivially);
+- located, every row lands at `y = 420 + r, x = 800`, destination stride 1920 -
+  a perfectly centred `(1920-320)/2, (1080-240)/2` memcpy.
+
+So the frame is `EncodingGroup::fake_frame_process` doing exactly its job. It is
+not a failure artefact, not a scaled asset and not an OSD render. **The splash
+oracle is now byte identity against a known asset; the chroma heuristic
+(`UV unique == 1`) can be retired.** M126's ink measurement of "rows 437-641,
+cols 5-1100" was contaminated by a single stray non-flat row near y=0.
+
+Corollary: because the delivered frame is a fixed asset, "frames byte-identical"
+carries **no gradient**. Every sweep scored that way was only ever a binary
+splash / not-splash detector. Those verdicts still stand as negatives, but no
+sweep of that shape can ever rank two settings.
+
+#### The stop-line counters are zero-ambiguous
+
+```
+stream stop: EVENT[0x30]=00000000 token[0x40]=00000000 0x44=00000000 0x48=00000000
+             0x4c=00000000 enc[0x50]=00000000 irq_total=4 frame_events=0
+```
+
+None of that means "the card never wrote". `MZ0380_MB_ENC_STAT_FREE` is itself
+**0**, so the driver arms `0x50` with 0 and reads 0 back. And
+`store_channel_done` (ep.ko 0xdc8) writes `count - 1` into the per-channel
+nibble, so a one-frame channel legitimately writes 0 to `0x40/0x44/0x48`. To
+make these readable, arm them with a non-zero sentinel instead.
+
+### M127c - I2C 0x98 identified: it is an ITE HDMI *transmitter*, lead closed
+
+The answer has been sitting in M83's bank sweep since it was run (RE_FINDINGS
+~line 2291) and was recorded as a curiosity rather than read as a chip ID:
+
+```
+98 bank0..3: identical rows (54 49 12 16 1c 60 00 00 00 ff ff ff 00 00 6c 08)
+```
+
+- `0x00/0x01 = 54 49` -> little-endian **`0x4954`**, the ITE Tech vendor ID
+  (`"IT"` in ASCII).
+- `0x02/0x03 = 12 16` -> device `0x612`, revision 1.
+- All four "banks" read identically, so it does not implement MST3367-style
+  bank select - it is a flat register file, not a receiver sibling.
+
+That is an **IT66121 / IT6612-class HDMI transmitter**, and 8-bit `0x98`
+(7-bit `0x4C`) is its stock address. On this board it drives the HDMI **output**
+passthrough.
+
+Everything about the Windows traffic now fits: a per-mode table keyed by pixel
+clock (entry `0x10` = 148,500,000 = 1080p60), YCbCr->RGB coefficients, and the
+`0xb1 = 0x0c` / `0xb2 = 0xea` constants are transmitter output setup. M92
+retracted this lead on the grounds that the traffic was CSC; the retraction was
+right, and the chip ID now makes it final.
+
+**`0x98` is not on the capture path. Do not spend another run on it.** It is
+also not a configuration EEPROM, so the "write-and-verify `0x09` first" caution
+from the M126 handoff is moot - and we had already written its register `0x00`
+during the EDID bank hunt with no ill effect.
+
+Residual value, for later and unrelated to the blocker: this is how HDMI
+passthrough would be implemented, and we have never initialised it.
+
+**Bus inventory is now complete and every device is identified:**
+
+| 8-bit | 7-bit | device | role |
+|---|---|---|---|
+| `0x9c` | `0x4e` | MST3367 | HDMI receiver - the capture path |
+| `0x98` | `0x4c` | IT66121 | HDMI transmitter - output passthrough |
+| `0x90` | `0x48` | - | not fitted (64/64 zero at two windows) |
+| `0xa0` | `0x50` | - | not fitted (no EDID EEPROM; EDID is inside the receiver) |
+
+### M127d - hdcapm init diff, and the one register never validly measured
+
+Fetched the GPL `hdcapm` MST3367 driver (stoth68000/hdcapm, `mst3367-drv.c`)
+and diffed its `mst3367_init_setup()` against ours. We match it almost
+everywhere - `0xab=15 0xad=05 0xb4=54 0xb5=0c 0x51=89`, BANK2 `01=61 02=f5
+07=04`, and we do write its 36-byte CSC table at `0x92..0xb5`. Two notes:
+
+- **`0xb0..0xb5` are the tail of the CSC table, not a standalone output stage.**
+  hdcapm writes `0xb0..0xb5` in `RxVideoInit`, then clobbers them with the CSC
+  block at `0x92..0xb5`, then re-writes `0xb0` last. So our observed
+  `b1=c0 b2=00 b5=0c` are CSC bytes and agree with hdcapm's *final* state; the
+  `0xb1=0xe0 / 0xb2=0x08` in its `RxVideoInit` are transient and never survive.
+  M126's byte-at-a-time `b1/b2/b5` sweeps were sweeping single cells of a
+  matrix, which is why they were flat.
+- `0xae |= 0x04` does not stick on our board (reads back `0x20`, bit2 clear).
+  Already known and documented in `mz0380-mst3367.c`; unchanged here.
+
+The MST3367 has **no 16-bit or 20-bit output mode**. Its only `0xb0` options,
+from the driver's own comments:
+
+| `0xb0` | meaning |
+|---|---|
+| `0x20` | RX_OUTPUT_YUV422 / 08.BITS / EXTERNAL SYNC - **what hdcapm ships** |
+| `0x21` | RX_OUTPUT_YUV422 / 08.BITS / EMBEDDED SYNC - **what we ship** |
+| `0x24` / `0x25` | RX_OUTPUT_YUV422 / 10.BITS / EXTERNAL SYNC |
+
+`vic_b0` is the single register where we knowingly differ from the reference
+driver for the same receiver, on the bit that selects embedded vs external
+sync - a first-order property of the pixel bus. **And it has never been validly
+measured.** core.c:1008 records why: the `vic_b0=0x20` run was made while
+`win_seq=1` was still the default, and M90 proved `win_seq=1` renders nothing at
+all. The result was confounded by a second variable known to suppress the
+outcome being measured - method rule 1, exactly.
+
+Next run, one spawn, everything else at the known-good baseline:
+
+```bash
+sudo POLLDRAIN=20 VICB0=0x20 ./mz0380-m55-real-capture.sh 1
+```
+
+Confirm `b0=20` in the `output stage` readback lines before believing anything -
+that is what makes it a measurement rather than a repeat of the wasted one.
+
+### M127e - a real splash oracle
+
+`mz0380-m127-splash.py` replaces the chroma heuristic. It SHA-256s the 320x240
+crop at (800,420) and compares against the known digest of `NOSG_LOGO_Y`
+(`dfce4efd...83a30b`). Exit 1 = SPLASH, 0 = NOT SPLASH, 2 = NO FRAME. The asset
+is vendor firmware and is deliberately not vendored - only its digest is.
+
+### M127f (hardware, 2026-08-21): TWO SPAWNS WASTED - this replicates M96
+
+    sudo POLLDRAIN=20 VICB0=0x20 ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICB0=0x20 VICINW=3840 ./mz0380-m55-real-capture.sh 1
+
+Both landed (`b0=20` at all three diag points, `vic_in=3840x1080` in the SET_VIC
+line) and both produced **nothing**: 0 deliveries, `0/1024` on all four buffers,
+`buf0` solid `aa`, capture 0 bytes.
+
+**This is M96 re-run.** `vic_b0=0x20` had already been measured validly, and
+M100 had already decoded `0xb0` from hdcapm's four commented variants:
+bit0 = embedded(1)/external(0) sync, bit2 = 10-bit(1)/8-bit(0). The known table
+was already complete before this session started:
+
+| `0xb0` | = | result |
+|---|---|---|
+| `0x21` | 8-bit, embedded | splash (baseline) |
+| `0x25` | 10-bit, embedded | splash, bit-identical (M101) |
+| `0x20` | 8-bit, external | nothing (M96, re-confirmed here) |
+| `0x14` | 10-bit, external - Windows' value | nothing (M80, M94) |
+
+**How the error happened, because the mechanism is reusable.** core.c:1008 says
+"that is exactly how the `vic_b0=0x20` test was wasted", written about the
+*M73-era* attempt that ran under `win_seq=1`. I read that as "`0x20` has never
+been validly measured" and did not grep RE_FINDINGS for the actual result. M96
+had re-run it properly after `win_seq` was defaulted to 0. **A caveat in a
+source comment describes the state at the time it was written; it is not a
+statement about the current result set.** Check the findings file, not the code
+comment, before calling anything untested.
+
+I also re-derived M96's "the period counters halved, so bit0 is a clock/width
+select" - and the second run refuted it in-place: with `b0=0x20` held constant
+the counters went `674 -> 337 -> 674` and `lines 1125 -> 1127 -> 1125` across
+source re-locks. It is a settling state, not a `b0` effect. M100 had already
+retracted this from the register decode. Nothing new either way.
+
+**Net new information from two spawns: none.** The only thing added is a second
+confirmation that `0x20` renders nothing.
+
+#### Where that leaves the actual question
+
+M100's conclusion stands and is the live one: embedded sync is required for the
+VIC to initialise at all, bit2 is neutral, so **we are on the right side of the
+CCIR half of `(CCIR or width chck fail)` and the width half is what is left**.
+
+The untested cell is `vic_in_w = 3840` **at a `b0` that reaches VIC init**.
+M76 ran 3840 pre-M112, when the harness scored `captured 0 bytes` for every
+setting and could not have returned a different answer (the M126 handoff already
+flags that verdict as needing re-measurement). M126 re-ran 2048 and 2200 at
+`b0=0x21` but not 3840. And the two runs above put 3840 against `b0=0x20`, which
+never reaches VIC init, so they say nothing about width.
+
+```bash
+sudo POLLDRAIN=20 VICINW=3840 ./mz0380-m55-real-capture.sh 1
+./mz0380-m127-splash.py /tmp/cap-m55.nv12
+```
+
+Defaults elsewhere (`b0=0x21`, `fw=5`, `win_seq=0`, `in_fmt=6`). Confirm both
+`b0=21` and `vic_in=3840x1080` in the log.
+
+### M127g RESULT (hardware, 2026-08-21): `vic_in_w = 3840` is NEUTRAL - M76 is now validly dead
+
+    sudo POLLDRAIN=20 VICINW=3840 ./mz0380-m55-real-capture.sh 1
+
+Both knobs confirmed in the log: `b0=21` at all three diag points,
+`vic_in=3840x1080` in the SET_VIC line. One frame, and
+`mz0380-m127-splash.py` returns **SPLASH** - SHA-256 `dfce4efd...83a30b`,
+byte-identical to `NOSG_LOGO_Y`.
+
+This is the re-measurement the M126 handoff asked for. M76's original 3840 run
+was scored `captured 0 bytes`, which was structurally zero for *every* setting
+before M112, so it could not have returned a different answer. Run at a `b0`
+that reaches VIC init, with a delivery path that works and an oracle that
+identifies the picture, **3840 is genuinely neutral.** The 8-bit double-rate
+width hypothesis is dead on its merits rather than on a broken harness.
+
+`vic_in_w` is now swept at 1920 / 2048 / 2200 / 3840, all splash.
+
+### M127h - our MST3367 init is a SUPERSET of hdcapm's
+
+Checked every register in `mst3367_init_setup()` against `mz0380-mst3367.c`:
+
+    0x41 0xb8 0x0f 0x16 0x17 0x18 0x19 0x1a 0x2a 0x24 0x30 0x31 0x32
+    0x1e 0x1f 0x73 0x90 0x91 0xac 0xb7
+
+All present. The only apparent gap, `0xe2` (hdcapm: "DISABLE AUTO POSITION"),
+is not a gap - we drive it dynamically through `mst3367_set_auto_position()`
+(auto-position on until a coherent mode is recognised, then off), which the run
+logs confirm (`(auto-position off)` on every locked detect). That is a
+deliberate improvement on hdcapm, not an omission.
+
+**So there is no missing receiver-init register.** Combined with M127d (the
+`0xb1/0xb2/0xb5` "output stage" is CSC-matrix cells, and we write the same table
+hdcapm does) and M100/M101 (`0xb0` fully decoded and swept), the receiver-side
+configuration surface is exhausted.
+
+### M127 session summary - where the host-side search now stands
+
+Swept and neutral, all with a valid harness and the byte-identity oracle:
+
+| surface | values tried | result |
+|---|---|---|
+| `0xb0` sync/width | `0x21` `0x25` (embedded) / `0x20` `0x14` (external) | embedded -> splash; external -> nothing renders |
+| `0xb1/0xb2/0xb5` | ours / hdcapm / gchd | splash (and they are CSC cells - M127d) |
+| receiver init | full hdcapm register set | we are a superset - M127h |
+| SET_VIC `in_fmt` | 3, 6, 7 (0 = illegal) | splash |
+| SET_VIC `vic_in_w` | 1920, 2048, 2200, 3840 | splash - M127g |
+| SET_VIC `is_nosg`, `fast_kill`, `color_info`, `m` | Windows values | splash |
+| host wake-ups | op `0x2f` x1171, op `0x06` flood | splash, and the receiver loses lock |
+| I2C `0x98` | - | IT66121 transmitter, off the capture path - M127c |
+
+The receiver holds a clean `R55=0x7f` 1080p60 HDMI lock in every one of these.
+The VIC reports no signal in every one of these. **No host-reachable
+configuration changes that.**
+
+What remains genuinely untested, in descending order of prior:
+
+1. **`fw = 6`** - the value Windows sends. The one run that tried it
+   (RE_FINDINGS ~3486) carried other changes and was **explicitly
+   retro-invalidated at ~3536**; it has never been run as a single variable.
+   Same failure shape as M76's width verdict, which turned out to be worth
+   re-measuring. Note `fw=6` still selects tinyvenc5 (only 7 -> tinyvenc7,
+   8 -> tinyvenc8) and still notifies `epint`, so it is a small change - it
+   alters the cfg's output format to 2/YUY2 (~3406). Low prior for fixing a
+   *capture* fault, but it is cheap and it is the last invalidated verdict.
+2. **tinyvenc5 opcodes `0x2f`, `0x31`, `0x51`, `0x62`** - still undecoded
+   (handlers at 0xebdc, 0xef24, 0xea78, 0xe854). Static, free.
+3. **GPIO pins other than 1/3/8/9** via op `0x15`. Expensive to evaluate - each
+   candidate needs a stream to score.
+
+The honest position: the remaining discriminating information is
+`dwVICMmrStat` inside the SoC, and it is not host-reachable. Reading it needs a
+card-side change, which the standing no-upload rule forbids. Plan around that.
+
+---
+
+## M128 - the tinyvenc5 dispatch table decoded; the splash has an off switch
+
+Static RE only. Zero encoder spawns, no hardware run. Blob unpacked read-only
+per the recipe in NEXT_SESSION_START.md; everything below is from
+`llvm-objdump -d --triple=armv5te-linux-gnueabi tinyvenc5` plus the symbol
+table (the binary is unstripped, and every `EncodingGroup` static is a named
+`B` symbol, which is what makes the struct offsets readable).
+
+### The dispatch table
+
+`main`'s command loop reads 44 bytes from `/sys/vpl_pciep/epint` and switches on
+the first word at `main+0x804`:
+
+```
+    e6d0: sub  r3, r2, #6
+    e6d4: cmp  r3, #92
+    e6d8: ldrls pc, [pc, r3, lsl #2]      @ table base 0xe6e0
+    e6dc: b    0xe654                      @ default: back to the top, silently
+```
+
+so index = cmd - 6, 93 entries, everything unlisted falls through without a
+word. Resolving the table against each handler's own format strings:
+
+| cmd | handler | len | card's own name |
+|---|---|---|---|
+| `0x06` | 0xe954 | 8 | `START_STREAMING` |
+| `0x09` | 0xe93c | 8 | bare ACK - `pwrite(epint, payload, 44)`, nothing else |
+| `0x29` | pre-loop | 40 | `SET_VIC_PARAMS` |
+| `0x2a` | 0xed48 | 20 | `SET_AIC_PARAMS` |
+| `0x2d` | 0xebdc | 44 | `SET_ENC_PARAMS` |
+| `0x2f` | **0xebdc** | 44 | `SET_ENC_PARAMS_POST` |
+| `0x31` | 0xef24 | 20 | `SET_PREVIEW_PARAMS` |
+| `0x50` | 0xeb8c | 44 | `SET_OSD` |
+| `0x51` | 0xea78 | 20 | `SET_BAR` |
+| `0x52` | 0xea34 | 7 | `SET_VIDEO_INVISIBLE` |
+| `0x62` | 0xe854 | 12 | `SET_LOGO` |
+
+Two structural facts fall straight out:
+
+- **`0x29` in the loop is a no-op.** Index 35 maps to the default. tinyvenc5
+  reads SET_VIC exactly once, before the loop (0xe60c), and that pre-loop
+  handler (0xf264) only `puts` its ACK banner and `pwrite`s the payload back.
+  A second SET_VIC to a running tinyvenc5 is discarded in silence.
+- **`0x2d` and `0x2f` are the same handler.** The only difference is the banner
+  (`cmp r2,#45` at 0xebec picks `"[tiny5] SET_ENC_PARAMS "` vs
+  `"[tiny5] SET_ENC_PARAMS_POST "`) and a `main`/`sub` tag. Everything it
+  writes lands in `EncodingGroup::main_encode_settings` (144 bytes/ch,
+  72 bytes/stream) - gop, qp, profile, bitrate, IDR, skip, avg, entropy,
+  aspect, resize, hdr_opts, crop.
+
+### Three of the four targets are closed
+
+`0x2f`, `0x51` and `0x62` are encoder-side or cosmetic. None of them touches
+VIC, capture, or the receiver:
+
+- **`0x2f` = SET_ENC_PARAMS_POST.** H.264 knobs. It cannot affect capture, which
+  retires M125's flood of 1171 as noise on principle rather than on evidence.
+- **`0x51` = SET_BAR.** A colour-bar overlay rect, per (channel, line), stored
+  in `EncodingGroup::bar_settings` (16 bytes/entry, index `ch*2 + line`):
+  `[4]=ch [5]=line [6..7]=is_show [8..9]=x [10..11]=y [12..13]=w [14..15]=h
+  [0x10]=update [0x11..0x13]=y,u,v`. x+w and y+h are clamped against
+  `preview_settings[ch]` width/height, printing
+  `"[tiny5]---------> wrong1 x=%d, w=%d"` / `wrong2 y=%d, h=%d` and zeroing the
+  offending pair. Overlay only.
+- **`0x62` = SET_LOGO.** `[4]=ch [5]=is_show [6]=reload [7]=pic_order
+  [8..9]=x [10..11]=y` into `EncodingGroup::logo_settings` (8 bytes/ch); loads
+  `/tmp/PIC_LOGO_%d`, max 320x240. Overlay only.
+
+### `0x31` is SET_PREVIEW_PARAMS, and byte 0x0e is `fake_frame_off`
+
+The handler at 0xef24 and its verbose printf at 0xf570 give the whole payload:
+
+```
+[4..7] mask (u32)   [8] ch   [9] fps   [0x0a] skip   [0x0b] avg
+[0x0c] die_en       [0x0d] preview_off [0x0e] fake_frame_off
+[0x0f] preview_no_osd  [0x10] mirror   [0x11] flip   [0x12] hw_d
+```
+
+The mask is sticky-OR'd into `preview_params_settings[ch].u32[0]` and gates
+exactly one field - byte `0x0c` (die_en), mask bit 4, cleared after use.
+Bytes `0x0d`..`0x12` are stored **unconditionally**, so `fake_frame_off`
+lands whatever the mask says.
+
+Store map (`MLA r3, r5, #40, lr` with `lr = preview_params_settings`):
+byte `0x0e` -> `preview_params_settings[ch].byte[0x0a]`.
+
+That is the exact byte M127 named as the standby-splash gate. Both halves now
+line up from opposite directions:
+
+```
+main   (0xe400)  strb r3, [r6, #0xa]        @ r6 = pps; zeroed at startup
+init_func (0x10ac0)
+        ldrb r1, [r2, #0x52]                @ r2 = 0x7dd38 + ch*40, +0x52-0x48 = pps[ch][0x0a]
+        cmp  r1, #0
+        beq  0x10bf0 -> pthread_create(..., EncodingGroup::fake_frame_process, this)
+```
+
+There is a **second** spawn site, in `EncodingGroup::Start` (0x10f30), gated by
+`preview_settings[0].byte[0x1b]` instead - which is `is_nosg`, and we already
+send 0. So on the baseline the splash thread exists for exactly one reason:
+nobody has ever told the card to turn it off.
+
+### Why this is worth one spawn
+
+The "real frames are rejected in `libtkmf_video_source.so.0`" mechanism is
+static RE only. The card's console is unreachable (no-upload rule), so the drop
+has never been *observed* - it is inferred. Suppressing the standby thread
+removes the only other frame source, which splits the two remaining stories:
+
+- **NO FRAME** -> the rejection is real; nothing reaches the encoder at all.
+- **a real frame** -> the standby thread was winning the race and masking it,
+  and the whole "VIC sees no signal" reading has been measuring the wrong thing.
+
+Note the guard is read **once**, at `pthread_create` time, inside the `0x06`
+handler (`new EncodingGroup` -> `pthread_create(on_start_thread)` -> `Start` ->
+`init_func`). So `0x31` is only effective **before** `START_STREAMING`.
+
+### Corroboration and one correction to the Windows read
+
+M82 decoded this same packet from the Windows driver and labelled byte `[14]`
+`board_flag_b`. It is `fake_frame_off`, and Windows sends 0 - i.e. **retail
+leaves the standby splash armed too.** M82 also had mirror/flip the other way
+round from the card's printf; the card wins. `di` = `die_en` is right.
+
+### Code
+
+- `fake_frame_off` module param (def 0, baseline unchanged). Sets `0x31`
+  byte `0x0e`, and on the `win_seq=0` path sends `0x31` before `0x06`, which
+  the baseline otherwise never sends at all.
+- `MZ0380_CMD_POST_PROC` keeps its name and value; the full field map and the
+  dispatch table are now in `mz0380-reg.h`. Added
+  `MZ0380_CMD_SET_ENC_PARAMS_POST`/`SET_BAR`/`SET_VIDEO_INVISIBLE`/`SET_LOGO`.
+- Fixed the M71 comment block in `mz0380-dma.c`: byte 7 is the cfg
+  `input format` enum, not an interlace bool. The code was always right.
+
+Builds clean. **Not yet smoke-tested or run on hardware** - `mz0380-m85-unload-smoke.sh`
+needs root and this session had no sudo.
+
+### Next
+
+1. `sudo ./mz0380-m85-unload-smoke.sh`, then one spawn:
+   `sudo POLLDRAIN=20 EXTRA="fake_frame_off=1" ./mz0380-m55-real-capture.sh 1`
+   scored with `mz0380-m127-splash.py` (expect 2/NO FRAME or, if the race
+   reading is right, 0/NOT SPLASH with real content).
+2. `fw = 6`, one spawn - still the last invalidated verdict.
+3. GPIO pins beyond 1/3/8/9.
+
+### M128a (hardware, 2026-08-21): fake_frame_off lands, the splash is gone, and the frame is a 16-byte stall
+
+One spawn. `sudo POLLDRAIN=20 EXTRA="fake_frame_off=1" ./mz0380-m55-real-capture.sh 1`,
+default everything else (`win_seq=0`, `fw=5`, `in_fmt=6`, bufs after SET_VIC).
+
+The knob landed - method rule 9 satisfied before reading anything else:
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x1f, fps=60, die_en=1, fake_frame_off=1) ret=0
+    stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+
+Ordering is right: `0x31` at 19046.701388, `0x06` at 19046.701399, 11 us apart.
+The receiver held `R55=0x7f` LOCKED coherent 1920x1080p60 throughout, across
+three HPD pulses, and the output stage never twitched (`b0=21 b1=c0 ... 51=89`
+identical before START, after START and at stop).
+
+Result:
+
+    poll-drain: buf 0 holds 16 of 3110400 bytes - DMA still in flight, waiting   (x17, over 57 s)
+    stop buf[0] head=53 53 53 52 52 52 52 52 52 51 53 53 53 54 54 55 | 1/1024 pages touched
+    buf0 +0x00: 53 53 53 52 52 52 52 52 52 51 53 53 53 54 54 55
+         +0x10: aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa
+    captured 0 bytes
+
+`mz0380_infer_frame_length()` scans **backwards** from the end of the 4 MiB
+buffer for the last non-poison qword, so `len == 16` is exact: bytes 0..15 were
+written and every byte after them is untouched `0xaa`. One 128-bit burst.
+
+#### Two things changed, and only one of them is new
+
+**Not new: the 16-byte stall itself.** That is M91's exact signature
+(RE_FINDINGS ~3665), and M91 saw it under `win_seq=1` - whose sequence also
+contains `0x31`. So "op `0x31` truncates the DMA after one burst" is a live and
+parsimonious reading, and it would incidentally answer M91's open question
+("something else in `win_seq` truncates the DMA after one 16-byte burst").
+M91's own suspect was `win_bufs_first` and the iATU latch, but that does not
+transfer here: this run had bufs in the M23 position, which has always
+permitted a full 3.1 MB write.
+
+**New: the sixteen bytes are not the splash.** Every previous run that reached
+this point wrote `11 11 11 11 11 10 11 11 ...` - the standby thread's 0x11
+canvas with its 1-LSB dither. M91's sixteen bytes were `11 11 11 11 10 10 11 11
+11 11 11 11 11 11 11 11`. This run wrote a dithered flat field at **0x53**,
+about 83, a mid-dark grey. Nothing on the card is known to paint 0x53. So
+`fake_frame_off=1` did what the static RE said it would: the standby generator
+did not run, and whatever produced those bytes is not it.
+
+#### What this run cannot settle
+
+It changed two variables at once against the baseline - it sent `0x31` at all
+(the `win_seq=0` path never does) **and** it set byte `0x0e` inside it. Method
+rule 1: the step is not informative until the other one is pinned. Both live
+stories fit the evidence:
+
+- **`0x31` truncates.** Then the 16 bytes are a broken transfer of whatever was
+  in the frame buffer, and the 0x53 is only "not the splash canvas", not
+  "captured pixels".
+- **`fake_frame_off` works and the real path is producing.** Then the standby
+  thread was the only thing ever completing a frame, the real path manages one
+  burst and dies, and 0x53 is source luma.
+
+#### The control, built
+
+`post_proc=1` (new, `mz0380-core.c`) sends `0x31` on the `win_seq=0` baseline
+with `fake_frame_off` left at 0 - one variable from this run, every other
+variable at a value already known to permit a full frame:
+
+```bash
+sudo POLLDRAIN=20 EXTRA="post_proc=1" ./mz0380-m55-real-capture.sh 1
+```
+
+    full 3110400 B splash  -> 0x31 is harmless. The stall belongs to
+                              fake_frame_off, i.e. to the real capture path,
+                              and the 0x53 is real luma. Then the blocker moves
+                              from "the VIC sees no signal" to "the real path
+                              delivers one burst and stops" - a different, and
+                              much more tractable, bug.
+    16 bytes of 0x11       -> 0x31 truncates. That closes M91 too, and
+                              fake_frame_off has to be retested some other way.
+
+A second, cheaper discriminator if a spawn is spare: repeat the
+`fake_frame_off=1` run with the source showing something drastically brighter
+or darker. If those sixteen bytes track the source, they are pixels and the
+control barely matters.
+
+**Do not read the 0x53 as proof of capture yet.** It is the first non-splash,
+non-black data the real path has ever produced, which is worth exactly one
+control run to confirm and not more than that.
+
+### M128b (hardware, 2026-08-21): the control fires - op `0x31` truncates the DMA, and M91 is closed
+
+One spawn. `sudo POLLDRAIN=20 EXTRA="post_proc=1" ./mz0380-m55-real-capture.sh 1`.
+`fake_frame_off=0`, everything else exactly as M128a.
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x1f, fps=60, die_en=1, fake_frame_off=0) ret=0
+    stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+    poll-drain: buf 0 holds 16 of 3110400 bytes   (x17)
+    stop buf[0] head=11 11 11 11 10 10 11 11 11 11 11 11 11 11 11 11 | 1/1024 pages touched
+    captured 0 bytes
+
+**Sixteen bytes, and they are M91's sixteen bytes byte for byte.** Receiver held
+`R55=0x7f` LOCKED throughout; output stage identical at all three sample points.
+
+| run | 0x31 | fake_frame_off | result | head |
+|---|---|---|---|---|
+| baseline (M88 etc.) | no | - | full 3110400 B | `11 11 11 11 11 10 11 ...` |
+| M91 (`win_seq=1 OP6=1`) | yes | 0 | 16 B | `11 11 11 11 10 10 11 ...` |
+| M128a | yes | **1** | 16 B | `53 53 53 52 52 52 52 52 ...` |
+| M128b (control) | yes | 0 | 16 B | `11 11 11 11 10 10 11 ...` |
+
+Two conclusions, one of them a correction to M128a:
+
+1. **op `0x31` truncates the DMA after one 16-byte burst.** It does so with
+   `fake_frame_off` at either value, so the stall belongs to `0x31`, not to the
+   byte. M128a's stall is therefore NOT evidence about the real capture path.
+2. **M91 is closed.** "Something else in `win_seq` truncates the DMA after one
+   16-byte burst" is `0x31`. M91's own suspect - `win_bufs_first` and a stale
+   outbound iATU - is wrong: M128b had the buffers in the M23 position, which
+   has always permitted a full 3.1 MB write, and still stalled.
+
+**What survives from M128a:** the head content. Same command, same everything,
+one byte different, and the sixteen bytes went from the standby thread's 0x11
+canvas to a dithered flat field at 0x53. `fake_frame_off=1` does reach the card
+and does stop the splash generator painting. That is n=1 against n=2 and it is
+not proof the 0x53 is captured luma - it may be uninitialised card memory - but
+whatever else it is, it is not the splash.
+
+#### It is not what `0x31` *means* - the handler is inert on this card
+
+Static, free, done before proposing another run. The ch-0 path of the handler
+(tinyvenc5 0xf020) falls through to:
+
+    f060: fopen("/tmp/PIC_INSERT", "rb")
+    f06c: subs r4, r0, #0 ; beq 0xffac
+    ffb8: strb r5, [r6]          @ r6 = g_insert_pic (0x7ed12), r5 = 0
+    ffbc: beq 0xe93c             @ -> the bare 44-byte ACK
+
+`/tmp/PIC_INSERT` does not exist, so `fopen` returns NULL, `g_insert_pic` is
+cleared and the handler ACKs. The `MemBroker_GetMemory(w*h*2)` allocation at
+0xf090 - the one thing in the handler that could plausibly move a DMA target -
+is **never reached**. Nothing the handler does touches capture, DMA or the VIC.
+The mask bits only steer which of `skip`/`avg` get stored and a
+`tiny_calculate_skip_fps` call, all of which rejoin at 0xf020.
+
+#### What `0x31` changes is the cadence in front of START
+
+From the two runs' own timestamps:
+
+    baseline    SET_AIC -> [156 ms, spent in the output-stage diag] -> 0x06
+    with 0x31   SET_AIC -> [156 ms diag] -> 0x31 -> [9 us] -> 0x06
+
+**Nine microseconds.** `0x06` is fire-and-forget (`timeout_ms = 0`), so it hits
+the doorbell while tinyvenc5 is still inside the `0x31` handler. ep.ko serves
+one command at a time out of the mailbox and pokes the card with a bare
+`sysfs_notify("epint")`; every other command in the sequence is tens to hundreds
+of ms apart. A first burst landing correctly and everything after it going
+nowhere is what a start that raced its own configuration looks like - and it
+explains M91 without needing `win_bufs_first`.
+
+#### Next, one variable, one spawn
+
+`post_proc_gap_ms` (new) inserts a wait between `0x31` and `0x06`:
+
+```bash
+sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_gap_ms=200" ./mz0380-m55-real-capture.sh 1
+```
+
+    full 3110400 B splash -> cadence. 0x31 is usable with a gap, which is what
+                             fake_frame_off needs to be testable at all. Then
+                             re-run fake_frame_off=1 WITH the gap, and the
+                             splash oracle finally answers the real question.
+    16 bytes of 0x11      -> the race is not it; the 0x31 handler needs another
+                             read, and the M128a 0x53 stays unexplained.
+
+Note this also matters beyond `0x31`: if a 9 us command-to-START gap is enough
+to truncate the stream, the same hazard sits in `win_seq=1`, which is why that
+path "renders nothing" (M90/M91). Fixing it may unblock the Windows ordering
+as a whole.
+
+### M128c (hardware, 2026-08-21): the cadence hypothesis is dead; `0x31` bypasses ep.ko's no_signal latch
+
+One spawn. `sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_gap_ms=200" ./mz0380-m55-real-capture.sh 1`.
+One variable from M128b.
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x1f, fps=60, die_en=1, fake_frame_off=0) ret=0
+    stream start: waiting 200 ms before op 0x06 (M128b cadence test)
+    stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+    poll-drain: buf 0 holds 16 of 3110400 bytes   (x16)
+    stop buf[0] head=11 11 11 11 10 10 11 11 11 11 11 11 11 11 11 11 | 1/1024 pages
+
+The gap landed (22570.106832 -> 22570.307842, 201 ms) and changed nothing.
+**The 9 us race is not the mechanism.** Receiver LOCKED throughout, and with
+the 200 ms gap the detect thread even stopped logging `55=a7 settling` churn -
+this was the quietest run of the three, and it still stalled.
+
+That is two mechanism hypotheses dead:
+
+| hypothesis | how it died |
+|---|---|
+| `0x31` reallocates a buffer under the DMA | static: `fopen("/tmp/PIC_INSERT")` fails on this card, so `MemBroker_GetMemory(w*h*2)` at 0xf090 is never reached (M128b) |
+| `0x31` races `0x06` (9 us) | hardware: 200 ms gap, identical 16-byte stall (M128c) |
+
+#### ep.ko's dispatch, and a correction to the M127 ABI note
+
+`pciep_isr` (ep.ko 0x1210) switches on the opcode. Nearly every command lands on
+a common arm at 0x1824 which first tests the sticky no-signal latch at
+`state[0x71c]` and bails to the "ignored" logger at 0x1894 if it is set:
+
+    1824: ldrb r3, [r5, #0x71c]
+    1828: cmp  r3, #0
+    182c: bne  0x1894              @ ignored
+    1830: ...                      @ sysfs_notify(epint)
+
+`0x2f`, `0x50`, `0x51`, `0x52`, `0x62` and `0x2a` all enter at 0x1824. `0x06`
+has its own arm at 0x1854 which tests the same latch and then notifies **two**
+attributes (0x199c first, then the common 0x1998) - that is the audio_ctrl
+notify the docs mention. But:
+
+    13ac: cmp r6, #49
+    13b0: beq 0x1830               @ NOT 0x1824
+
+**`0x31` enters at 0x1830, past the latch test.** It is the one opcode in the
+set that is NOT gated by no_signal. M127's ABI note lists `0x31` among the
+latched ops; that is wrong. Corrected, but it is not the truncation mechanism
+either - the latch is clear in these runs (a good SET_VIC precedes them, and
+`0x06` on the gated arm is plainly getting through).
+
+#### What `0x31` actually writes into tinyvenc5, in full
+
+Worth having written down, because the remaining suspects are all in here.
+With our payload (mask 0x1f, ch 0, fps 60, die_en 1, everything else 0):
+
+    pps[0].u32[0] |= 0x1f          then bits 4, 0, 1 cleared again as consumed
+    pps[0][4] = ch = 0
+    pps[0][5] = fps = 60
+    pps[0][8] = die_en = 1         gated by mask bit 4
+    pps[0][6] = skip               gated by mask bit 0
+    pps[0][7] = avg = 0            gated by mask bit 1
+    pps[0][9]    = preview_off      = 0   unconditional
+    pps[0][0x0a] = fake_frame_off         unconditional
+    pps[0][0x0b] = preview_no_osd   = 0   unconditional
+    pps[0][0x0c] = mirror           = 0   unconditional
+    pps[0][0x0d] = flip             = 0   unconditional
+    pps[0][0x0e] = hw_d             = 0   unconditional
+    preview_settings[0][0x30] = 0         unconditional
+    g_insert_pic = 0                      via the failed fopen
+
+One card-side rewrite we did not ask for: at 0xefac the handler tests
+`w * h * fps > 0x041eb000` (68,952,064). 1920x1080x60 = 124,416,000, so we take
+it, and at 0xf5d0 - because we send avg = 0 - it runs `if (skip <= 1) skip = 2`
+**on the payload buffer**, then stores that 2 into `pps[0][6]`. We ask for
+skip 0 and the card records skip 2.
+
+#### The ladder, in order, each one variable
+
+`fake_frame_off` is stored **unconditionally** - it needs no mask bit. So the
+minimal `0x31` is also the one that still delivers what we want.
+
+1. **`post_proc=1 post_mask=0`** - the smallest possible `0x31`. Clearing the
+   mask drops the die_en store (bit 4), the skip store and the avg store
+   (bits 0/1) and takes the short arm at 0xf014. Strictly fewer card-side
+   writes than mask 0x1f.
+   ```bash
+   sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0" ./mz0380-m55-real-capture.sh 1
+   ```
+   full frame -> `0x31` is usable. Immediately follow with
+   `post_proc=1 post_mask=0 fake_frame_off=1`, which is the experiment this
+   whole thread exists to run.
+   16 bytes -> die_en and the forced skip are both exonerated, and the cause is
+   in the unconditional block above or in the epint traffic itself.
+
+2. **`post_proc=1 post_proc_opcode=0x09`** - the control for "any extra command
+   before START". `0x09` is inert on both sides: same 0x1824 arm in ep.ko, and
+   tinyvenc5's handler at 0xe93c is a bare `pwrite(epint, payload, 44)`.
+   ```bash
+   sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_opcode=0x09" ./mz0380-m55-real-capture.sh 1
+   ```
+   16 bytes -> the fault is structural: an extra epint command immediately
+   before START truncates the stream whatever it is. That is a far bigger
+   finding than `0x31`, and it would explain the whole `win_seq` ordering
+   failing (M90/M91).
+   full frame -> `0x31`'s own writes are the cause; combine with (1) to
+   localise.
+
+3. Only if both are clean and the stall persists: re-read the unconditional
+   block, starting with `preview_settings[0][0x30]`, whose reader has not been
+   found yet.
+
+**Honest status:** `0x31` truncates, reproducibly, three runs. Why is still
+open, and I have been wrong about it twice.
+
+### M128d (hardware, 2026-08-21): both ladder steps clean - the truncator is a mask-gated store, and `0x31` is now usable
+
+Two spawns, run back to back.
+
+**Step 1 - `post_proc=1 post_mask=0`:**
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x00, fps=60, die_en=1, fake_frame_off=0) ret=0
+    stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+    captured 3110400 bytes = 1 whole frames + 0 bytes
+
+**Step 2 - `post_proc=1 post_proc_opcode=0x09`:**
+
+    stream start: SET_PREVIEW_PARAMS(op 0x09, mask=0x1f, ...) ret=0
+    poll-drain: buf 0 holds 1475200 of 3110400 bytes - DMA still in flight, waiting
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+    captured 3110400 bytes = 1 whole frames + 0 bytes
+
+Both full frames. Step 2 even caught the transfer mid-flight at 1475200 bytes
+and then complete 21 ms later - a healthy DMA, which is exactly what the
+16-byte runs were not.
+
+Scored on the host, no spawn:
+
+    ./mz0380-m127-splash.py /tmp/cap-m55.nv12
+    sha256  dfce4efd5139298f544d23473f85a42fb7115a3c5e4ba65b71c070d59883a30b
+    VERDICT: SPLASH - byte-identical to tinyvenc5's NOSG_LOGO_Y.
+
+#### The result
+
+| run | opcode | mask | result |
+|---|---|---|---|
+| M91 / M128b / M128c | 0x31 | 0x1f | 16 bytes |
+| M128a | 0x31 | 0x1f | 16 bytes |
+| **M128d step 1** | 0x31 | **0x00** | **full 3110400 B, SPLASH** |
+| **M128d step 2** | **0x09** | 0x1f | **full 3110400 B, SPLASH** |
+
+- **An extra epint command immediately before START is harmless.** The `0x09`
+  control is clean, so the structural reading is dead - it is not "any command",
+  and it is not the cadence (M128c already killed that with a 200 ms gap).
+- **`0x31` itself is harmless.** With mask 0 it delivers a whole frame.
+- **The truncator is one of the three mask-gated stores.** mask 0x1f enables
+  exactly three writes that mask 0 does not:
+
+      bit 0 -> pps[ch][6] = skip     (which the card had forced to 2, M128c)
+      bit 1 -> pps[ch][7] = avg = 0
+      bit 4 -> pps[ch][8] = die_en = 1
+
+  Everything else in the handler is unconditional and ran identically in both.
+- **M90/M91 are explained.** `win_seq=1` sends `0x31` with `post_mask` at its
+  default 0x1f. That is why the Windows ordering "renders nothing at all" -
+  not the ordering, one field in one command.
+
+Prior on which bit: **die_en**. It is a de-interlace engine being switched on
+for a progressive 1080p60 source, and it is set to 1 for exactly one reason -
+M82 saw Windows send 1. That is the same byte-parity reasoning that already
+cost us `fw=7` (method rule 4: parity is a hypothesis generator, not a rule).
+`skip=2` is second: we ask for 0 and the card rewrites it.
+
+#### `0x31` is now usable, so the experiment can finally run
+
+`fake_frame_off` is stored **unconditionally** - it needs no mask bit. So the
+minimal `0x31` carries it:
+
+```bash
+sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" ./mz0380-m55-real-capture.sh 1
+./mz0380-m127-splash.py /tmp/cap-m55.nv12
+```
+
+This is the run this whole thread exists for, and it now has a working delivery
+path and a validated oracle under it. Read it as:
+
+    1 / SPLASH     -> fake_frame_off did not take. Check the dmesg line first.
+    2 / NO FRAME   -> the standby thread was the ONLY frame source. The real
+                      path produces nothing, the rejection in
+                      libtkmf_video_source.so.0 is real, and the VIC genuinely
+                      sees no signal.
+    0 / NOT SPLASH -> a real frame. The standby thread was masking it, and the
+                      no-signal reading has been measuring the wrong thing for
+                      the entire project.
+
+Then, separately and worth a spawn each because it bears on the whole Windows
+ordering: bisect the mask bit with `post_mask=0x10` (die_en alone) against
+`post_mask=0x01` (skip alone).
+
+#### Unrelated observation, logged not chased
+
+Both runs show the detect thread reporting `hper=337 vper=299 lines=1127`
+alongside the usual `hper=674 vper=599 lines=1125`, at the same `htot=2200
+vtot=1125 hact=1920` and still `MATCHED`. Exactly half the usual hper/vper.
+Seen only after the frame was delivered in step 1, but throughout step 2. Not
+touched here.
+
+---
+
+## M129 (hardware, 2026-08-21): REAL VIDEO. The card was capturing all along.
+
+    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" ./mz0380-m55-real-capture.sh 1
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x00, fps=60, die_en=1, fake_frame_off=1) ret=0
+    stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+    captured 3110400 bytes = 1 whole frames + 0 bytes
+
+    ./mz0380-m127-splash.py /tmp/cap-m55.nv12
+    sha256  eea4e3bf875845d453abd5911f7ef9b63fa72ec24dd4ece524e64e73fb50f5f7
+    VERDICT: NOT SPLASH
+             Y outside the crop: 170 distinct values
+             UV plane:           144 distinct values
+
+**It is a photograph of the scene in front of the camera.** Confirmed visually
+by the operator and by ffplay. Raw frame preserved as
+`m129-first-real-frame.raw` (sha256
+`76e7050e53dfe68b033c3aa6659a68c2013671333e1dbe812bfd4697c7cc8704`).
+
+Objective check before anyone called it, so that "it looks like an image" is not
+the evidence:
+
+    Y   min=78 max=247 mean=144.94 std=45.64
+    row-to-row corr (Y[r] vs Y[r+1])   = 0.9665
+    col-to-col corr (Y[:,c] vs [:,c+1]) = 0.9703
+    same, pixel-shuffled control        = -0.0008
+    22.02% of pixels have |dY/dx| > 8
+    quadrant Y means: 149.7 / 157.4 / 105.0 / 167.7
+    rows with mean < 20 (video black): 0 of 1080
+
+0.97 neighbour correlation against -0.0008 shuffled is not uninitialised DRAM
+and not a flat field. The luma plane on its own renders as a clean, sharp,
+artefact-free 1080p greyscale frame - no tearing, no banding, correct geometry.
+
+### What this overturns
+
+**The "VIC reports no signal" reading was wrong.** The card's standby thread was
+drawing NOSG_LOGO_Y over a working capture path, and every previous run measured
+the standby thread. Specifically:
+
+- `EncodingGroup::fake_frame_process` was not a fallback for a dead input. It
+  ran unconditionally alongside `encode_handler` because
+  `preview_params_settings[ch].byte[0x0a]` is zeroed at startup and nobody had
+  ever told the card otherwise - Windows included (M82's `board_flag_b` = 0).
+- The `(Drop this frame) ... bNoSignal` path in `libtkmf_video_source.so.0`,
+  which M127 named as the target, is not what was happening. It was never
+  observed - the card's console is unreachable - and it was wrong.
+- Every "splash" verdict in this file measured the standby thread, not the
+  capture. The M127 corollary ("no sweep of that shape can rank two settings")
+  stands and is now the explanation for the entire negative result set: the
+  sweeps were fine, the oracle was reading a thread that ignores every knob
+  they turned.
+
+### The three ingredients, and why it took all three
+
+1. `fake_frame_off = 1` in op `0x31` byte `0x0e` - stops the standby thread ever
+   being created (M128, static).
+2. `post_mask = 0` - the default 0x1f enables a mask-gated store that truncates
+   the DMA to one 16-byte burst (M128d). With mask 0x1f the frame never
+   completes, so #1 alone shows nothing.
+3. Sending `0x31` at all on the `win_seq=0` baseline, which never did.
+
+M128a had #1 and #3 but not #2, which is why it produced 16 bytes of 0x53 -
+that was the real frame, truncated.
+
+### Remaining defect: chroma
+
+Luma is perfect. Chroma is not, and it is not a plane-order problem:
+
+    chroma region 1036800 bytes = two 960x540 planes
+    plane A: mean 124.41 std 27.29   row-corr 0.9376  col-corr 0.9489
+    plane B: mean 134.93 std 28.20   row-corr 0.9482  col-corr 0.9504
+    corr(A, B)          =  0.6598
+    corr(A, Y downsampled) = -0.9645
+    corr(B, Y downsampled) = -0.7552
+
+Both planes are image-like, so the layout is planar 4:2:0 (decoding as NV12
+gives magenta/green interleave banding; as `yuv420p` the banding vanishes and
+the geometry is exact). But **plane A is 96% ANTI-correlated with luma**. That
+is not colour difference data, it is inverted luma. Colour-difference planes for
+a real scene do not track -Y.
+
+Two candidates, in order:
+
+1. **The MST3367 CSC matrix.** Our driver already decodes and logs
+   `input colorspace YUV444` from the link registers, and the receiver's job is
+   YUV444 -> BT1120 YCbCr 4:2:2. We program hdcapm's 36-byte CSC table at
+   `0x92..0xb5` verbatim (M127d/M127h). If that table is an RGB-input matrix and
+   the source is sending YUV444, "luma roughly right, chroma tracking -Y" is
+   exactly the artefact. This is the top suspect and it is host-fixable.
+2. **`out_fmt`.** SET_VIC byte 12 is the output format and we send **0**, which
+   M72 already noted is not a legal value; the card falls back to the cfg's
+   `output format` (1/YV12 for `fw=5`, 2/YUY2 for `fw=6` - M79). Worth setting
+   deliberately. Note `fw=6`/YUY2 changes the frame to 4:2:2, i.e. 4147200
+   bytes, and `mz0380_infer_frame_length`'s `want` is hardcoded `w*h*3/2` - that
+   needs fixing before any YUY2 run or poll-drain will never see a complete
+   frame.
+
+### Also unresolved
+
+- **Possible mirror.** The "Boss" logo at top-left appears mirrored. Could be
+  the physical scene; check against it before touching `mirror`/`flip`
+  (SET_VIC bytes 13/14, and the SET_PREVIEW_PARAMS bytes 0x10/0x11).
+- **Which mask bit truncates** (M128d): `post_mask=0x10` (die_en) vs `0x01`
+  (skip). Not needed for capture any more, but it is the whole explanation for
+  `win_seq=1` rendering nothing (M90/M91), so it still gates the Windows
+  ordering.
+- The `hper=337 vper=299 lines=1127` detect readings, exactly half the usual,
+  appearing alongside the normal ones.
+
+### Method note
+
+The thing that produced this was the control run, not the hypothesis. M128a
+looked like a result and was two variables; the `post_mask=0` and `0x09` controls
+cost one spawn each and turned a wrong conclusion into the right one. Three
+mechanism guesses were wrong along the way (buffer realloc, the 9 us race, and
+"any extra command"); none of them cost a spawn to kill except the last, because
+the first died statically and the second died on a knob that already existed.
+
+## M130: the chroma defect diagnosed - an RGB matrix on a YCbCr source
+
+Static + host-side analysis of the M129 frame. No spawns.
+
+### The measurement
+
+    plane A  mean 124.57  std 27.23   corr(A, luma) = -0.9664
+    plane B  mean 135.13  std 28.16   corr(B, luma) = -0.7488
+
+Both chroma planes are image-like in their own right (row-corr 0.94, col-corr
+0.95), so the layout is planar 4:2:0 and the geometry is right. But plane A is
+**96% anti-correlated with luma**. Colour-difference data does not track -Y.
+
+### The mechanism
+
+HDMI YCbCr 4:4:4 assigns Cb to the blue TMDS channel, Y to green and Cr to red.
+Feed that to an RGB->YCbCr matrix (BT.601 shown) and it computes:
+
+    Y_out  =  0.257*Cr + 0.504*Y  + 0.098*Cb   -> dominated by Y, looks fine
+    Cb_out = -0.148*Cr - 0.291*Y  + 0.439*Cb   -> dominated by -Y
+    Cr_out =  0.439*Cr - 0.368*Y  - 0.071*Cb   -> -Y plus a real Cr term
+
+That is the observation exactly: perfect luma, one chroma plane nearly pure
+inverted luma, the other inverted luma mixed with something real. Inverting the
+model on the captured frame turns the magenta/green mush into a coherent
+picture of the actual object - residual cast, because the exact matrix and
+range are not pinned, but unmistakably the right shape.
+
+### Why we have an RGB matrix
+
+hdcapm was fetched and read rather than assumed. Its `mst3367-drv.c`:
+
+```c
+static inline u32 MST3367_HdmiGetPacketColor(struct v4l2_subdev *sd)
+{
+	u8 r48 = mst3367_rd(sd, BANK2, 0x48) & 0x60;
+	if (r48 == 0x00) color = 0;      /* RX_INPUT_RGB    */
+	else if (r48 == 0x20) color = 1; /* RX_INPUT_YUV422 */
+	else if (r48 == 0x40) color = 2; /* RX_INPUT_YUV444 */
+```
+
+It detects the input colour space, caches it in `regb2r48_cached` - **and never
+uses it to choose a matrix.** The CSC table goes out unconditionally:
+
+```c
+for (i = 0; i < sizeof(csctbl); i++)
+	mst3367_wr(sd, BANK0, 0x92 + i, csctbl[i]);
+```
+
+That is fine on hdcapm's board, whose EDID makes sources send RGB. **We push no
+EDID at all** (M127 closed EDID as a dead end for making the source transmit),
+and this source chose YUV444 - which our own link line has been reporting on
+every single run, unremarked, for months:
+
+    link [before START]: ... 48=d2, input colorspace YUV444
+
+So we inherited a bug that cannot fire on the board it came from.
+
+### The table's layout, which is not all coefficients
+
+31 bytes at 0x92..0xB0:
+
+    0x92        0x40                 <- CONTROL, not a coefficient
+    0x93..0x98  M11 M12 M13          2 bytes each, big-endian
+    0x99..0x9E  M21 M22 M23
+    0x9F..0xA4  M31 M32 M33
+    0xA5..0xAA  A1  A2  A3           offsets
+    0xAB..0xB0  15 95 05 20 C0 08    colour range + output stage
+
+The trailing bytes land on 0xAB (colour range) and 0xB0 (output format), both of
+which the init rewrites immediately afterwards - that is the "fixes up 0xb0
+last" M127d noticed.
+
+**The coefficient fixed-point format is NOT cracked.** High nibble 7 marks the
+negative entries and 0 the positive ones, but no scale tried reproduces a
+recognisable BT.601 or BT.709 matrix in either direction. Do not hand-write a
+matrix on the strength of a guess.
+
+### The cheap experiment
+
+`0x92 = 0x40` is a single-bit control byte in front of a colour-space
+conversion we do not want: the input is YCbCr and the output over BT1120 is
+YCbCr 4:2:2. If 0x40 is the enable, clearing it should bypass the conversion.
+
+New knob `mst_csc_ctl` (default 0x40, i.e. no change):
+
+```bash
+sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1 mst_csc_ctl=0" \
+     ./mz0380-m55-real-capture.sh 1
+./mz0380-m130-chroma.py /tmp/cap-m55.nv12
+```
+
+The run echoes `MST3367 CSC control 0x92 = 0x00 (hdcapm default 0x40)` when the
+override is active - check it before reading the result (method rule 9).
+
+### New oracle: `mz0380-m130-chroma.py`
+
+Companion to the splash oracle. Reports `corr(chroma, luma)` and the plane
+means, and verdicts CHROMA OK / PARTIAL / CONTAMINATED. Validated against the
+M129 frame, which it correctly calls CONTAMINATED at |corr| 0.97.
+
+Exit 0 = correct, 1 = contaminated or partial, 2 = no whole frame.
+
+### If `mst_csc_ctl=0` does not work
+
+In descending order:
+
+1. Sweep the other bits of 0x92 - it is one byte, and a full sweep is 8 spawns,
+   but 0x00/0x40/0x80/0xc0 covers the plausible enable/mode encodings.
+2. **Push an EDID that advertises RGB only.** That makes the source send RGB and
+   the inherited matrix becomes correct by construction. EDID was closed as a
+   dead end for *making the source transmit*, which is a different question -
+   the source transmits fine now, we would only be steering its output format.
+3. Crack the fixed-point format properly, which probably means finding an
+   MStar/MST3367 CSC register description rather than more numerology.
+
+### M130a (hardware, 2026-08-21): `mst_csc_ctl=0` fixes the colour
+
+One spawn.
+
+    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1 mst_csc_ctl=0" \
+         ./mz0380-m55-real-capture.sh 1
+
+| statistic | M129 (`0x92=0x40`) | M130a (`0x92=0x00`) |
+|---|---|---|
+| `corr(A, luma)` | **-0.9664** | -0.3194 |
+| `corr(B, luma)` | -0.7488 | **+0.3492** (sign flipped) |
+| share of A that is luma | 0.93 | **0.10** |
+| share of B that is luma | 0.56 | **0.12** |
+| plane A std | 27.23 | 12.12 |
+| luma std | 45.70 | 66.73 |
+
+Rendered as plain `yuv420p` (I420: Y, U, V) it is a **correct, natural-colour
+image** - a red pedal on a neutral dark mat, black PCB with gold pads, yellow
+sticker, no cast. The U/V-swapped rendering gives the textbook red/blue swap
+(blue pedal, brown mat), which confirms plain I420 is the right order.
+
+So `0x92` **is** the CSC control byte, `0x40` enables the conversion, and with a
+YCbCr source the conversion is exactly what we did not want. Diagnosis
+(M130) confirmed on hardware.
+
+The residual 0.10/0.12 is ordinary scene correlation - bright things are often
+also saturated - not a defect. Luma std rising 45.7 -> 66.7 is the range no
+longer being squashed by the matrix.
+
+#### The fix, made properly rather than as a knob
+
+`mst_csc_ctl` now defaults to **AUTO**, which does what hdcapm reads the
+register for and then never does:
+
+```c
+cs = (b2_48 & 0x60) >> 5;                    /* BANK2 0x48, hdcapm's own decode */
+want = (cs == 1 || cs == 2) ? 0x00           /* YUV422 / YUV444: do not convert */
+                            : 0x40;          /* RGB: hdcapm's RGB->YCbCr matrix */
+```
+
+This **cannot** go in `init_regs()`: that runs at bring-up, before HPD is
+asserted, so nothing is transmitting and `0x48` is meaningless. New
+`mz0380_mst3367_apply_csc_mode()` is called from the stream-start path just
+before the "before START" diag, once the receiver has locked. Any explicit
+value for the parameter still forces that byte, at init and at stream start.
+
+"undefined" (`cs == 3`) deliberately falls back to hdcapm's `0x40`: it is what
+every working board ships, so it is the safer branch when `0x48` has not
+settled.
+
+#### Tooling
+
+- `mz0380-m130-chroma.py` recalibrated. It now reports **corr^2** - the share of
+  a chroma plane's variance that luma explains - because correlation magnitude
+  alone is a bad test: real scenes do correlate colour with brightness. The two
+  measured states are an order of magnitude apart (0.93 vs 0.10), so the
+  thresholds (>=0.40 contaminated, <=0.25 clean) are not delicate. Verified
+  both ways: exit 0 on the fixed frame, exit 1 on the M129 frame.
+- `m130-colour-correct-frame.raw` kept in-tree beside `m129-first-real-frame.raw`
+  as the before/after pair.
+- **`mz0380-m55-real-capture.sh` no longer says NV12.** The payload is planar
+  I420 and always was; the `.nv12` filename is historical. The wrong hint cost
+  two viewing mistakes in one session. The script now prints `yuv420p` and the
+  two scoring commands.
+
+## M131: the working configuration is now the driver's default
+
+No spawns. Method rule 5 - "never let a test harness carry its own copy of a
+driver default" - cuts both ways: once a setting is known correct, the DRIVER
+should carry it, not a 60-character `EXTRA=` string that is easy to mistype and
+easy to forget.
+
+| parameter | was | now | why |
+|---|---|---|---|
+| `post_proc` | 0 | **1** | it is what carries `fake_frame_off`; the `win_seq=0` path never sent 0x31 |
+| `post_mask` | 0x1f | **0** | 0x1f truncates the DMA to 16 bytes (M128d) |
+| `fake_frame_off` | 0 | **1** | 0 paints NOSG_LOGO_Y over a working capture (M129) |
+| `mst_csc_ctl` | - | **AUTO** | picks the CSC mode from the detected input colour space (M130a) |
+
+So a plain `insmod` should now produce real, correctly-coloured video, and the
+capture command is back to:
+
+```bash
+sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+```
+
+Each old behaviour is still reachable: `post_proc=0` restores the pre-M129
+sequence, `fake_frame_off=0` restores the splash, `post_mask=0x1f` restores the
+truncation, an explicit `mst_csc_ctl` forces that byte. Reproducing any result
+in this file older than M129 needs the first three.
+
+The harness was checked rather than assumed: `mz0380-m55-real-capture.sh` routes
+every knob it owns through `add_opt` and none of these four are among them -
+they only ever arrive via `EXTRA=`. No drift.
+
+### Next: sustained capture, and it may not even be broken
+
+**Every real-video run so far asked for exactly one frame.** `m55`'s argument is
+the frame count (`FRAMES=${1:-6}` -> `v4l2-ctl --stream-count`), and M129/M130a
+both passed `1`. "poll-drain stopped after 1 deliveries" was the request being
+satisfied, not a ceiling being hit. Buffers 1-3 reading untouched is equally
+consistent with "v4l2-ctl dequeued its one frame and the driver stopped
+streaming" as with "the card only ever produced one".
+
+`op6_kick_ms` also defaults to **0**, so no wake-up has ever been fired on a
+configuration that produces real frames. The whole M117/M118/M120/M126 kick and
+credit machinery is present in `mz0380_poll_drain_thread()` and has only ever
+been exercised against the splash.
+
+So the next run is just to ask for more, one variable from M130a:
+
+```bash
+sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+./mz0380-m130-chroma.py /tmp/cap-m55.nv12
+```
+
+`timeout -s INT --foreground "$CAPWAIT"` bounds it, so a stall cannot hang the
+run; the script truncates to whole frames and says how many it got.
+
+- **5 whole frames** -> sustained capture already works and the "one frame per
+  stream" cadence was an artefact of never asking for a second one.
+- **1 frame then timeout** -> the cadence is real. Then, in order:
+  `op6_kick_ms=33 kick_repeat=1` (the kick machinery, never yet tried with real
+  frames), then `poll_drain_credit`.
+
+Note this run also exercises the `mst_csc_ctl=AUTO` path for the first time -
+M130a forced `0` explicitly. The run echoes
+`MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2)`; if
+chroma comes back contaminated, suspect AUTO before the frame count.
+
+Not yet smoke-tested: `sudo ./mz0380-m85-unload-smoke.sh` should be run first,
+as after every build.
+
+## M132 (hardware, 2026-08-21): the one-frame cadence is REAL
+
+    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+
+First run on the M131 defaults, i.e. no `EXTRA=` at all. The frame count was the
+only variable against M130a.
+
+    29111.695  poll-drain: buf 0 holds 91392 of 3110400 bytes - DMA still in flight
+    29111.717  poll-drain: buf 0 holds 3110400 bytes ... delivering
+    29111.717  frame token 0 inferred ... length=3110400
+    29167.389  poll-drain stopped after 1 deliveries, 0 kicks (op 0x06)
+
+**One frame, then 55.7 seconds of nothing.** v4l2-ctl waited for five, got one,
+and `timeout -s INT` killed it mid-write - hence 3108864 bytes, short by exactly
+the 1536-byte stdio tail, which is the M116 failure mode the script warns about.
+The head bytes (`50 50 50 50 51 51 51 51 52 53 55 56 ...`) are real video, not
+the 0x11 splash, so the capture itself was fine.
+
+So the M131 hypothesis is dead: asking for more frames does not produce more
+frames. The cadence is a property of the card, not of the request. Buffers 1-3
+untouched is now meaningful rather than merely consistent.
+
+Worth noting the DMA is fast: 91392 bytes at the first poll and complete 22 ms
+later. The transfer is not the bottleneck; nothing asks for a second frame.
+
+### An observability gap of my own making
+
+`mz0380_mst3367_apply_csc_mode()` logs which CSC mode it chose, and section 3 of
+the harness greps
+`stream start|stream stop|frame token|enc|no HDMI signal|poll-drain` - which
+does not match `MST3367 CSC`. So the single line that confirms the colour knob
+landed was **filtered out of the output of the very run that first exercised
+it**. Exactly what method rule 9 exists to prevent, in a line I added myself
+one milestone earlier. Pattern added to the grep.
+
+The chroma could not be scored either way: the truncated file is 1536 bytes
+short of a frame, so `mz0380-m130-chroma.py` correctly refuses it (exit 2). The
+AUTO path is therefore **still unverified** - carry that into the next run.
+
+### Next: the kick machinery, never yet tried with real frames
+
+`op6_kick_ms` defaults to 0, so `0 kicks` is not a failure - nothing was asked
+to fire. The whole M117/M118/M120/M126 apparatus in
+`mz0380_poll_drain_thread()` (enc_stat ack, credit re-arm, op6 kick, repeat) has
+only ever run against the splash, where the frame source was a standby thread
+that ignored all of it. It has never been exercised on a path where a real
+encoder is waiting to be asked.
+
+M120's reasoning still holds and is why the kick is gated on a delivered frame:
+firing from t=0 races tinyvenc5's start-up read of SET_VIC (M119 - zero frames
+AND the receiver lost lock). Gating on `delivered > 0` makes that race
+impossible, and M126 made the kick repeat rather than fire once per frame.
+
+Ask for a frame every ~33 ms once the first has landed:
+
+```bash
+sudo POLLDRAIN=20 EXTRA="op6_kick_ms=33 kick_repeat=1" ./mz0380-m55-real-capture.sh 5
+./mz0380-m130-chroma.py /tmp/cap-m55.nv12
+```
+
+    5 whole frames  -> streaming works; the card simply needs asking per frame.
+    still 1         -> the kick opcode is wrong for this purpose. Try
+                       kick_opcode=0x2f and 0x09 (bare epint notify, no
+                       audio_ctrl side effect), then poll_drain_credit=1.
+    0 frames / lock lost -> the M119 hazard came back despite the gate; stop and
+                       re-read the gating rather than raising the interval.
+
+Check the run echoes a nonzero kick count in `poll-drain stopped after N
+deliveries, K kicks` before reading anything else, and check the `MST3367 CSC`
+line that is now visible.
+
+## M133 (hardware, 2026-08-21): kicks do not gate the cadence, and they cost the lock
+
+    sudo POLLDRAIN=20 EXTRA="op6_kick_ms=33 kick_repeat=1" ./mz0380-m55-real-capture.sh 5
+
+    29677.971  poll-drain: buf 0 holds 3110400 bytes ... delivering
+    29677.972  poll-drain: first kick op 0x06 ret=0
+    29733.653  poll-drain stopped after 1 deliveries, 1224 kicks (op 0x06)
+
+**1224 kicks. One frame.** Every kick returned ret=0, so the card accepted all
+of them and produced nothing.
+
+And it cost the receiver its lock:
+
+    29680.231  detect 55=83 no-lock (auto-position on; timing not sampled)
+    29680.499  detect 55=03 no-lock
+    ...        output stage [at stop]: R55=ff
+
+Lock was lost ~2.3 s after the flood began, and never came back - `R55=ff` at
+stop against `7f` on every other run this session. This is the M119/M125 hazard
+("op 0x2f accepted 1171 times -> one frame, and the receiver lost lock under it.
+Do not flood these.") reconfirmed with `0x06` at 33 ms. **The closed-table entry
+was right and now covers 0x06 too.**
+
+So the wake-up is not the gate. Do not spend more spawns on kick tuning.
+
+### What the stop line says instead
+
+    stream stop: EVENT[0x30]=00000000 token[0x40]=00000000 ... enc[0x50]=00000000
+                 irq_total=6 frame_events=0 fifo_drops=0
+
+- `frame_events=0`, and `irq_total=6` is just the mailbox traffic. The card
+  never raises a frame-completion event at all - which is why poll-drain exists.
+- `token[0x40]=0`. The buffer index (token & 7) never advances off 0, matching
+  buffers 1-3 reading untouched in every run.
+- `enc[0x50]=0` - already "host has consumed it, encode another" (M40), so the
+  enc_stat handshake is not what is being waited on.
+
+The DMA of the one frame is fast and complete (2573440 of 3110400 bytes at the
+first poll, whole 21 ms later). The card writes one frame into buffer 0, never
+signals, never advances, and no amount of asking changes it.
+
+**Next single variable: `poll_drain_credit=1`, kicks OFF.** That is M118's
+`mz0380_credit_rearm()` - the card's one-shot completion credit, which nothing
+has ever restored on this path because the ISR that normally does it runs only
+for an event that never fires. It is the only remaining piece of the
+handshake that has not been tried against real frames.
+
+```bash
+sudo POLLDRAIN=20 EXTRA="poll_drain_credit=1" ./mz0380-m55-real-capture.sh 5
+```
+
+### A bug of mine: the CSC AUTO path read the wrong register value
+
+    29676.556  MST3367 CSC 0x92 = 0x40 (auto, input colorspace RGB from 0x48=00)
+    29676.712  link [before START]: ... 48=d2, input colorspace YUV444
+
+`mz0380_mst3367_apply_csc_mode()` read BANK2 0x48 as **0x00** and therefore
+picked 0x40, the RGB matrix - the exact wrong branch for this source. The output
+diag read the same register as **0xd2** 156 ms later, with the receiver locked
+throughout. So M132's AUTO run was silently applying the broken CSC, and the
+truncated capture meant the chroma oracle could not catch it.
+
+Why the standalone read fails is not established. It is not worth establishing:
+the diag's read path is proven on every run in this file, so **the fix is to
+reuse it rather than add a second one**. `output_diag()` now caches 0x48 into
+`dev->mst_b2_48`, `apply_csc_mode()` prefers the cached value (and says
+`cached` or `read here` in its log line), and the stream-start path calls the
+diag FIRST so the cache is fresh. This is also, belatedly, why hdcapm keeps
+`regb2r48_cached` instead of re-reading.
+
+**`mst_csc_ctl=AUTO` remains unverified on hardware.** M130a proved
+`mst_csc_ctl=0` works; AUTO has never yet chosen correctly.
+
+### Harness note: score chroma on a 1-frame run
+
+Asking for 5 frames guarantees `timeout -s INT` kills v4l2-ctl mid-write and the
+single good frame loses its 1536-byte stdio tail, so the file is unscoreable
+(the oracle correctly refuses it, exit 2). Use `... .sh 5` to test cadence and
+read the driver log; use `... .sh 1` when the frame itself needs scoring.
+
+## M134 (hardware, 2026-08-21): credit is not the gate either; CSC AUTO verified
+
+    sudo POLLDRAIN=20 EXTRA="poll_drain_credit=1" ./mz0380-m55-real-capture.sh 5
+
+    41251.274  MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2, cached)
+    41252.546  poll-drain: buf 0 holds 3110400 bytes ... delivering
+    41308.233  poll-drain stopped after 1 deliveries, 0 kicks
+
+**One frame again.** `mz0380_credit_rearm()` (M118) does not move the cadence.
+Lock held clean throughout - `55=7f LOCKED` at every sample and at stop - which
+also confirms M133's lock loss was the kick flood and nothing else.
+
+### The M133 fix is verified
+
+`MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2, cached)`.
+AUTO now reads the right value, from the cached diag read, and picks the right
+branch. `mst_csc_ctl=AUTO` is **confirmed working** - the last of M130's fix to
+be proven on hardware. (The frame itself is still unscoreable: 5-frame runs
+always truncate. Colour is established by M130a plus this log line; one
+`.sh 1` run would close it formally.)
+
+### Where the handshake hunt stands
+
+Everything the completion path could have wanted has now been tried against
+real frames, one at a time:
+
+| mechanism | milestone | result |
+|---|---|---|
+| enc_stat ack | M117 (in poll-drain unconditionally) | 1 frame |
+| op6 / 0x2f kick, repeating | M133, 1224 kicks | 1 frame, **and lock lost** |
+| completion credit re-arm | M134 | 1 frame |
+
+And the stop line is the same every time: `frame_events=0`, `token[0x40]=0`,
+`enc[0x50]=0`. The card writes one frame into buffer 0, never raises an event,
+never advances the buffer index, and nothing the host returns changes it.
+
+### Re-reading the problem: this is the PREVIEW path, not the encoder
+
+The delivered payload is **raw planar 4:2:0**, not an H.264 bitstream - the
+"inferred H.264 length" in the log is a misnomer left from when we expected
+NALs. The splash arrived the same way. So the DMA target is a raw frame buffer
+fed by the card's preview path, and its cadence is governed by
+`preview_params_settings` - the struct op 0x31 writes.
+
+Which puts the spotlight on two fields we are deliberately NOT setting:
+
+    post[1] = (fps & 0xff) << 8;    /* [8]=ch=0  [9]=fps=60  [10]=skip=0  [11]=avg=0 */
+
+`skip` and `avg` are gated by mask bits 0 and 1, and since M131 the mask is 0,
+so **neither is ever stored**: `pps[6]` and `pps[7]` keep their startup value of
+zero. M128c already noticed the card's own handler wants `skip` to be at least 2
+- with `avg == 0` it runs `if (skip <= 1) skip = 2` on the payload at 0xf5d0 -
+but with mask bit 0 clear that 2 never reaches the struct.
+
+A preview pacer with skip=0 is a plausible reason for exactly one frame.
+
+### Next: the M128d bisect, now on the critical path
+
+Which bit of the old 0x1f mask truncates the DMA was deprioritised as
+"interesting but not needed". It is needed now, because it decides whether
+`skip` can be set at all.
+
+```bash
+sudo POLLDRAIN=20 EXTRA="post_mask=0x01" ./mz0380-m55-real-capture.sh 5
+```
+
+Bit 0 alone = store `skip`, nothing else.
+
+    full frames  -> bit 0 is safe, so die_en (bit 4) is the truncator - which was
+                    the standing prior, and it also unblocks the Windows
+                    ordering (M90/M91). AND skip is now applied: watch the
+                    delivery count. More than one frame closes the cadence.
+    16 bytes     -> `skip` itself is the truncator. Then it can never be set,
+                    and the cadence gate is somewhere else entirely.
+
+Two answers from one spawn, whichever way it lands. Follow with
+`post_mask=0x10` (die_en alone) to complete the bisect.
+
+## M135 (hardware, 2026-08-21): mask bit 0 is the truncator - and the mechanism is a SKIPPED function call
+
+    sudo POLLDRAIN=20 EXTRA="post_mask=0x01" ./mz0380-m55-real-capture.sh 5
+
+Run twice, identical both times:
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x01, fps=60, die_en=1, fake_frame_off=1)
+    poll-drain: buf 0 holds 16 of 3110400 bytes - DMA still in flight, waiting  (x16)
+    stop buf[0] head=2e 2e 2f 2f 2e 2e 2e 2f 2f 30 31 30 2f 2f 2f 2f   (run 1)
+    stop buf[0] head=30 30 31 31 30 30 31 30 30 30 30 30 30 30 30 30   (run 2)
+
+**Bit 0 alone truncates.** My standing prior was die_en (bit 4); it was wrong.
+Note the 16 bytes are real video at the current scene's luma (~0x30, a dark
+evening scene) - the same shape as M128a's 0x53, which is now explained: those
+were real frames, truncated.
+
+### It is not "setting skip breaks it"
+
+The branch at tinyvenc5 0xf338 decides whether `tiny_calculate_skip_fps()` gets
+called:
+
+```
+f34c: tst  r3, #1          @ sticky mask bit 0
+f350: beq  0xf394          @ clear -> fall through to the call
+f354: ldrb r1, [r2, #6]    @ pps[6] = skip
+f358: cmp  r1, #0
+f35c: beq  0xf394
+f360: ldrb r2, [r2, #5]    @ pps[5] = fps
+f368: beq  0xf394
+f378:      clear mask bit 0
+f390: b    0xf3f4          @ <-- SKIPS tiny_calculate_skip_fps
+f394: tst  r3, #2
+f3b4: ...
+f3f0: bl   tiny_calculate_skip_fps
+```
+
+With mask 0: bit 0 clear -> f394 -> bit 1 clear -> f3b4 -> **calls** it -> whole
+frame. With mask 0x01 and the card's own clamp having forced skip to 2 (M128c)
+and fps 60: -> f36c -> clears the bit -> **skips the call** -> 16 bytes.
+
+So the correlation is *calling `tiny_calculate_skip_fps`* <=> a complete
+transfer, not the value of `skip`. Falsifiable prediction:
+**`post_mask=0x10` (die_en alone) should give a FULL frame**, because bits 0 and
+1 stay clear and the call happens. That completes the M128d bisect and tests the
+model in one spawn. It also settles whether die_en is safe, which is what the
+Windows ordering (M90/M91) needs.
+
+### Two cheap dead ends closed statically
+
+- **ops `0x60`/`0x61`.** They are in ep.ko's no_signal list but absent from
+  tinyvenc5's dispatch table, so ep.ko must handle them itself - a plausible
+  "hand the buffer back" candidate. It is not: `pciep_isr` 0x1888 does the
+  latch test and falls to 0x17bc, the same bare `sysfs_notify(epint)` every
+  other opcode gets. No buffer semantics at all.
+- **The buffer tables.** cmd 2 (ours) and cmd 5 both index a 192-byte per-group
+  struct by payload word 0 (`MLA r5, #192, r2, r5`) and each write **8** address
+  words - cmd 2 at group offset 0x08..0x24, cmd 5 at 0x68..0x84. Two separate
+  8-entry tables. Nothing in ep.ko ever reads either; the card's userspace
+  consumes them. This matches the driver's own warning about a "SET_BUF_8 second
+  set not allocated" and means we back 4 of 8 slots in one of two tables - but
+  the card only ever writes slot 0, so under-provisioning is not the gate.
+
+### Cadence: where it actually stands
+
+Everything host-side has been tried, one variable at a time:
+
+| tried | milestone | result |
+|---|---|---|
+| enc_stat ack | M117 | 1 frame |
+| op6 kick x1224 | M133 | 1 frame, lock lost |
+| credit re-arm | M134 | 1 frame |
+| asking v4l2 for more | M132 | 1 frame |
+| ops 0x60/0x61 as buffer return | M135, static | not buffer ops at all |
+
+The card writes one frame into buffer 0, raises no completion, never advances
+the token, and nothing the host sends changes it. **The remaining answer is
+card-side**: what in `libvideocap` / `video_capture_mgr` advances the preview
+buffer index and re-arms the DMA. That is a static dig, it is free, and it is
+the honest next step - not another knob.
+
+### Next, in order
+
+1. **`post_mask=0x10`, one spawn.** Completes the bisect, tests the
+   `tiny_calculate_skip_fps` model, and unblocks the Windows ordering question.
+   Predicted: full frame.
+2. **Static: the preview DMA loop.** `libvideocap.so.13` /
+   `video_capture_mgr` - find what writes the host buffer addresses into the
+   DMA engine per frame and what advances the index. `libvideocap` is PIC and
+   addresses strings as `GOT_base(0x18e4c) + literal`.
+3. `out_fmt` (SET_VIC byte 12, still 0) once the cadence is understood.
+
+### Spawn budget warning
+
+This session has spent **12** encoder spawns on top of whatever the power cycle
+already had. The card has historically wedged in the **8-18** range and has not
+wedged yet, so the next few runs are in the risky zone. A soft PC shutdown
+resets it (M127).
+
+### M135a (hardware): `post_mask=0x10` gives a FULL frame - the bisect is complete and the model holds
+
+    stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x10, fps=60, die_en=1, fake_frame_off=1)
+    poll-drain: buf 0 holds 1121024 of 3110400 bytes - DMA still in flight
+    poll-drain: buf 0 holds 3110400 bytes ... delivering
+
+Predicted and observed. So:
+
+| mask | stores | tiny_calculate_skip_fps | result |
+|---|---|---|---|
+| 0x00 | nothing | called | full frame |
+| 0x01 | skip | **skipped** | 16 bytes |
+| 0x10 | die_en | called | **full frame** |
+| 0x1f | skip+avg+die_en | **skipped** | 16 bytes |
+
+**die_en is safe. Bit 0 is the truncator, and the mechanism is the skipped
+call.** M128d's prior (die_en) was wrong, and the de-interlacer being on for a
+progressive source turns out to be harmless.
+
+**This unblocks the Windows ordering.** `win_seq=1` "renders nothing"
+(M90/M91) because it sends `0x31` with mask 0x1f, whose bit 0 skips the call.
+`win_seq=1 post_mask=0` (or `0x10`) is now worth a spawn on its own account.
+
+## M136: SET_VIC byte 34 is the FRAME-COMPLETION INTERRUPT ENABLE (static)
+
+Free. Found by reading ep.ko rather than guessing, and it is the best cadence
+candidate this session has produced.
+
+`pciep_isr`'s cmd-41 (SET_VIC) arm ends:
+
+```
+1744: ldrb r1, [r4, #0x22]     @ SET_VIC payload byte 34
+1748: adds r3, r1, #0
+174c: movne r3, #1
+1754: strb r3, [r5, #0x630]    @ state[0x630] = (byte34 != 0)
+```
+
+`state[0x630]` is the gate inside `store_channel_done()` - the sysfs attribute
+**the card's own userspace writes when a channel finishes a frame**:
+
+```
+dc8: <store_channel_done>
+ ...  packs (count - 1) into a nibble at bit ch*4 in BAR0 0x40/0x44/0x48/0x4c
+ e88: ldrb r3, [r1, #0x630]
+ e8c: cmp  r3, #0
+ e94: beq  0xefc               @ ZERO: do not raise - accumulate into [0x634]
+ ebc: str  r4, [r3, #0x30]     @ BAR0 0x30: EVENT |= (1 << ch)
+ ed0: str  r0, [r3]            @ and poke the interrupt
+```
+
+Those four BAR0 registers are exactly the ones our stop line prints, and
+`0x40` is `MZ0380_MB_FRAME_TOKEN`.
+
+**With byte 34 at zero the card counts its completed frames and never tells the
+host.** Which is precisely what every run reports:
+
+    stream stop: EVENT[0x30]=00000000 token[0x40]=00000000 0x44=... 0x48=... 0x4c=...
+                 frame_events=0
+
+Note `store_channel_done` writes `count - 1`, so a single completed frame packs
+as nibble 0 - indistinguishable from never-written. `token[0x40]=0` has always
+been read as "the index never advanced"; it is equally "one frame, index 0, and
+no interrupt".
+
+We have sent 0 in byte 34 for the driver's entire life. M82 read it as "mix"
+from the Windows traces, where it is also zero - but "Windows sends 0" has
+already cost us `fw=7` and `post_mask=0x1f` (method rule 4). The AIC twin of
+this mechanism is already named in our own header: SET_AIC byte 17 =
+`aic_int_mode` -> `state[0x63c]`, the other branch of the same gate at 0xefc.
+Nothing has ever set the video one.
+
+New knob `vic_int_mode` (SET_VIC byte 34, default 0 = no change):
+
+```bash
+sudo POLLDRAIN=20 EXTRA="vic_int_mode=1" ./mz0380-m55-real-capture.sh 5
+```
+
+    >1 frame                 -> the cadence is solved.
+    1 frame but EVENT/frame_events nonzero -> the interrupt now arrives; the
+                                remaining gate is what the host does with it
+                                (the ISR path, which has never run for real).
+    no change                -> byte 34 is not the enable, or the card's
+                                userspace never calls channel_done at all.
+
+Read `EVENT[0x30]`, `frame_events` and `token[0x40]` in the stop line before
+anything else - those three are the measurement, not the frame count.
+
+## M137 (hardware + static, 2026-08-21): `vic_int_mode=1` changes nothing - and why
+
+    sudo POLLDRAIN=20 EXTRA="vic_int_mode=1" ./mz0380-m55-real-capture.sh 5
+
+    stream stop: EVENT[0x30]=00000000 token[0x40]=00000000 ... frame_events=0
+    poll-drain stopped after 1 deliveries, 0 kicks
+
+No change. **Caveat, and it is mine:** the SET_VIC log line did not print byte
+34, so this run cannot formally distinguish "the flag landed and did nothing"
+from "the flag never landed" - method rule 9 again, in a line that has been
+short of `fk` and `int_mode` all along. `insmod` would have rejected an unknown
+parameter and did not, and `params[7]` demonstrably ORs the byte in, so the
+value almost certainly landed; but "almost certainly" is not the standard this
+file holds itself to. **Fixed:** the line now prints `fk=` and `int_mode=`.
+Re-confirm on the next run that carries the knob.
+
+### Why it may be moot: who actually writes `channel_done`
+
+`/sys/class/vpl_pciep/channel_done` (the attribute `store_channel_done()`
+backs - ep.ko creates it with `__class_create` + `class_create_file`, which is
+why its path prefix differs from the `/sys/vpl_pciep/` attributes) is
+referenced from exactly **two** places in tinyvenc5:
+
+    12c60   EncodingGroup::encode_handler
+    15d58   EncodingGroup::fake_frame_process
+
+The second is the standby splash thread, which `fake_frame_off=1` stops from
+ever being created (M128/M129). So since M129 the **only** writer is
+`encode_handler`, and it evidently writes once and then blocks.
+
+This is not a regression from `fake_frame_off`: every pre-M129 run also
+delivered exactly one frame per stream, with the splash thread running. But it
+does relocate the question. The cadence gate is **inside `encode_handler`'s
+loop** - what it waits on after finishing frame 1 - and `state[0x630]` only
+decides whether a completion that never happens gets reported.
+
+That also explains why every host-side handshake failed: enc_stat, credit and
+kicks all address the *reporting* path, and the producer is what is stalled.
+
+### Next, and it is static
+
+Disassemble `EncodingGroup::encode_handler` (tinyvenc5 0x12c60 region) and find
+what it blocks on after its first `channel_done` write. Candidates visible in
+the PLT: `TK_H264Enc_WaitOneFrame`, `TK_MMA_WaitOneFrameComplete`,
+`SSM_ReleaseAndReceive`, `PB_GetFullness`, and the `pread` of
+`/sys/vpl_pciep/enc_stat%d`. One of those returns and never comes back.
+
+This is free, it is the only remaining thread, and it is where the next session
+should start. Do NOT spend more spawns on host-side knobs until it is read -
+five have now been spent proving, one at a time, that the reporting path is not
+the problem.

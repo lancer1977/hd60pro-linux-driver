@@ -17,19 +17,14 @@ struct mz0380_board mz0380_boards[] = {
 	[MZ0380_BOARD_UNKNOWN] = {
 		.name = "UNKNOWN/GENERIC",
 		.windows_driver = "unknown",
-		.firmware_name = NULL,
 	},
 	[MZ0380_BOARD_ELGATO_HD60_PRO] = {
 		.name = "Elgato Game Capture HD60 Pro",
 		.windows_driver = "e60MZ0380.X64.SYS",
-		.firmware_name = "mz0380/MZ0380.HD.HEX",
-		.firmware_base_name = NULL,
 	},
 	[MZ0380_BOARD_ELGATO_HD60_PRO_REV3] = {
 		.name = "Elgato Game Capture HD60 Pro (Rev.3)",
 		.windows_driver = "e60MZ0380.X64.SYS",
-		.firmware_name = "mz0380/MZ0381.HD.HEX",
-		.firmware_base_name = NULL,
 	},
 };
 const unsigned int mz0380_bcount = ARRAY_SIZE(mz0380_boards);

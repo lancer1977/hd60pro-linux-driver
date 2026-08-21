@@ -26,6 +26,8 @@
 static void mz0380_drain_work_fn(struct work_struct *w);
 static void mz0380_enc_stat_ack(struct mz0380_dev *dev);
 static void mz0380_frame_buffer_repoison(struct mz0380_dev *dev, u32 idx);
+static void mz0380_poll_drain_start(struct mz0380_dev *dev);
+static void mz0380_poll_drain_stop(struct mz0380_dev *dev);
 
 /* SET_VIC below configures video channel zero; channel_done sets its EVENT bit. */
 #define MZ0380_VIDEO_EVENT_BIT BIT(MZ0380_STREAM_VIDEO_CHANNEL)
@@ -231,7 +233,28 @@ static int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 	int ret;
 
 	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
-	params[1] = mz0380_set_buf_stride;	/* M27: cmd[0x8], runtime knob */
+	/*
+	 * M92: word[3] is a buffer SIZE IN BYTES, not a stride. The Windows
+	 * driver builds every buffer-registration command (0x02, 0x03, 0x04,
+	 * 0x05, 0x08) with the identical shape - word[2] = channel, word[3] =
+	 * size, word[4..11] = four {hi,lo} address pairs, count = 12 - and the
+	 * sizes it sends decode exactly:
+	 *
+	 *   0x466000 = 2048 x 1125 x 2   + 4096   (YUV422, stride 2048, vtotal)
+	 *   0x34BD00 = 2048 x 1125 x 1.5 + 256    (YUV420, same geometry)
+	 *   0x10F000 = 1024 x  540 x 2   + 4096   (preview, YUV422)
+	 *   0x0CA900 = 1024 x  540 x 1.5 + 256    (preview, YUV420)
+	 *
+	 * i.e. frame bytes plus a small header, at a power-of-two stride. That
+	 * also identifies the "third region" in the DriverEntry log line
+	 * [MEMORY] [00466000] [0034BD00] [0034BD00], which the Windows
+	 * collection had left unexplained.
+	 *
+	 * Our value is the size of the buffer we actually allocate, which is
+	 * the same thing Windows sends, so the number was right even though
+	 * M27 named it "stride". Nothing changes here but the meaning.
+	 */
+	params[1] = mz0380_set_buf_stride;	/* cmd[0x8] = size, see above */
 	/*
 	 * ep.ko op2 copies cmd[0xc+8i]->channels[ch]+0 (iATU UPPER target reg 0x58 =
 	 * host addr HIGH) and cmd[0x10+8i]->+4 (iATU LOWER reg 0x54 = host addr LOW).
@@ -279,7 +302,32 @@ static int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 
 	ret = mz0380_send_command(dev, mz0380_set_buf_opcode, params,
 				  ARRAY_SIZE(params), NULL, 2000);
-	if (ret || !mz0380_probe_windows)
+	if (ret)
+		return ret;
+
+	/*
+	 * M92: Windows sends 0x08 immediately after 0x02, with the same channel,
+	 * the same size word and four more address pairs - the pair is issued
+	 * back to back at 0x14027b62d / 0x14027b752 and never one without the
+	 * other. ep.ko treats them asymmetrically: op2 fills window0 slots 1..4
+	 * and CLEARS host_ready (G[0]), while op8 fills slots 5..8 and SETS
+	 * wency_ready = 8. We have only ever sent the one that clears a ready
+	 * flag, and never the one that sets the other.
+	 *
+	 * Same four buffers: the point is the slots and the wency_ready side
+	 * effect, not extra memory. Off by default - the M88 baseline renders
+	 * the splash without it, and after M84 a change that has not been
+	 * measured does not get to be a default.
+	 */
+	if (mz0380_set_buf_op8) {
+		int r8 = mz0380_send_command(dev, MZ0380_CMD_SET_BUF_8, params,
+					     ARRAY_SIZE(params), NULL, 2000);
+
+		pr_info("%s: SET_BUF_8(op 0x08, window0 slots 5..8, sets wency_ready) ret=%d\n",
+			dev->name, r8);
+	}
+
+	if (!mz0380_probe_windows)
 		return ret;
 
 	/*
@@ -345,6 +393,18 @@ static irqreturn_t mz0380_isr(int irq, void *data)
 	struct mz0380_dev *dev = data;
 	u32 event;
 
+	/*
+	 * M84: a SHARED INTx handler is called for every other device on the
+	 * line, including during our own teardown. If the BAR has already been
+	 * unmapped the very first MMIO read is a NULL dereference - which is
+	 * exactly how the first INTx run died (oops in mz_read, CR2 = 0x30 =
+	 * MZ0380_MB_EVENT, "rmmod exited with irqs disabled"). The ordering bug
+	 * that opened that window is fixed in mz0380_finidev(), but a shared
+	 * handler must not depend on ordering alone.
+	 */
+	if (!dev || !dev->bmmio[MZ0380_MAP_BAR_MMIO])
+		return IRQ_NONE;
+
 	event = mz_mmio_read(dev, MZ0380_MB_EVENT);
 	if (!event || event == 0xffffffff)
 		return IRQ_NONE;
@@ -372,8 +432,27 @@ int mz0380_irq_request(struct mz0380_dev *dev)
 		}
 	}
 
+	/*
+	 * M82. The endpoint ADVERTISES MSI - Windows derives
+	 * DEVPKEY_PciDevice_InterruptSupport = 3 (line + message) and
+	 * InterruptMessageMaximum = 1 straight from its config space - but the
+	 * retail driver never uses it. On the Windows box the card's
+	 * Interrupt Management\MessageSignaledInterruptProperties key is absent
+	 * (14 other PCI devices on the same board have it), the INF carries no
+	 * MSISupported directive, AllocConfig assigns a level-sensitive shared
+	 * line with CM_RESOURCE_INTERRUPT_MESSAGE clear, and the trace logs
+	 * "INTERRUPT = 00000000" on IRQ 29.
+	 *
+	 * So PCI_IRQ_MSI | PCI_IRQ_INTX picks the one interrupt path the
+	 * shipping stack has never exercised. If the card's MSI path is unwired
+	 * in firmware the symptom is precisely ours: commands complete, the
+	 * encoder starts, no completion ever arrives. Default to what Windows
+	 * does and treat MSI as the experiment.
+	 */
 	nvec = pci_alloc_irq_vectors(dev->pci, 1, 1,
-				     PCI_IRQ_MSI | PCI_IRQ_INTX);
+				     mz0380_irq_intx ? PCI_IRQ_INTX
+						     : (PCI_IRQ_MSI |
+							PCI_IRQ_INTX));
 	if (nvec < 1) {
 		pr_err("%s: pci_alloc_irq_vectors failed (%d)\n",
 		       dev->name, nvec);
@@ -381,6 +460,12 @@ int mz0380_irq_request(struct mz0380_dev *dev)
 	}
 
 	dev->msi_enabled = (nvec >= 1) && dev->pci->msi_enabled;
+	/* Legacy delivery needs the line unmasked; probe masks it by default. */
+	if (!dev->msi_enabled)
+		pci_intx(dev->pci, 1);
+	pr_info("%s: interrupt: %s, irq %u (Windows uses INTx)\n",
+		dev->name, dev->msi_enabled ? "MSI" : "legacy INTx",
+		pci_irq_vector(dev->pci, 0));
 	dev->irq = pci_irq_vector(dev->pci, 0);
 
 	dev->frame_event_head = 0;
@@ -911,7 +996,8 @@ static u8 mz0380_timings_fps(const struct v4l2_dv_timings *t)
  * Mask bits 0, 1 and 6 select exactly FPS, GOP and bitrate.  Leave profile,
  * QP and geometry masked out until their userspace enum/range ABI is proven.
  */
-static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps)
+static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps,
+					   u32 main_or_sub)
 {
 	u32 enc[10] = { 0 };
 	u32 gop = dev->capture.gop_size;
@@ -932,17 +1018,74 @@ static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps)
 		fallback = true;
 	}
 
-	enc[0] = MZ0380_ENC_VALID_FPS | MZ0380_ENC_VALID_GOP |
-		 MZ0380_ENC_VALID_BITRATE;
-	enc[1] = (gop << 24) | (fps << 16); /* main stream, channel zero */
+	/*
+	 * M82: the sub stream is a second, independent encoder. Windows always
+	 * configures both, back to back, and only the second carries
+	 * main_or_sub = 1 (its dword build ORs a literal 0x100 into card+0x08
+	 * at 0x14028c643 - the byte-9 position, which is exactly where our
+	 * tinyvenc5-derived map already put the field). Its own numbers in the
+	 * traces were gop = 30 and bitrate = 4 Mbit against the main stream's
+	 * gop = 32 / 4 MiB; nothing suggests the card cares, so the sub stream
+	 * just mirrors the main configuration here.
+	 */
+	enc[0] = mz0380_enc_mask ?: (MZ0380_ENC_VALID_FPS |
+				     MZ0380_ENC_VALID_GOP |
+				     MZ0380_ENC_VALID_BITRATE);
+	enc[1] = (gop << 24) | (fps << 16) |
+		 ((main_or_sub & 0xff) << 8);	/* channel zero */
 	enc[3] = bitrate;
 
 	/* Match Windows' EVENT-wait path; timeout 0 would permit mailbox reuse. */
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_ENC_PARAMS, enc,
 				  ARRAY_SIZE(enc), NULL, 5000);
-	pr_info("%s: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x%02x, main ch0, fps=%u, gop=%u, bitrate=%u%s) ret=%d\n",
-		dev->name, enc[0], fps, gop, bitrate,
-		fallback ? ", conservative fallback applied" : "", ret);
+	pr_info("%s: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x%04x, %s ch0, fps=%u, gop=%u, bitrate=%u%s) ret=%d\n",
+		dev->name, enc[0], main_or_sub ? "sub" : "main", fps, gop,
+		bitrate, fallback ? ", conservative fallback applied" : "",
+		ret);
+	return ret;
+}
+
+/*
+ * STOP_STREAMING as Windows sends it: word[2] = 0xFFFFFFFF ("all channels"),
+ * count 3. We have always sent a bare opcode, i.e. channel 0 implicitly and
+ * count 2. M82.
+ */
+static int mz0380_stream_stop_all(struct mz0380_dev *dev, unsigned int timeout_ms)
+{
+	u32 stop_all = 0xffffffffu;
+
+	return mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
+				   &stop_all, 1, NULL, timeout_ms);
+}
+
+/*
+ * op 0x31, the command that closes every Windows capture-start sequence. We
+ * have always called it POST_PROC; M128's static decode of tinyvenc5 names it
+ * SET_PREVIEW_PARAMS and gives the whole 20-byte payload:
+ *
+ *   [4..7]=mask  [8]=ch  [9]=fps  [0x0a]=skip  [0x0b]=avg  [0x0c]=die_en
+ *   [0x0d]=preview_off  [0x0e]=fake_frame_off  [0x0f]=preview_no_osd
+ *   [0x10]=mirror  [0x11]=flip  [0x12]=hw_d
+ *
+ * so post_di is die_en. On this board every field except fps and die_en is
+ * zero in the Windows traces, and die_en is 1 even for a progressive source.
+ * fake_frame_off is ours, not Windows': see mz0380_fake_frame_off in core.c.
+ */
+static int mz0380_stream_post_proc(struct mz0380_dev *dev, u32 fps)
+{
+	u32 post[5] = { 0 };
+	int ret;
+
+	post[0] = mz0380_post_mask;
+	post[1] = (fps & 0xff) << 8;			/* [8]=ch [9]=fps  */
+	post[2] = (mz0380_post_di & 0xff) |		/* [12]=die_en     */
+		  ((mz0380_fake_frame_off ? 1u : 0u) << 16); /* [14] */
+
+	ret = mz0380_send_command(dev, mz0380_post_proc_opcode, post,
+				  ARRAY_SIZE(post), NULL, 5000);
+	pr_info("%s: stream start: SET_PREVIEW_PARAMS(op 0x%02x, mask=0x%02x, fps=%u, die_en=%u, fake_frame_off=%u) ret=%d\n",
+		dev->name, mz0380_post_proc_opcode, post[0], fps,
+		mz0380_post_di, mz0380_fake_frame_off, ret);
 	return ret;
 }
 
@@ -961,19 +1104,39 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	bool interlaced = dev->capture.source_interlaced;
 	u32 fps = dev->capture.source_fps ?:
 		  mz0380_timings_fps(&dev->detected_timings);
-	u32 fw = mz0380_vic_fw;         /* byte6: encoder selector, see M71 */
 	/*
-	 * byte7: VideoCap INPUT FORMAT, not a boolean. M72 restores 6/7 after
-	 * M71 briefly made this an interlace flag - the card's printf calls it
-	 * "interlace", but the SDK capture config
-	 * (re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg) documents the
-	 * actual enum: "input format (1:8-bits Raw, 2:CCIR656i, 3:CCIR656p,
-	 * 4:Bayer, 5:16-bits Raw, 6:BT1120p, 7:BT1120i)". 6 vs 7 IS
-	 * progressive vs interlaced here, which is why the label is not wrong,
-	 * merely loose - but 0/1 are Raw/none and would be nonsense.
+	 * byte6 "fw": encoder selector (M71) AND cfg output-format selector
+	 * (M79: vcm writes "output format" = 2/YUY2 when fw == 6, else 1/YV12;
+	 * fw == 7 spawns ./tinyvenc7, fw == 8 ./tinyvenc8, anything else
+	 * ./tinyvenc5). M82: the Windows driver only ever sends 6 or 7, picked
+	 * by frame rate - 6 for 1080p30 and 1080p29.97, 7 for 1080p60, in
+	 * every [CH00] line of every trace. It never sends 5, which is what we
+	 * have always sent. 0 here means "use the Windows rule".
 	 */
-	u32 in_fmt = interlaced ? 7 : 6;
+	u32 fw = mz0380_vic_fw ?: (fps > 30 ? 7u : 6u);   /* 0 = Windows rule; see M88 */
+	/*
+	 * byte7: VideoCap INPUT FORMAT, per the SDK capture config
+	 * (re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg): "input format
+	 * (1:8-bits Raw, 2:CCIR656i, 3:CCIR656p, 4:Bayer, 5:16-bits Raw,
+	 * 6:BT1120p, 7:BT1120i)". The card's own printf calls the field
+	 * "interlace", which is why M71 read it as a boolean and M103 briefly
+	 * reclassified it back - but the label is loose, not wrong: 6 vs 7 is
+	 * BT1120p vs BT1120i.
+	 *
+	 * M104 settled it ON HARDWARE and the enum reading won. 3, 6 and 7 all
+	 * reach the card's NOSG splash and are indistinguishable; 0 - which is
+	 * not in the enum - produces nothing at all, i.e. VideoCap never opens
+	 * and tinyvenc exits before it can draw. That also PROVES the byte is
+	 * consumed, which the three indistinguishable values could not.
+	 *
+	 * MZ0380_VIC_IN_FMT_AUTO exists because the old `vic_in_fmt ?: derived`
+	 * idiom could not express 0 at all, so the field's own sweep knob could
+	 * not reach part of its range. The derived default is unchanged.
+	 */
+	u32 in_fmt = (mz0380_vic_in_fmt == MZ0380_VIC_IN_FMT_AUTO)
+			? (interlaced ? 7u : 6u) : mz0380_vic_in_fmt;
 	u32 out_fmt = mz0380_vic_out_format;    /* byte12 "m", see M72 */
+	u32 vic_in_w, vic_in_h;
 	bool aic_newly_armed = false;
 	bool vic_fired = false;
 	int ret;
@@ -990,12 +1153,14 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * video_capture_mgr's op-41 handler (RE_FINDINGS.md M23). The mailbox puts
 	 * the opcode at struct[0..3]; our params[i] lands at struct[4+4i..7+4i]
 	 * (params[0]=struct[4..7]). Authoritative field map:
-	 *   [4]=ch  [5]=fps  [6]=fw  [7]=interlace
+	 *   [4]=ch  [5]=fps  [6]=fw  [7]=input format (6=BT1120p, 7=BT1120i)
 	 *   [8..9]=width  [10..11]=height  [12]=m  [13]=flip  [14]=mirror
 	 *   [16..19]=color_info  [20..21]=x_start  [22..23]=y_start
 	 *   [24..25]=input_frame_width  [26..27]=input_frame_height
 	 *   [28]=bitstream_num(MUST be >=1)  [29]=osd_en  [30]=osd_size
-	 *   [31]=is_nosg  [32]=vanc_lines  [33]=fast_kill  [35]=is_slave
+	 *   [31]=is_nosg  [32]=vanc_lines  [33]=fast_kill
+ *   [34]=frame-completion interrupt enable (M136 - was guessed as "mix")
+ *   [35]=is_slave
 	 *   [36..39]=nosg back/y/u/v
 	 *
 	 * M71: bytes 6 and 7 corrected against the card's OWN printf. The
@@ -1006,15 +1171,16 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * r1=[cmd+4]=ch, r2=[cmd+6]=fw, r3=[cmd+5]=fps, then stack args
 	 * [cmd+8]=W, [cmd+10]=H, [cmd+7]=interlace, [cmd+12]=m, ... So byte6
 	 * is the ENCODER SELECTOR (vcm 0x9250 compares it to 7 -> ./tinyvenc7,
-	 * and 8 -> ./tinyvenc8, else ./tinyvenc5) and byte7 is the INTERLACE
-	 * FLAG, which is passed straight into the encoder's argv.
+	 * and 8 -> ./tinyvenc8, else ./tinyvenc5).
 	 *
-	 * We had byte6 = 2|3 and byte7 = 6|7 (a "BT1120 bus selector" that does
-	 * not exist in this struct). The encoder therefore spawned - by
-	 * fallthrough - and was told interlace=6 for a progressive source,
-	 * which is a plausible reason VideoCap_*VIC captured nothing at all
-	 * while the receiver held a clean 1080p60 lock.
-	 * params[8] explicitly clears those final no-signal colour bytes; the
+	 * M127/M128 CORRECTION to the rest of that paragraph: byte7 is NOT an
+	 * interlace boolean. video_capture_mgr only *labels* it "interlace(%d)"
+	 * in the printf above; the value is sprintf'd RAW into the cfg line
+	 * matching "input format", whose enum is 6 = BT1120p and 7 = BT1120i.
+	 * The code below (in_fmt) is right and always was - it was this comment
+	 * that was wrong. Historical note: the pre-M71 packing had byte6 = 2|3,
+	 * which spawned tinyvenc5 only by fallthrough.
+	 * params[8] carries the no-signal colour bytes (M82: 0.00.80.80); the
 	 * following struct word is PARAM10/STATUS and is never SET_VIC payload.
 	 * The old M20/M22 packing put input_w/input_h/bitstream_num two bytes early,
 	 * so the firmware read bitstream_num=0 (byte28 unset) and garbage input dims
@@ -1037,10 +1203,88 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * saturation is the config's documented "mono".
 	 */
 	params[2] = out_fmt & 0xff;
-	params[3] = (mz0380_vic_saturation & 0xff) << 16;
+	/*
+	 * M82: bytes 16..19 are color_info[0..3], and the Windows driver sends
+	 * a fixed 1,1,1,2 on every single SET_VIC in all four traces - never a
+	 * per-picture value. Decoded from the dword build at 0x14028bcb9,
+	 *   eax = c3<<24 | c1<<16 | c2<<8 | c1
+	 * cross-checked against its printf "color = %d.%d.%d.%d" which prints
+	 * the same three stack slots in the order c3,c1,c2,c1 and read
+	 * "color = 2.1.1.1" in every trace. So c1=1, c2=1, c3=2 and the bytes
+	 * on the wire are [16]=1 [17]=1 [18]=1 [19]=2.
+	 *
+	 * This supersedes the M72 reading of the same four bytes as
+	 * brightness/contrast/saturation/field-invert: that guess put 128 in
+	 * byte 18 and zero everywhere else, which is not a value the retail
+	 * driver ever sends. vic_saturation is kept only as an override.
+	 */
+	params[3] = mz0380_vic_color_info;
+	if (mz0380_vic_saturation != MZ0380_VIC_SATURATION_UNSET)
+		params[3] = (params[3] & ~0x00ff0000u) |
+			    ((mz0380_vic_saturation & 0xff) << 16);
 	params[1] = ((out_h & 0xffff) << 16) | (out_w & 0xffff);
-	params[5] = ((in_h & 0xffff) << 16) | (in_w & 0xffff);
+	/*
+	 * M76: bytes 24..27 are the VIC's own width/height register, patched
+	 * into the card's cfg as "input frame width/height" independently of
+	 * the capture geometry. Overridable to test the 8-bit double-rate
+	 * hypothesis (3840) against the VIC's width check.
+	 */
+	vic_in_w = mz0380_vic_in_w ?: in_w;
+	vic_in_h = mz0380_vic_in_h ?: in_h;
+	params[5] = ((vic_in_h & 0xffff) << 16) | (vic_in_w & 0xffff);
 	params[6] = 1u | ((mz0380_stream_nosg ? 1u : 0u) << 24); /* [28]=bitstream_num=1, [31]=is_nosg */
+	/*
+	 * M82: byte 33 is fast_kill and Windows sends 1, always ("fk=1" in
+	 * every [CH00] line of every trace). We have sent 0 for the life of
+	 * this driver. Bytes 32 (vanc_lines) and 34..35 (mix, is_slave) are
+	 * zero there too, which is what we already send.
+	 */
+	params[7] = ((mz0380_vic_fast_kill & 0xff) << 8) |	/* [33] */
+		    ((mz0380_vic_int_mode & 0xff) << 16);	/* [34] M136 */
+	/*
+	 * M82: bytes 36..39 are the no-signal fill colour, and Windows sends
+	 * back=0, Y=0x00, U=0x80, V=0x80 - neutral grey, not the all-zero
+	 * (green) we have been sending. Only consumed when the card falls back
+	 * to its NOSG generator, but it costs nothing to match.
+	 */
+	params[8] = mz0380_vic_nosg;
+
+	/*
+	 * M82: Windows precedes EVERY reconfiguration with a stop, and its
+	 * "[FIRMWARE RESET]" log line is exactly that - opcode 0x07 with
+	 * word[2] = 0xFFFFFFFF ("all channels"), count 3, flag 1
+	 * (fire-and-forget), sent from 0x14028cf38 with the reconfiguration
+	 * function called on the very next instruction. We have always sent
+	 * STOP with an empty payload, and only on the unwind path.
+	 *
+	 * The traces show a consistent 1.84-1.91 s between that stop and the
+	 * SET_VIC that follows it. Part of it is eight msleep() calls inside
+	 * the config function; the rest is unattributed, so the safe reading
+	 * is that the card is not ready for 0x29 immediately.
+	 */
+	if (mz0380_win_seq) {
+		int stop_ret = mz0380_stream_stop_all(dev, 0);
+
+		pr_info("%s: stream start: pre-STOP(op 0x07, all channels) ret=%d, settling %u ms\n",
+			dev->name, stop_ret, mz0380_stop_settle_ms);
+		msleep(mz0380_stop_settle_ms);
+
+		/*
+		 * Windows registers its capture buffers when the pin opens,
+		 * which is before the reconfiguration - the opposite of the
+		 * M23 placement below, which was chosen so that op6's iATU
+		 * latch would see our addresses. The two only agree when there
+		 * is no op6; win_bufs_first=0 keeps the M23 placement.
+		 */
+		if (mz0380_win_bufs_first) {
+			ret = mz0380_stream_program_bufs(dev);
+			if (ret) {
+				pr_warn("%s: SET_BUF failed (%d) - frames will not flow\n",
+					dev->name, ret);
+				goto err_events;
+			}
+		}
+	}
 
 	/* Even a timed-out transaction may already have spawned tinyvenc5. */
 	vic_fired = true;
@@ -1051,9 +1295,19 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 			dev->name, in_w, in_h, fps,
 			interlaced ? "i" : "p", fw, ret);
 	else
-		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u -> H.264 output=%ux%u, bitstreams=1) ret=%d\n",
+		/*
+		 * M137: fk and int_mode added. Byte 34 (int_mode) was set for
+		 * the first time in M136 and this line did not print it, so the
+		 * negative result could not be distinguished from "the knob
+		 * never landed" - method rule 9, in a line that has been short
+		 * of these two bytes all along.
+		 */
+		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u vic_in=%ux%u fk=%u int_mode=%u -> H.264 output=%ux%u, bitstreams=1) ret=%d\n",
 			dev->name, in_w, in_h, interlaced ? "i" : "p",
-			fps, fw, in_fmt, out_fmt, out_w, out_h, ret);
+			fps, fw, in_fmt, out_fmt, vic_in_w, vic_in_h,
+			mz0380_vic_fast_kill & 0xff,
+			mz0380_vic_int_mode & 0xff,
+			out_w, out_h, ret);
 	if (ret)
 		goto err_events;
 
@@ -1068,7 +1322,9 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * start_delay_ms module param if the first frame is missed (symptom: no
 	 * rising IRQ/token count after op6, IRQ 164 stuck at the idle value 3).
 	 */
-	msleep(mz0380_start_delay_ms);
+	/* M82: Windows inserts no settle at all between 0x29 and 0x2a. */
+	if (!mz0380_win_seq)
+		msleep(mz0380_start_delay_ms);
 
 	/*
 	 * SET_VIC launches tinyvenc5, but opcode 0x2d is the host-owned encoder
@@ -1077,9 +1333,12 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * full-width mailbox packet through the command EVENT before SET_BUF can
 	 * overwrite the shared words.  The NOSG diagnostic emits raw synthetic
 	 * NV12 and deliberately skips H.264 configuration/spawn work.
+	 *
+	 * M82: in the Windows order the encoder commands come AFTER SET_AIC,
+	 * so this runs further down instead.
 	 */
-	if (!mz0380_stream_nosg) {
-		ret = mz0380_stream_configure_encoder(dev, fps);
+	if (!mz0380_win_seq && !mz0380_stream_nosg) {
+		ret = mz0380_stream_configure_encoder(dev, fps, 0);
 		if (ret)
 			goto err_events;
 	}
@@ -1092,11 +1351,13 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * (RE_FINDINGS.md M23). op2 does not sysfs_notify, so it won't disturb the
 	 * tinyvenc5 that is blocked waiting for op6.
 	 */
-	ret = mz0380_stream_program_bufs(dev);
-	if (ret) {
-		pr_warn("%s: SET_BUF failed (%d) - frames will not flow\n",
-			dev->name, ret);
-		goto err_events;
+	if (!mz0380_win_seq || !mz0380_win_bufs_first) {
+		ret = mz0380_stream_program_bufs(dev);
+		if (ret) {
+			pr_warn("%s: SET_BUF failed (%d) - frames will not flow\n",
+				dev->name, ret);
+			goto err_events;
+		}
 	}
 	if (!mz0380_stream_nosg)
 		pr_info("%s: SET_BUF(op 0x%02x) provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8\n",
@@ -1144,7 +1405,8 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 			mz0380_aic_freq,			/* cmd+8  freq  */
 			(mz0380_aic_period_frames & 0xffff) |	/* cmd+12       */
 			((u32)(mz0380_aic_periods & 0xffff) << 16), /* cmd+14   */
-			1u,					/* cmd+16 on=1  */
+			1u |					/* cmd+16 on=1  */
+			((u32)(mz0380_aic_int_mode & 0xff) << 8),/* cmd+17     */
 		};
 
 		ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS, aic,
@@ -1163,6 +1425,69 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	}
 
 	/*
+	 * M73: photograph the receiver's output stage on both sides of the
+	 * encoder kick. If the VIC never sees a clock, the evidence is here and
+	 * nowhere the host can otherwise reach - the card's own log is on a
+	 * serial port we do not have.
+	 */
+	/*
+	 * M130/M133: the source is locked by now, so 0x48 finally means
+	 * something - pick the CSC mode from the colour space it is actually
+	 * sending. The diag runs FIRST because its read of 0x48 is the one that
+	 * works, and it caches the value we then use; M133 had these the other
+	 * way round and the standalone read returned 0x00, selecting the RGB
+	 * matrix for a YUV444 source.
+	 */
+	if (!mz0380_stream_nosg) {
+		mz0380_mst3367_output_diag(dev, "before START");
+		mz0380_mst3367_apply_csc_mode(dev);
+	}
+
+	/*
+	 * M82: the Windows tail. Both encoder streams, then POST_PROC. ep.ko
+	 * routes 0x2d (45) and 0x31 (49) to a bare sysfs_notify("epint"), the
+	 * same wake op 0x06 performs, so this sequence is itself the kick and
+	 * Windows never sends 0x06 on the capture path.
+	 */
+	if (mz0380_win_seq && !mz0380_stream_nosg) {
+		ret = mz0380_stream_configure_encoder(dev, fps, 0);
+		if (ret)
+			goto err_events;
+		if (mz0380_enc_sub) {
+			ret = mz0380_stream_configure_encoder(dev, fps, 1);
+			if (ret)
+				goto err_events;
+		}
+		ret = mz0380_stream_post_proc(dev, fps);
+		if (ret)
+			goto err_events;
+	}
+
+	/*
+	 * M128: the baseline (win_seq=0) never sends 0x31 at all, so the only
+	 * way to reach fake_frame_off on the path that actually renders is to
+	 * send it here. It has to precede op 0x06: the standby-thread guard runs
+	 * inside 0x06's handler (new EncodingGroup -> on_start_thread -> Start ->
+	 * init_func), and it reads preview_params_settings[ch].byte[0x0a] once,
+	 * at pthread_create time. Nothing is sent unless the knob is set, so the
+	 * default baseline is byte-identical to before.
+	 */
+	if (!mz0380_win_seq && !mz0380_stream_nosg &&
+	    (mz0380_fake_frame_off || mz0380_post_proc)) {
+		ret = mz0380_stream_post_proc(dev, fps);
+		if (ret)
+			goto err_events;
+		/* M128b: see mz0380_post_proc_gap_ms. 0x06 otherwise lands on
+		 * the doorbell 9 us later, while the card is still inside the
+		 * 0x31 handler. */
+		if (mz0380_post_proc_gap_ms) {
+			pr_info("%s: stream start: waiting %u ms before op 0x06 (M128b cadence test)\n",
+				dev->name, mz0380_post_proc_gap_ms);
+			msleep(mz0380_post_proc_gap_ms);
+		}
+	}
+
+	/*
 	 * op 0x06 is FIRE-AND-FORGET. Unlike INIT/SET_VIC, its ep.ko handler
 	 * (@0x1854, M22) only does sysfs_notify(epint) to wake tinyvenc5 - it
 	 * posts NO mailbox completion (no STATUS bit0, no EVENT bit11). Waiting
@@ -1172,19 +1497,14 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * Frame arrival is confirmed downstream by the MSI/outbound-ATU path, not
 	 * by a command ack.
 	 */
-	/*
-	 * M73: photograph the receiver's output stage on both sides of START.
-	 * If the VIC never sees a clock, the evidence is here and nowhere the
-	 * host can otherwise reach - the card's own log is on a serial port we
-	 * do not have.
-	 */
-	if (!mz0380_stream_nosg)
-		mz0380_mst3367_output_diag(dev, "before START");
-
-	ret = mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
-				  NULL, 0, NULL, 0);
-	pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
-		dev->name, ret);
+	if (!mz0380_win_seq || mz0380_win_start_op6) {
+		ret = mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
+					  NULL, 0, NULL, 0);
+		pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
+			dev->name, ret);
+	} else {
+		ret = 0;
+	}
 
 	if (!mz0380_stream_nosg) {
 		msleep(500);   /* let the encoder settle into its capture loop */
@@ -1193,6 +1513,9 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	dev->stream_head = 0;
 	if (ret)
 		goto err_events;
+
+	/* M111: last, so it only runs once the stream is genuinely started. */
+	mz0380_poll_drain_start(dev);
 	return 0;
 
 err_events:
@@ -1207,8 +1530,7 @@ err_events:
 	 * the failed-start unwind.
 	 */
 	if (vic_fired) {
-		int stop_ret = mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
-						NULL, 0, NULL, 2000);
+		int stop_ret = mz0380_stream_stop_all(dev, 2000);
 
 		pr_warn("%s: stream start failed (%d) after SET_VIC; best-effort STOP_STREAMING ret=%d\n",
 			dev->name, ret, stop_ret);
@@ -1234,13 +1556,19 @@ EXPORT_SYMBOL_GPL(mz0380_dma_start);
 
 static void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 {
+	/*
+	 * M111: stop the poll-drain before anything touches buffer ownership -
+	 * it copies out of the stream buffers and re-poisons them, exactly the
+	 * race the extent watcher is frozen for below.
+	 */
+	mz0380_poll_drain_stop(dev);
+
 	if (verbose)
 		/* Freeze the diagnostic reader before changing buffer ownership. */
 		mz0380_extent_watch_stop(dev);
 
 	if (dev->dma_armed)
-		mz0380_send_command(dev, MZ0380_CMD_STOP_STREAMING,
-				    NULL, 0, NULL, 2000);
+		mz0380_stream_stop_all(dev, 2000);
 
 	if (verbose) {
 		/*
@@ -1422,6 +1750,198 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 
 repoison:
 	mz0380_frame_buffer_repoison(dev, idx);
+}
+
+/*
+ * M111: the poll-drain fallback.
+ *
+ * The card writes a whole frame and then never tells us. mz0380_drain_frame_snapshot()
+ * already knows how to turn "buffer idx holds a frame" into a vb2 delivery - it
+ * infers the length from the poison suffix, copies, and re-poisons. The only
+ * thing missing on the real path is something to call it, because the
+ * completion event that normally supplies the token has never fired.
+ *
+ * So synthesise the snapshot. token = the buffer index, timestamp = now,
+ * everything else zero (the drain only reads those fields for diagnostics).
+ * Re-poisoning inside the drain is what makes this idempotent: a frame is
+ * picked up on the first pass that sees it and cannot be delivered twice.
+ *
+ * mz0380_infer_frame_length() returns -ENODATA for a fully-poisoned buffer, so
+ * it doubles as the "is there anything here" test and no separate dirty check
+ * is needed.
+ */
+static int mz0380_poll_drain_thread(void *data)
+{
+	struct mz0380_dev *dev = data;
+	unsigned long next_kick = jiffies;
+	unsigned int delivered = 0;
+	unsigned int kicks = 0;
+
+	while (!kthread_should_stop()) {
+		bool handled = false;
+		bool kick_due = false;
+		unsigned int idx;
+
+
+		for (idx = 0; idx < MZ0380_STREAM_NR_BUFS; idx++) {
+			struct mz0380_frame_event snapshot = {};
+			size_t want;
+			size_t len;
+
+			if (!READ_ONCE(dev->streaming))
+				break;
+			if (mz0380_infer_frame_length(dev, idx, &len) || !len)
+				continue;
+
+			/*
+			 * M115: only deliver a COMPLETE frame. The poison
+			 * boundary marks how far the DMA has got, not that it
+			 * has finished, so polling a burst in flight yields a
+			 * torn prefix - the first run delivered 794368 bytes
+			 * and then the real 3110400, and ffplay rejected the
+			 * fragment. The nosg path has always had this check
+			 * (mz0380_nosg_frame_landed); the real path needs it
+			 * for the same reason.
+			 *
+			 * The expected size is exact and known: the card
+			 * writes width*height*3/2 of 4:2:0. Anything short is
+			 * a burst still in progress - leave it alone and it
+			 * will be complete on a later pass.
+			 */
+			want = (size_t)dev->capture.source_width *
+			       dev->capture.source_height * 3 / 2;
+			if (want && len < want) {
+				pr_info_ratelimited("%s: poll-drain: buf %u holds %zu of %zu bytes - DMA still in flight, waiting\n",
+						    dev->name, idx, len, want);
+				continue;
+			}
+
+			snapshot.token = idx;
+			snapshot.timestamp_ns = ktime_get_ns();
+			pr_info_ratelimited("%s: poll-drain: buf %u holds %zu bytes with no completion event; delivering\n",
+					    dev->name, idx, len);
+			mz0380_drain_frame_snapshot(dev, &snapshot);
+			delivered++;
+			handled = true;
+		}
+
+		/*
+		 * M117: hand the slot back. mz0380_enc_stat_ack()'s own comment
+		 * says it outright - "without this ack the card's encoder
+		 * produces exactly one bitstream and then skips every
+		 * subsequent frame" - which is precisely the cadence we
+		 * measured: one frame per stream, buffers 1-3 never touched.
+		 *
+		 * mz0380_dma_drain_video() acks after its drain batch, but the
+		 * poll path calls mz0380_drain_frame_snapshot() directly and so
+		 * skipped it. The card sets enc_stat and never clears it
+		 * itself; the driver clears it once at stream start (M40) and,
+		 * until now, never again on this path.
+		 */
+		if (handled) {
+			mz0380_enc_stat_ack(dev);
+			/*
+			 * M118: and the other half of what a real completion
+			 * would have done. enc_stat alone (M117) did not move
+			 * the cadence off one frame, so the slot handshake is
+			 * not the gate. This re-arms the card's one-shot
+			 * completion credit, which nothing has ever restored on
+			 * this path because the ISR that normally does it runs
+			 * only for an event that never fires.
+			 */
+			if (mz0380_poll_drain_credit)
+				mz0380_credit_rearm(dev);
+
+			/*
+			 * M120: ask for the NEXT frame, once per frame we just
+			 * consumed. tinyvenc5 delivers one frame per
+			 * sysfs_notify on /sys/vpl_pciep/epint and op6's ep.ko
+			 * handler does nothing but that notify (M22).
+			 *
+			 * M119 fired this free-running from stream start and it
+			 * was WORSE than not firing at all - zero frames, and
+			 * the receiver dropped its lock. Our own comment at the
+			 * op6 send site says why: op6 must land after the
+			 * freshly forked tinyvenc5 has exec'd and consumed the
+			 * SET_VIC it reads first, "rather than racing its
+			 * start-up read". A timer starting at t=0 races exactly
+			 * that, 62 times a second.
+			 *
+			 * Kicking only after a delivered frame makes the race
+			 * impossible: the first kick cannot happen until the
+			 * first frame has already arrived. op6_kick_ms is now a
+			 * minimum spacing, not a period.
+			 */
+			kick_due = true;
+		}
+
+		/*
+		 * M126: keep kicking after the FIRST delivery, not only after
+		 * each one. A kick that fires only inside the handled branch
+		 * gives exactly one kick per frame, so a one-frame stream is a
+		 * one-kick experiment - which cannot tell "the card ignored the
+		 * wake-up" apart from "we only ever asked once". The M119/M120
+		 * hazard was kicking BEFORE the first frame, racing tinyvenc5's
+		 * start-up read of SET_VIC; gating on delivered > 0 keeps that
+		 * impossible while letting the wake-up repeat.
+		 */
+		if (mz0380_kick_repeat && delivered)
+			kick_due = true;
+
+		if (kick_due && mz0380_op6_kick_ms &&
+		    time_after_eq(jiffies, next_kick)) {
+			/*
+			 * M126: 0x06 by default; 0x2f / 0x09 are the same
+			 * epint notify without the audio_ctrl side effect
+			 * (M125).
+			 */
+			int kick_ret = mz0380_send_command(dev,
+							   mz0380_kick_opcode & 0xff,
+							   NULL, 0, NULL, 0);
+
+			if (!kicks)
+				pr_info("%s: poll-drain: first kick op 0x%02x ret=%d\n",
+					dev->name, mz0380_kick_opcode & 0xff,
+					kick_ret);
+			kicks++;
+			next_kick = jiffies +
+				msecs_to_jiffies(mz0380_op6_kick_ms);
+		}
+
+		msleep_interruptible(max_t(unsigned int, 1,
+					   mz0380_poll_drain_ms));
+	}
+
+	pr_info("%s: poll-drain stopped after %u deliveries, %u kicks (op 0x%02x)\n",
+		dev->name, delivered, kicks, mz0380_kick_opcode & 0xff);
+	return 0;
+}
+
+static void mz0380_poll_drain_start(struct mz0380_dev *dev)
+{
+	struct task_struct *task;
+
+	if (!mz0380_poll_drain_ms || dev->poll_task || mz0380_stream_nosg)
+		return;
+
+	task = kthread_run(mz0380_poll_drain_thread, dev,
+			   "mz0380-polldrain/%u", dev->nr);
+	if (IS_ERR(task)) {
+		pr_warn("%s: poll-drain thread failed to start (%ld)\n",
+			dev->name, PTR_ERR(task));
+		return;
+	}
+	dev->poll_task = task;
+	pr_info("%s: poll-drain armed every %u ms - frames the card has already written will be delivered without a completion event (M111)\n",
+		dev->name, mz0380_poll_drain_ms);
+}
+
+static void mz0380_poll_drain_stop(struct mz0380_dev *dev)
+{
+	if (!dev->poll_task)
+		return;
+	kthread_stop(dev->poll_task);
+	dev->poll_task = NULL;
 }
 
 void mz0380_dma_drain_video(struct mz0380_dev *dev)

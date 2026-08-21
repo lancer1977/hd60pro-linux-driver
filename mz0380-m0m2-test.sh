@@ -7,12 +7,12 @@
 #   responds pre-boot (i.e. is NOT stuck at 0xffffffff). This validates the
 #   RE finding that the mailbox lives in BAR0 before committing to an upload.
 #
-#   Stage M2 (writes to the card): flip firmware_upload=1 and watch the
-#   BEGIN/COMMIT mailbox handshake + boot result. Only run after M0 looks sane.
+#   Stage M2 is GONE. It attempted a firmware upload, and this driver has no
+#   upload path: the card boots its own flash image. Do not re-add it.
 #
 # Usage:
 #   sudo ./mz0380-m0m2-test.sh m0     # read-only observability
-#   sudo ./mz0380-m0m2-test.sh m2     # attempt firmware upload
+#   sudo ./mz0380-m0m2-test.sh m4     # bus master + MSI handshake
 #
 set -u
 cd "$(dirname "$0")"
@@ -48,34 +48,17 @@ m0)
 	echo
 	echo "[M0] KEY CHECK: in the state dump above, look at the bar0[...] mailbox"
 	echo "     lines. If DOORBELL/STATUS/RESULT/PARAM read back as 0xffffffff,"
-	echo "     the BAR0 low region is asleep pre-boot and upload will not work"
-	echo "     yet. If they read structured values (0x0, small ints), the"
-	echo "     mailbox is live and M2 can proceed."
+	echo "     the BAR0 low region is still asleep - the card has not finished"
+	echo "     booting its flash image. If they read structured values (0x0,"
+	echo "     small ints), the mailbox is live."
 	echo "[M0] leaving module loaded for inspection. 'sudo rmmod mz0380' when done."
-	;;
-m2)
-	echo "[M2] building..."; make -s || exit 1
-	unload; load_deps
-	echo "[M2] loading with firmware_upload=1 (writes BAR0 mailbox + blob)..."
-	dmesg -C 2>/dev/null || true
-	insmod "$MOD" procfs_verbosity=2 snapshot_profile=6 firmware_upload=1 enable_video=1
-	rc=$?
-	sleep 2
-	echo "===== dmesg ====="
-	dmesg | grep -iE 'mz0380|firmware|BEGIN|COMMIT|boot|WARNING|Oops|BUG' \
-		| grep -vE 'Modules linked in|Unloaded tainted' | tail -40
-	echo "insmod rc=$rc"
-	dump
-	echo
-	echo "[M2] PASS if dmesg shows a firmware version / boot success and a BAR0"
-	echo "     read returns something other than 0xffffffff afterwards."
 	;;
 m4)
 	echo "[M4] building..."; make -s || exit 1
 	unload; load_deps
-	echo "[M4] loading firmware_upload=1 dma_handshake=1 (bus master + MSI, NO ring programming)..."
+	echo "[M4] loading dma_handshake=1 (bus master + MSI, NO ring programming)..."
 	dmesg -C 2>/dev/null || true
-	insmod "$MOD" procfs_verbosity=2 snapshot_profile=6 firmware_upload=1 \
+	insmod "$MOD" procfs_verbosity=2 snapshot_profile=6 \
 		dma_handshake=1 enable_video=1
 	rc=$?
 	sleep 2
@@ -89,5 +72,5 @@ m4)
 	echo "     appears; then hdmi signal should read present/absent."
 	;;
 *)
-	echo "unknown stage '$STAGE' (use m0, m2 or m4)"; exit 1;;
+	echo "unknown stage '$STAGE' (use m0 or m4; m2 was the upload stage and is gone)"; exit 1;;
 esac

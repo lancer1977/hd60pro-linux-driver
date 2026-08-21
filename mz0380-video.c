@@ -267,10 +267,29 @@ static u32 mz0380_sizeimage(const struct mz0380_capture_state *capture)
  * captured by the polling loop in mz0380-dma.c - not H.264. The node
  * advertises whichever format the current mode actually produces.
  */
+/*
+ * M111: the real path delivers RAW frames too, not H.264, whenever the
+ * poll-drain is doing the delivering. buf0 receives exactly
+ * 1920*1080*3/2 = 3110400 bytes of 4:2:0 - the card's own splash - and the
+ * encoder never produces a bitstream for it. Advertising H.264 there would
+ * hand userspace 3 MB of planar YUV labelled as a bytestream, and sizing the
+ * plane from the bitrate (12 Mbit/8 = 1.5 MB) would make the drain reject
+ * every frame as "does not fit vb2 plane" before it got that far.
+ *
+ * So both the format and the plane size follow the same switch.
+ */
+static u32 mz0380_raw_frame_size(const struct mz0380_capture_state *capture)
+{
+	return capture->width * capture->height * 3 / 2;
+}
+
 static u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
 {
 	if (mz0380_stream_nosg)
 		return MZ0380_NOSG_NV12_SIZEIMAGE;
+	if (mz0380_poll_drain_ms)
+		return max(mz0380_raw_frame_size(&dev->capture),
+			   mz0380_sizeimage(&dev->capture));
 	return mz0380_sizeimage(&dev->capture);
 }
 
@@ -284,6 +303,12 @@ static void mz0380_fill_pix_format(struct mz0380_dev *dev,
 		pix->height = MZ0380_NOSG_NV12_HEIGHT;
 		pix->pixelformat = V4L2_PIX_FMT_NV12;
 		pix->bytesperline = MZ0380_NOSG_NV12_WIDTH;
+	} else if (mz0380_poll_drain_ms) {
+		/* M111: real geometry, raw payload. */
+		pix->width = dev->capture.width;
+		pix->height = dev->capture.height;
+		pix->pixelformat = V4L2_PIX_FMT_NV12;
+		pix->bytesperline = dev->capture.width;
 	} else {
 		pix->width = dev->capture.width;
 		pix->height = dev->capture.height;
@@ -340,6 +365,11 @@ static int mz0380_enum_fmt_vid_cap(struct file *file, void *priv,
 		f->flags = 0;
 		strscpy(f->description, "NV12 raw (fake-frame path)",
 			sizeof(f->description));
+	} else if (mz0380_poll_drain_ms) {
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+		f->flags = 0;
+		strscpy(f->description, "NV12 raw (poll-drain path)",
+			sizeof(f->description));
 	} else {
 		f->pixelformat = V4L2_PIX_FMT_H264;
 		f->flags = V4L2_FMT_FLAG_COMPRESSED;
@@ -379,6 +409,8 @@ static int mz0380_try_fmt_vid_cap(struct file *file, void *priv,
 
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+	if (mz0380_poll_drain_ms)
+		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
 
 	mz0380_apply_try_fmt(dev, f);
 	dev->capture = saved;
@@ -404,6 +436,8 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+	if (mz0380_poll_drain_ms)
+		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
 
 	mode = mz0380_find_mode(f->fmt.pix.width, f->fmt.pix.height);
 	interval = mz0380_find_interval(mode->width, mode->height,
@@ -732,6 +766,24 @@ static int mz0380_start_streaming(struct vb2_queue *vq, unsigned int count)
 				 live.bt.width, live.bt.height,
 				 live.bt.interlaced ? 'i' : 'p',
 				 mz0380_signal_cache_ms);
+			ret = 0;
+		} else if (ret && mz0380_stream_without_signal) {
+			/*
+			 * M113: no source, on purpose. Arm at 1080p60 so the
+			 * card runs its normal capture path and falls back to
+			 * its own no-signal splash - which is what Windows
+			 * delivers to OBS in this exact situation.
+			 */
+			dev->capture.source_width = 1920;
+			dev->capture.source_height = 1080;
+			dev->capture.source_fps = 60;
+			dev->capture.source_interlaced = false;
+			dev->capture.timeperframe.numerator = 1;
+			dev->capture.timeperframe.denominator = 60;
+			dev->signal_locked = false;
+			dev_info(&dev->pci->dev,
+				 "no HDMI signal locked (%d) - arming anyway at 1920x1080p60 [stream_without_signal=1]; expect the card's no-signal splash, not source pixels\n",
+				 ret);
 			ret = 0;
 		} else if (ret) {
 			dev_warn(&dev->pci->dev,

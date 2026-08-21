@@ -21,7 +21,7 @@
 #
 # Run as root with the module loaded:
 #   modprobe videodev videobuf2-v4l2 videobuf2-dma-sg v4l2-dv-timings snd-pcm
-#   insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 procfs_verbosity=2
+#   insmod ./mz0380.ko dma_handshake=1 procfs_verbosity=2
 
 set -u
 CMD=/proc/mz0380-cmd

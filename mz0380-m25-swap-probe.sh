@@ -24,7 +24,7 @@ run_one() {
 	modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings \
 		snd-pcm || { echo "modprobe deps failed"; exit 1; }
 	dmesg -C
-	insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
+	insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
 		enable_video=1 procfs_verbosity=2 stream_nosg=1 \
 		buf_pair_swap=$swap || { echo "insmod failed"; exit 1; }
 	sleep 3

@@ -8,7 +8,7 @@
 # Stages:
 #   1  build         - module compiles
 #   2  probe-safe    - module loads, /proc/mz0380* present, BARs mapped
-#   3  firmware      - request_firmware() succeeds; firmware_upload=1
+#   3  firmware      - request_firmware() succeeds;
 #                      reaches MZ0380_FW_STATE_READY
 #   4  bar0-wake     - post-firmware, BAR0 0x0000 != 0xffffffff
 #                      (Xilinx fabric is alive)
@@ -38,7 +38,7 @@ HDMI_SOURCE_NOTE="(plug HDMI source in when prompted)"
 DRY_RUN="${DRY_RUN:-0}"
 KEEP_LOADED="${KEEP_LOADED:-0}"
 STAGES="${STAGES:-all}"
-EXPECTED_FW="${EXPECTED_FW:-/lib/firmware/mz0380/MZ0380.HD.HEX}"
+EXPECTED_FW="${EXPECTED_FW:-/lib/firmware/mz0380/MZ0380.FW.TXT}"
 CAPTURE_SECONDS="${CAPTURE_SECONDS:-5}"
 
 usage() {
@@ -143,15 +143,15 @@ stage_probe_safe() {
 }
 
 stage_firmware() {
-	hdr "3. firmware"
+	hdr "3. firmware handshake (nothing is uploaded)"
 	[[ -f "$EXPECTED_FW" ]] \
-		|| abort "missing firmware blob at $EXPECTED_FW (see README)"
-	ok "firmware blob present"
+		|| abort "missing version sidecar at $EXPECTED_FW (see README)"
+	ok "version sidecar present"
 
 	ensure_unloaded
 	run sudo insmod "$MODULE" procfs_verbosity=2 \
-		enable_video=1 firmware_upload=1 \
-		|| abort "insmod (firmware_upload=1) failed"
+		enable_video=1 \
+		|| abort "insmod () failed"
 
 	# Watch dmesg for fw state
 	sleep 3
@@ -190,7 +190,7 @@ stage_irq() {
 
 	ensure_unloaded
 	run sudo insmod "$MODULE" procfs_verbosity=2 \
-		enable_video=1 firmware_upload=1 enable_dma=1 \
+		enable_video=1 enable_dma=1 \
 		|| abort "insmod (enable_dma=1) failed"
 
 	sleep 5
@@ -279,7 +279,7 @@ stage_alsa_capture() {
 	if ! arecord -L 2>/dev/null | grep -q mz0380; then
 		ensure_unloaded
 		run sudo insmod "$MODULE" procfs_verbosity=2 \
-			enable_video=1 firmware_upload=1 \
+			enable_video=1 \
 			enable_dma=1 enable_audio=1 \
 			|| abort "insmod (enable_audio=1) failed"
 		sleep 2

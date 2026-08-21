@@ -37,10 +37,10 @@ fuser -k /dev/video0 2>/dev/null
 rmmod mz0380 2>/dev/null
 sleep 1
 modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
-insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
+insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
 	enable_video=1 procfs_verbosity=2 dma_iova_remap=1 \
 	edidhunt_max_regs="$MAXREGS" || { echo "insmod failed"; exit 1; }
-echo "waiting for firmware upload + boot..."
+echo "waiting for the card to finish booting its own flash image..."
 sleep 25
 
 dmesg -C

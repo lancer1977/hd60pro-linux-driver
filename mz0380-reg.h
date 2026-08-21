@@ -99,8 +99,6 @@
 #define MZ0380_MB_EVT_PAYLOAD1         0x44
 #define MZ0380_MB_EVT_PAYLOAD2         0x48
 #define MZ0380_MB_EVT_PAYLOAD3         0x4c    /* payload for EVENT[23:16] events  */
-#define MZ0380_MB_FW_BUFFER            0x60    /* firmware blob aperture (BAR0)    */
-
 #define MZ0380_MB_FIRE                 0x800   /* doorbell value to fire a command */
 #define MZ0380_MB_INT_ACK              0x400   /* doorbell value acking an event   */
 #define MZ0380_MB_RESET                MZ0380_MB_INT_ACK /* old name, same value   */
@@ -127,10 +125,12 @@
 #define MZ0380_REG_PARAM_MAX           11
 
 /* Opcodes (RE-confirmed from DownloadFirmware/DownloadBaseFirmware) */
-#define MZ0380_CMD_BEGIN_FW_DL          0x0b  /* begin main (HD) firmware, param=size */
-#define MZ0380_CMD_COMMIT_FW            0x0c  /* commit/execute main firmware         */
-#define MZ0380_CMD_BEGIN_BASE_FW_DL     0x0e  /* begin base firmware, param=size      */
-#define MZ0380_CMD_COMMIT_BASE_FW       0x0f  /* commit/execute base firmware         */
+/*
+ * Opcodes 0x0b/0x0c/0x0e/0x0f are the card's firmware-download path. They are
+ * deliberately NOT defined here. The card boots its own flash image and this
+ * driver has no upload path at all - see the header of mz0380-fw.c. Do not
+ * re-add them.
+ */
 
 /*
  * Peripheral register file access (RE-confirmed, FUN_1402777e4 /
@@ -173,6 +173,44 @@
  */
 #define MZ0380_CMD_SET_VIC_PARAMS       0x29  /* 41: select input + WxH/fps    */
 #define MZ0380_CMD_SET_ENC_PARAMS       0x2d  /* 45: masked H.264 encoder config */
+/*
+ * M82 (Windows collect-2026-08-19, func 0x14028a248): POST_PROC. Built and
+ * sent immediately after the two SET_ENC_PARAMS calls, with count = 7 (opcode
+ * + 5 payload words) and flag = 1 (no ACK poll). Payload, byte-exact from the
+ * store sequence at 0x14028c8ba and confirmed against the driver's own printf
+ * "mask = %08X, i = %d, fps = %d, skip = %d, avg = %d, di = %d, osd = %d,
+ * mirror = %d, flip = %d":
+ *     [4..7]   u32 mask = 0x1F   (all five fields valid)
+ *     [8]  i   [9]  fps   [10] skip   [11] avg
+ *     [12] di  [13] board_flag_a     [14] board_flag_b   [15] osd
+ *     [16] flip  [17] mirror  [18] board_flag_c  [19] 0
+ *     [20..23] 0
+ * Both board flags and the [18] byte are zero on the 0x1C/0xFA (Elgato) board:
+ * every branch that sets them tests a board id this card does not have, or a
+ * context flag that read zero in all four traces. So the packet the HD60 Pro
+ * actually receives is { 0x1F, fps<<8, 0x01, 0, 0 } - di = 1.
+ *
+ * ep.ko routes op 49 (0x31) to "notify epint" and nothing else, i.e. it is a
+ * pure doorbell that wakes the encoder. Windows never sends START_STREAMING
+ * (0x06) on the capture path at all; 0x2d and 0x31 are what kick tinyvenc.
+ *
+ * M128: the card's own name for 0x31 is SET_PREVIEW_PARAMS, and tinyvenc5's
+ * printf at 0xf570 gives every field, which supersedes the guessed labels
+ * above where the two disagree:
+ *     [4..7] mask   [8] ch   [9] fps   [0x0a] skip   [0x0b] avg
+ *     [0x0c] die_en ("di")   [0x0d] preview_off
+ *     [0x0e] fake_frame_off  ("board_flag_b" above - it is not a board flag)
+ *     [0x0f] preview_no_osd ("osd")
+ *     [0x10] mirror   [0x11] flip   [0x12] hw_d
+ * (the Windows read had mirror/flip the other way round; the card's printf
+ * wins.) ep.ko's payload length for 0x31 is 20, so [20..23] never arrive.
+ *
+ * fake_frame_off is the gate on EncodingGroup::fake_frame_process, the thread
+ * that draws NOSG_LOGO_Y. Windows sends 0 there, i.e. retail leaves the
+ * standby splash armed too. See mz0380_fake_frame_off in mz0380-core.c.
+ */
+#define MZ0380_CMD_POST_PROC            0x31  /* 49: SET_PREVIEW_PARAMS        */
+#define MZ0380_POST_PROC_MASK           0x1f
 #define MZ0380_CMD_GPIO_READ            0x14  /* 20: read GPIO bitmap          */
 #define MZ0380_CMD_GPIO_SET             0x15  /* 21: set GPIO data (prop 941)  */
 #define MZ0380_CMD_GPIO_DIR             0x17  /* 23: set GPIO direction (940)  */
@@ -328,6 +366,24 @@
 #define MZ0380_CMD_STOP_STREAMING       0x07  /* was 0x2a (wrong) - M33        */
 
 /*
+ * LOAD_FILES. M76: video_capture_mgr's op-0x6e handler (vcm FUN_0000aa3c) is
+ * an arbitrary-offset 16-byte read/write of ONE fixed path on the card,
+ * /mnt/flash/PIC_ENC:
+ *
+ *   struct[4..5]  = is_write   (0 = read the card -> host, 1 = write)
+ *   struct[6..7]  = byte offset (fseek, 16-bit)
+ *   struct[8..23] = the 16 data bytes; on a read vcm pwrite()s the whole
+ *                   44-byte command back, so they come home in PARAM1..PARAM4
+ *
+ * The card boots the rootfs WE upload (mz0380-fw.c ships the whole
+ * yuan_demo_sdi/ tar), so redirecting the card's stdout into that file turns
+ * this opcode into the card's console over PCIe - no UART, no board access.
+ * This define is the read half; nothing in-tree writes the file.
+ */
+#define MZ0380_CMD_LOAD_FILES           0x6e  /* 110: PIC_ENC 16B r/w - M76    */
+#define MZ0380_LOAD_FILES_CHUNK         16
+
+/*
  * SET_AIC_PARAMS. Field offsets recovered from video_capture_mgr's printf
  * ("Set AIC PARAMS-> bits, channel_num, mono, freq, frame_num_of_period,
  * period_num_of_buffer, on") by following the ARM vararg registers/stack, and
@@ -344,6 +400,47 @@
  * START_STREAMING and start completing frames (M33).
  */
 #define MZ0380_CMD_SET_AIC_PARAMS       0x2a  /* 42: audio params + on flag    */
+
+/*
+ * M128: tinyvenc5's complete dispatch table, read straight off the switch at
+ * main+0x804 (jump table base 0xe6e0, index = cmd - 6, default 0xe654 = the
+ * top of the poll loop). Names are the card's own, from the format strings
+ * each handler prints; lengths are ep.ko's rodata[0xa0 + cmd] copy size.
+ *
+ *   cmd   handler   len  name
+ *   0x06  0xe954     8   START_STREAMING - news the EncodingGroups, then one
+ *                        pthread(on_start_thread) per channel -> Start()
+ *   0x09  0xe93c     8   bare ACK: pwrite(epint, payload, 44). No side effect
+ *                        at all, which is exactly why it works as a wake-up
+ *   0x29  (pre-loop) 40  SET_VIC_PARAMS - read once BEFORE the loop; the
+ *                        in-loop table maps 0x29 to the default, so a second
+ *                        one is silently ignored
+ *   0x2a  0xed48    20   SET_AIC_PARAMS (audio: i2s/audio counts). Video-inert
+ *   0x2d  0xebdc    44   SET_ENC_PARAMS
+ *   0x2f  0xebdc    44   SET_ENC_PARAMS_POST - SAME handler as 0x2d; the only
+ *                        difference is which of the two banner strings it
+ *                        prints and a "sub"/"main" tag. H.264 knobs only
+ *                        (gop/qp/profile/bitrate/crop/resize): it cannot
+ *                        affect capture, which retires M125's blind flood
+ *   0x31  0xef24    20   SET_PREVIEW_PARAMS (see MZ0380_CMD_POST_PROC)
+ *   0x50  0xeb8c    44   SET_OSD - on-screen text
+ *   0x51  0xea78    20   SET_BAR - a colour-bar overlay rect, per (ch, line):
+ *                        [4]=ch [5]=line [6..7]=is_show [8..9]=x [10..11]=y
+ *                        [12..13]=w [14..15]=h [0x10]=update [0x11..0x13]=y,u,v
+ *                        clamped against preview_settings[ch] w/h. Overlay only
+ *   0x52  0xea34     7   SET_VIDEO_INVISIBLE - [4]=ch [5]=insert [6]=load
+ *   0x62  0xe854    12   SET_LOGO - [4]=ch [5]=is_show [6]=reload
+ *                        [7]=pic_order [8..9]=x [10..11]=y. Overlay only
+ *
+ * Anything else falls through to the default and is dropped without a word.
+ * Of the four the M127 handoff listed as worth decoding, three (0x2f, 0x51,
+ * 0x62) turn out to be encoder-side or cosmetic and are now closed. The
+ * fourth, 0x31, is the one that matters.
+ */
+#define MZ0380_CMD_SET_ENC_PARAMS_POST  0x2f  /* 47: same handler as 0x2d      */
+#define MZ0380_CMD_SET_BAR              0x51  /* 81: colour-bar overlay rect   */
+#define MZ0380_CMD_SET_VIDEO_INVISIBLE  0x52  /* 82: insert/load               */
+#define MZ0380_CMD_SET_LOGO             0x62  /* 98: logo overlay              */
 
 /* BAR0 frame-completion status window (M17). EVENT is MZ0380_MB_EVENT (0x30). */
 #define MZ0380_MB_FRAME_TOKEN           0x40  /* (token & 7) = buffer index    */
@@ -403,12 +500,6 @@
  * QUERY_SIGNAL=0x20. There is no card->host signal query.
  */
 #define MZ0380_CMD_RESET                0xFF  /* CHECKME */
-
-/*
- * Firmware download (RE-confirmed): there is NO chunked seq/ack protocol.
- * The whole blob is written word-by-word into the BAR0 aperture at
- * MZ0380_MB_FW_BUFFER, bracketed by BEGIN and COMMIT mailbox commands.
- */
 
 /* ====================================================================
  *  Section B : BAR0 XDMA controller (post-firmware)

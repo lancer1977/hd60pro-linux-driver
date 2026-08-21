@@ -233,15 +233,129 @@ MODULE_PARM_DESC(card, "card type");
  * Bring-up gates. All default OFF so existing probe-safe behaviour
  * survives. Flip them on incrementally as each phase is verified.
  *
- *   firmware_upload=1   load /lib/firmware/mz0380/MZ0380.HD.HEX
  *   enable_dma=1        alloc rings, enable bus master, request MSI
  *   enable_audio=1      register an ALSA snd_card alongside V4L2
+ *
+ * There is no firmware_upload parameter and there must never be one again:
+ * the card boots its own flash image and mz0380-fw.c only handshakes with it.
+ * The old inert compatibility no-op was removed along with the scripts that
+ * passed it.
  */
-bool mz0380_firmware_upload_enabled;
-module_param_named(firmware_upload, mz0380_firmware_upload_enabled,
-		   bool, 0444);
-MODULE_PARM_DESC(firmware_upload,
-		 "load and upload the onboard ARM firmware (mz0380/MZ0380.HD.HEX); off by default until protocol is verified");
+/*
+ * GPIO pin 8, the companion reset/power strap. mz0380_mst3367_reset() has
+ * always finished by driving it LOW and leaving it there.
+ *
+ * M109: pin 9 next door is the MST3367 reset and is documented ACTIVE-LOW - we
+ * release it to 1. If pin 8 follows the same convention then driving it 0 holds
+ * the companion device in reset for the entire session, which is a complete
+ * explanation for the card's HDMI passthrough output being dead - no picture at
+ * all on a monitor plugged into the card, not even a no-signal message.
+ *
+ * Nobody chose 0 deliberately; it came from the original bring-up sequence and
+ * has never been varied. 0 and 1 are both real levels, so MZ0380_RX_STRAP_LEAVE
+ * is the third value meaning "do not drive pin 8 at all".
+ */
+/*
+ * M111: deliver frames the card has already written, without waiting for a
+ * completion event that has never once fired.
+ *
+ * The real capture path delivers only from the MSI-driven drain. Every run this
+ * project has ever made reports frame_events=0 and EVENT[0x30]=0 - the card
+ * DMAs a complete 1920x1080 4:2:0 frame into buf0 (760 contiguous pages ending
+ * at 0x2f7000 == 1920*1080*3/2) and then nothing tells the host it is there, so
+ * vb2 is never fed and userspace reads 0 bytes. The nosg path was written as a
+ * poller for exactly this reason (M41); the real path never got the same
+ * treatment.
+ *
+ * Nonzero starts a kthread that scans the stream buffers on this interval and
+ * hands any completed frame to the ORIGINAL drain path
+ * (mz0380_drain_frame_snapshot), which infers the length from the poison
+ * suffix, copies into vb2 and re-poisons - so a frame is delivered once and
+ * only once, and the event-driven path stays byte-for-byte unchanged.
+ *
+ * Default 0 (off) so it bisects cleanly against every earlier result.
+ */
+/*
+ * M118: fire the card's credit re-arm after a poll-drained frame.
+ *
+ * The completion path's ISR ends with BAR5[0xdc]=2, EVENT=0, doorbell 0x400 -
+ * which drives the card's pciep_isr_clrint and sets msi_enable=1 again. That
+ * one-shot credit is what lets the card raise the NEXT completion. It has never
+ * run in this project, because it lives in an interrupt handler for an event
+ * that never fires.
+ *
+ * The poll-drain acks enc_stat (M117) but that changed nothing, so the slot
+ * handshake is not the gate. This is the other half of what a real completion
+ * would have done, and it is the last piece of the ISR the poll path does not
+ * reproduce.
+ */
+/*
+ * M119: re-notify the on-card encoder, once per frame.
+ *
+ * ep.ko's op 0x06 handler (@0x1854, M22) does ONE thing: sysfs_notify() on
+ * /sys/vpl_pciep/epint. tinyvenc5 blocks on that node, wakes, DMAs a frame, and
+ * blocks again. So one op6 buys exactly one frame - which is precisely the
+ * cadence measured all session, and why the nosg path respawns the encoder per
+ * frame (M39) and burns the card's spawn budget doing it.
+ *
+ * op6 is fire-and-forget (no mailbox completion, M22) and does NOT fork an
+ * encoder - SET_VIC does that. Re-sending it is therefore cheap and costs no
+ * spawn budget. Every host-side ack has now been eliminated as the cadence gate
+ * (op8/wency_ready M93+M116, enc_stat M117, completion credit M118); this is the
+ * card-side wake-up those acks were standing in for.
+ */
+unsigned int mz0380_op6_kick_ms;
+module_param_named(op6_kick_ms, mz0380_op6_kick_ms, uint, 0644);
+MODULE_PARM_DESC(op6_kick_ms,
+		 "M120: after each poll-drained frame, re-fire START_STREAMING (op 0x06) to re-notify /sys/vpl_pciep/epint and ask for the next one - tinyvenc5 delivers one frame per notify. Value is the MINIMUM spacing in ms, not a period; kicks never fire before the first frame (M119 fired free-running from stream start and got zero frames plus a lost lock) (def:0 = off; try 16)");
+
+/*
+ * M126: WHICH opcode the post-frame kick sends. M125 decoded ep.ko's
+ * pciep_isr dispatcher:
+ *
+ *   op 0x06        notifies audio_ctrl, THEN epint / epint_1080p
+ *   op 0x09, 0x2f  notify the same epint node, WITHOUT the audio_ctrl notify
+ *
+ * tinyvenc5 blocks on /sys/vpl_pciep/epint and delivers one frame per notify.
+ * op 0x06 is "start", and re-sending start per frame drags the audio control
+ * path along with it; 0x2f is the bare wake-up and is the natural per-frame
+ * kick. The plumbing already exists - op6_kick_ms fires after each delivered
+ * frame (M120) - so only this opcode changes.
+ *
+ * Default stays 0x06 so op6_kick_ms means exactly what it did before.
+ */
+unsigned int mz0380_kick_opcode = 0x06;
+module_param_named(kick_opcode, mz0380_kick_opcode, uint, 0644);
+MODULE_PARM_DESC(kick_opcode,
+		 "M126: opcode fired by op6_kick_ms after each delivered frame - 0x06 (def, START, also notifies audio_ctrl) or 0x2f / 0x09 (bare epint wake-up)");
+
+/*
+ * M126: with the kick confined to the post-delivery branch, a one-frame stream
+ * fires exactly one kick - which is what the first 0x2f run measured, and it
+ * cannot distinguish "the card ignored the wake-up" from "we only asked once".
+ * With this set, the kick repeats every op6_kick_ms once at least one frame has
+ * been delivered. Still never before the first frame: that is the M119/M120
+ * race that cost a lock and a run.
+ */
+bool mz0380_kick_repeat;
+module_param_named(kick_repeat, mz0380_kick_repeat, bool, 0644);
+MODULE_PARM_DESC(kick_repeat,
+		 "M126: after the FIRST delivered frame, repeat the kick every op6_kick_ms even with no new delivery (def:0)");
+
+bool mz0380_poll_drain_credit;
+module_param_named(poll_drain_credit, mz0380_poll_drain_credit, bool, 0644);
+MODULE_PARM_DESC(poll_drain_credit,
+		 "M118: after a poll-drained frame, fire the credit re-arm the completion ISR would have (BAR5[0xdc]=2, EVENT=0, doorbell 0x400) (def:0)");
+
+unsigned int mz0380_poll_drain_ms;
+module_param_named(poll_drain_ms, mz0380_poll_drain_ms, uint, 0644);
+MODULE_PARM_DESC(poll_drain_ms,
+		 "M111: poll the stream buffers every N ms and deliver any frame the card has already written, instead of waiting for a completion event that never arrives (def:0 = off; 20 is a reasonable value)");
+
+unsigned int mz0380_rx_strap;
+module_param_named(rx_strap, mz0380_rx_strap, uint, 0644);
+MODULE_PARM_DESC(rx_strap,
+		 "M109: GPIO8 companion reset/power strap level after the receiver reset (def:0, the level this driver has always driven; 1 = release; 0xffffffff = do not drive it at all)");
 
 bool mz0380_enable_dma;
 module_param_named(enable_dma, mz0380_enable_dma, bool, 0444);
@@ -390,6 +504,36 @@ MODULE_PARM_DESC(card_frame_offset,
  * This sends the other windows' buffer-setter opcodes too, pointed at the three
  * buffers the card is currently ignoring, to find which window wakes up.
  */
+/*
+ * M92: Windows never sends 0x02 without 0x08 right behind it (0x14027b62d
+ * then 0x14027b752, same channel, same size, four more address pairs).
+ * ep.ko: op2 fills window0 slots 1..4 and clears host_ready; op8 fills
+ * slots 5..8 and sets wency_ready = 8.
+ */
+/*
+ * M94: write the receiver's output stage the way the Windows driver does -
+ * 0xb0/0xae/0xad/0xb1/0xb2/0xb3/0xb4 as one block, not 0xb0 alone. See
+ * mst3367_commit_digital_output(). Windows sends 0xb0 = 0x14, so pair this
+ * with vic_b0=0x14.
+ */
+bool mz0380_mst_win_output;
+module_param_named(mst_win_output, mz0380_mst_win_output, bool, 0644);
+MODULE_PARM_DESC(mst_win_output,
+		 "M94: write the full Windows MST3367 output-stage block (def:0; pair with vic_b0=0x14)");
+
+/*
+ * M94: BANK0 0xad. Windows computes it as (context_flag > 0) & 5, i.e. 0 or 1,
+ * from a field we cannot identify from the host. Exposed so both can be tried.
+ */
+unsigned int mz0380_mst_ad;
+module_param_named(mst_ad, mz0380_mst_ad, uint, 0644);
+MODULE_PARM_DESC(mst_ad, "M94: MST3367 BANK0 0xad value - Windows sends 0 or 1 (def:0)");
+
+bool mz0380_set_buf_op8;
+module_param_named(set_buf_op8, mz0380_set_buf_op8, bool, 0644);
+MODULE_PARM_DESC(set_buf_op8,
+		 "M92: also send SET_BUF op 0x08 after op 0x02, as Windows always does (def:0)");
+
 bool mz0380_probe_windows;
 module_param_named(probe_windows, mz0380_probe_windows, bool, 0644);
 MODULE_PARM_DESC(probe_windows,
@@ -447,6 +591,26 @@ MODULE_PARM_DESC(signal_poll_ms,
  * table entry matches - without this the whole real-signal path stays
  * blocked on one unreadable register.
  */
+/*
+ * M113: arm the real capture path with no source connected at all.
+ *
+ * Windows streams the card's own "no signal" splash into OBS with nothing
+ * plugged in, so a source is NOT required to get pixels out of this card - and
+ * running without one removes the last uncontrolled variable from a test (the
+ * operator power-cycling a source mid-window is what produced the M105
+ * measurement artefact).
+ *
+ * mz0380_force_timings only rescues a signal that IS locked but matches no
+ * table entry. With nothing connected there is no lock to rescue, so streamon
+ * bails before the encoder is ever armed. This makes it arm anyway, at the
+ * geometry below, exactly as if a 1080p60 source had been detected.
+ */
+bool mz0380_stream_without_signal;
+module_param_named(stream_without_signal, mz0380_stream_without_signal,
+		   bool, 0644);
+MODULE_PARM_DESC(stream_without_signal,
+		 "M113: arm the real capture path even when no HDMI signal is locked, using 1920x1080p60 - for reproducing what Windows shows with no source connected (def:0)");
+
 bool mz0380_force_timings;
 module_param_named(force_timings, mz0380_force_timings, bool, 0644);
 MODULE_PARM_DESC(force_timings,
@@ -544,33 +708,132 @@ MODULE_PARM_DESC(signal_cache_ms,
  * field as "2=progressive, 3=interlaced"), which reached tinyvenc5 only by
  * fallthrough. 5 is the H.264 encoder this card uses. Exposed as a parameter
  * so the alternative can be bisected on hardware without a rebuild.
+ *
+ * M82 supersedes the value, not the meaning. The Windows driver's own
+ * [CH00] log prints byte6 as "fw" and byte7 as "vi", and across all four
+ * live traces it sends fw = 6 for 1080p30 / 1080p29.97 and fw = 7 for
+ * 1080p60. It never sends 5. Since vcm derives the capture cfg's "output
+ * format" from this byte (2/YUY2 when fw == 6, else 1/YV12) and spawns
+ * ./tinyvenc7 when it is 7, 5 and 6 differ in the pixel format the capture
+ * stage is told to produce - and 5 is a value the retail driver has never
+ * exercised.
+ *
+ * M88 (hardware): and yet **only fw = 5 works on this card.** Bisected against
+ * the splash oracle with everything else held at its M82 value - the Windows
+ * ordering, the new color_info/fast_kill/nosg/aic_int_mode, INTx - flipping
+ * this one byte is the whole difference:
+ *
+ *     fw = 5  -> tinyvenc5, cfg output format 1/YV12  -> splash renders
+ *     fw = 6  -> tinyvenc5, cfg output format 2/YUY2  -> nothing written
+ *     fw = 7  -> tinyvenc7, cfg output format 1/YV12  -> nothing written
+ *
+ * 5 and 6 differ ONLY in the cfg's output format, so YUY2 by itself stops the
+ * capture loop before it writes anything; 7 fails separately, through a
+ * different encoder binary. Windows sends 6 or 7 and captures, so something
+ * about the card's state differs from ours and this byte is where it surfaces
+ * - but a value that demonstrably kills the capture loop is not one to ship
+ * for the sake of parity. 0 selects the Windows rule (6 at <=30 fps, 7 above)
+ * for anyone re-testing that contradiction.
  */
 unsigned int mz0380_vic_fw = 5;
 module_param_named(vic_fw, mz0380_vic_fw, uint, 0644);
 MODULE_PARM_DESC(vic_fw,
-		 "M71: SET_VIC byte6 'fw' encoder selector - 5=tinyvenc5 H.264, 7=tinyvenc7, 8=tinyvenc8 (def:5)");
+		 "SET_VIC byte6 'fw' - 5=tinyvenc5/YV12, the only value that works here (M88); 0=Windows rule (6 at <=30fps, 7 above); 6, 7, 8 (def:5)");
 
 /*
  * M72: SET_VIC byte12 ("m" in the card's log) is VideoCap's OUTPUT FORMAT.
  * The SDK's own capture config, re-dump/fw/yuan_demo_sdi/nullsensor_1920x1080.cfg,
  * documents the enum inline: "1:YUV420, 2:YUV422" - and 0, which this driver
  * has always sent, is not a legal value. H.264 encodes from YUV420.
+ *
+ * M79 then found that byte12 never reaches the cfg at all - vcm passes it on
+ * the tinyvenc argv instead, and the cfg's output format comes from byte6.
+ * M82 settles the value: Windows sends m = 0 for both 1080p30 and 1080p60 and
+ * m = 1 only for the 29.97 DSLR, so it looks like a fractional-rate flag, and
+ * 0 is what this card is given for an ordinary integer-rate source.
  */
-unsigned int mz0380_vic_out_format = 1;
+unsigned int mz0380_vic_out_format;
 module_param_named(vic_out_format, mz0380_vic_out_format, uint, 0644);
 MODULE_PARM_DESC(vic_out_format,
-		 "M72: SET_VIC byte12 VideoCap output format - 1=YUV420, 2=YUV422 (def:1)");
+		 "SET_VIC byte12 'm' - Windows sends 0 at integer frame rates, 1 at 29.97 (def:0)");
 
 /*
  * M72: SET_VIC bytes 16..19 ("color_info") line up with the same config file's
  * brightness / contrast / saturation / field-invert block, whose documented
  * neutral values are 0 / 0 / 128 / 0 - "saturation adjustment (0~255, 128:off,
  * 0:mono)". We have always sent 0,0,0,0, i.e. saturation pinned to mono.
+ *
+ * M82 retires that reading: the four bytes are color_info[0..3] and Windows
+ * sends a fixed 1,1,1,2 on every SET_VIC, never a picture control. vic_saturation
+ * now only overrides byte18 of vic_color_info, and does nothing unless set.
  */
-unsigned int mz0380_vic_saturation = 128;
+unsigned int mz0380_vic_saturation = MZ0380_VIC_SATURATION_UNSET;
 module_param_named(vic_saturation, mz0380_vic_saturation, uint, 0644);
 MODULE_PARM_DESC(vic_saturation,
-		 "M72: SET_VIC byte18 saturation - 128=neutral, 0=mono (def:128)");
+		 "override SET_VIC byte18 only; unset leaves vic_color_info alone (def:unset)");
+
+/*
+ * M82: SET_VIC bytes 16..19, exactly as the Windows driver builds them at
+ * 0x14028bcb9 - [16]=1 [17]=1 [18]=1 [19]=2, i.e. 0x02010101 little-endian.
+ * Identical in every trace and for every source.
+ */
+unsigned int mz0380_vic_color_info = 0x02010101;
+module_param_named(vic_color_info, mz0380_vic_color_info, uint, 0644);
+MODULE_PARM_DESC(vic_color_info,
+		 "M82: SET_VIC bytes 16..19 color_info (def:0x02010101, what Windows always sends)");
+
+/* M82: SET_VIC byte33 fast_kill. Windows logs fk=1 unconditionally. */
+unsigned int mz0380_vic_fast_kill = 1;
+module_param_named(vic_fast_kill, mz0380_vic_fast_kill, uint, 0644);
+MODULE_PARM_DESC(vic_fast_kill, "M82: SET_VIC byte33 fast_kill (def:1)");
+
+/*
+ * M82: SET_VIC bytes 36..39 - no-signal fill colour, back.Y.U.V. Windows sends
+ * 0.00.80.80, i.e. neutral grey; we sent all zeros, which is green.
+ */
+/*
+ * M136: SET_VIC byte 34 - the frame-completion interrupt enable.
+ *
+ * Found in ep.ko, not guessed. pciep_isr's cmd-41 arm (0x171c) ends with:
+ *
+ *   1744: ldrb r1, [r4, #0x22]     @ SET_VIC payload byte 34
+ *   1748: adds r3, r1, #0
+ *   174c: movne r3, #1
+ *   1754: strb r3, [r5, #0x630]    @ state[0x630] = (byte34 != 0)
+ *
+ * and state[0x630] is the gate in store_channel_done() - the sysfs attribute
+ * the CARD's userspace writes when a channel finishes a frame:
+ *
+ *   e88: ldrb r3, [r1, #0x630]
+ *   e8c: cmp  r3, #0
+ *   e94: beq  0xefc                @ zero: do NOT raise, only accumulate
+ *   ...
+ *   ebc: str  r4, [r3, #0x30]      @ BAR0 0x30 = EVENT |= (1 << ch)
+ *   ed0: str  r0, [r3]             @ and poke the interrupt
+ *
+ * So with byte 34 at zero the card packs its per-channel frame counters into
+ * BAR0 0x40/0x44/0x48/0x4c and then **never tells the host**. That is exactly
+ * what every run in this file reports at stop: `EVENT[0x30]=00000000`,
+ * `frame_events=0`, `token[0x40]=00000000`, and one frame per stream.
+ *
+ * We have sent 0 here for the driver's entire life. M82 read this byte as
+ * "mix" from the Windows traces, where it is also zero - but Windows gets its
+ * frames a different way, and "Windows sends 0" has already cost us fw=7 and
+ * post_mask=0x1f (method rule 4).
+ *
+ * The AIC side of the same mechanism is already known and named:
+ * SET_AIC byte 17 = aic_int_mode -> state[0x63c] (see MZ0380_CMD_SET_AIC_PARAMS).
+ * This is its video twin, and nothing has ever set it.
+ */
+unsigned int mz0380_vic_int_mode;
+module_param_named(vic_int_mode, mz0380_vic_int_mode, uint, 0644);
+MODULE_PARM_DESC(vic_int_mode,
+		 "M136: SET_VIC byte 34 - nonzero makes ep.ko's store_channel_done() raise the frame-completion EVENT to the host instead of only accumulating it. Never tried; the one-frame cadence is consistent with it being 0 (def:0)");
+
+unsigned int mz0380_vic_nosg = 0x80800000;
+module_param_named(vic_nosg, mz0380_vic_nosg, uint, 0644);
+MODULE_PARM_DESC(vic_nosg,
+		 "M82: SET_VIC bytes 36..39 nosg back/Y/U/V (def:0x80800000 = 0.00.80.80)");
 
 /*
  * M73: BANK0 0xb0 output format/clock select for ordinary (non-720p30) modes.
@@ -583,6 +846,99 @@ unsigned int mz0380_vic_b0 = 0x21;
 module_param_named(vic_b0, mz0380_vic_b0, uint, 0644);
 MODULE_PARM_DESC(vic_b0,
 		 "M73: MST3367 BANK0 0xb0 output select for ordinary modes (def:0x21, hdcapm uses 0x20)");
+
+/*
+ * M126: BANK0 0xb1 / 0xb2 / 0xb5 - the receiver output-stage registers that
+ * every sibling driver disagrees with us about, and that have never been
+ * tunable.
+ *
+ *            ours    hdcapm   gchd (1080p)   Windows 0x9c trace
+ *   0xb1     0xc0    0xe0     0x0c           0xc0  (confirmed)
+ *   0xb2     0x00    0x08     0xc4           value never resolved
+ *   0xb5     0x0c    -        0xd0           not seen
+ *
+ * The Windows trace pins 0xb1 and leaves 0xb2 as "?", so 0xb2 is the one
+ * register with no reference value at all - and it is the one both siblings
+ * write non-zero while we write zero. gchd is the more interesting witness
+ * despite writing different values: it selects BOTH 0xb2 and 0xb5 from the
+ * INPUT RESOLUTION (configure_hdmi.cpp: 0xb2 = c4/cc/cf and 0xb5 = d0/cc/cc
+ * for 1080 / 720 / SD), where ours are two fixed constants. Structure
+ * transfers even when values do not.
+ *
+ * Defaults are the current hard-coded values, so leaving these unset changes
+ * nothing. Sweep ONE at a time (method rule 2), with fw=5, win_seq=0 and
+ * vic_b0=0x21 - the only combination known to reach the splash.
+ */
+unsigned int mz0380_mst_b1 = 0xc0;
+module_param_named(mst_b1, mz0380_mst_b1, uint, 0644);
+MODULE_PARM_DESC(mst_b1,
+		 "M126: MST3367 BANK0 0xb1 output config (def:0xc0 = ours+Windows; hdcapm 0xe0, gchd 0x0c)");
+
+unsigned int mz0380_mst_b2;
+module_param_named(mst_b2, mz0380_mst_b2, uint, 0644);
+MODULE_PARM_DESC(mst_b2,
+		 "M126: MST3367 BANK0 0xb2 output config (def:0x00 = ours; hdcapm 0x08, gchd 0xc4 for 1080p)");
+
+/*
+ * M130: MST3367 BANK0 0x92 - the CSC control byte.
+ *
+ * The 31-byte table we inherit from hdcapm spans 0x92..0xB0, and only the
+ * first byte is not a coefficient:
+ *
+ *   0x92        0x40                 <- this byte: control
+ *   0x93..0x98  M11 M12 M13          (2 bytes each, big-endian)
+ *   0x99..0x9E  M21 M22 M23
+ *   0x9F..0xA4  M31 M32 M33
+ *   0xA5..0xAA  A1  A2  A3           (offsets)
+ *   0xAB..0xB0  15 95 05 20 C0 08    (colour range + output stage; 0xB0 is
+ *                                     rewritten straight afterwards)
+ *
+ * Why it matters (M129/M130): the captured frame's luma is perfect and its
+ * chroma is 96% ANTI-correlated with luma - the signature of a matrix
+ * subtracting luma from channels that are already luma-free. HDMI YCbCr 4:4:4
+ * puts Cb on the blue channel, Y on green and Cr on red, so feeding it to an
+ * RGB->YCbCr matrix gives Cb_out = -0.291*Y + ..., exactly what we measure.
+ * Inverting that model on the captured frame turns the picture from
+ * magenta/green mush into a coherent image, which confirms the mechanism.
+ *
+ * hdcapm writes this table unconditionally. Its MST3367_HdmiGetPacketColor()
+ * reads the input colour space from BANK2 0x48 bits 6:5 and caches it in
+ * regb2r48_cached - and then never uses it to pick a matrix. That is fine on
+ * hdcapm's board, whose EDID makes sources send RGB. We push no EDID at all
+ * (M127) and this source picked YUV444, which our own link log reports on
+ * every run: "48=d2 ... input colorspace YUV444".
+ *
+ * With YCbCr in and YCbCr 4:2:2 out over BT1120, no conversion is wanted. If
+ * 0x40 is the CSC enable, 0 should bypass it and the chroma should come out
+ * right. That is one spawn and it is the cheapest thing that could work; the
+ * fixed-point format of the coefficients has NOT been cracked, so do not try
+ * to hand-write a matrix yet.
+ */
+unsigned int mz0380_mst_csc_ctl = MZ0380_MST_CSC_CTL_AUTO;
+module_param_named(mst_csc_ctl, mz0380_mst_csc_ctl, uint, 0644);
+MODULE_PARM_DESC(mst_csc_ctl,
+		 "M130: MST3367 BANK0 0x92, the CSC control byte. Default AUTO (0xffffffff) = pick from the detected input colorspace: 0x00 (no conversion) for YUV422/YUV444, 0x40 (hdcapm's RGB->YCbCr) for RGB. Any other value forces that byte");
+
+unsigned int mz0380_mst_b5 = 0x0c;
+module_param_named(mst_b5, mz0380_mst_b5, uint, 0644);
+MODULE_PARM_DESC(mst_b5,
+		 "M126: MST3367 BANK0 0xb5 (def:0x0c = ours; gchd sends 0xd0 for 1080p, 0xcc otherwise)");
+
+/*
+ * M126: gchd commits 0xb0 in TWO writes - the configuration value with bit0
+ * (embedded sync) CLEAR, then the same value with bit0 SET as the very last
+ * register write of the whole HDMI bring-up (0xe8 then 0xe9). We write 0xb0
+ * once, with bit0 already set, inside the 0xab bit7 freeze bracket.
+ *
+ * This is NOT the same experiment as M96, which measured 0x20 as a terminal
+ * value and got nothing written. If bit0 is an output enable rather than a
+ * mode select, the config must land before it is asserted, and a one-shot
+ * write with bit0 already high never gives the retimer a clean edge.
+ */
+bool mz0380_mst_b0_late;
+module_param_named(mst_b0_late, mz0380_mst_b0_late, bool, 0644);
+MODULE_PARM_DESC(mst_b0_late,
+		 "M126: commit 0xb0 as (value & ~1) inside the freeze, then set bit0 after unfreezing - gchd's order (def:0)");
 
 /*
  * M75: which opcode programs the encoder's DMA destination buffers.
@@ -602,6 +958,71 @@ unsigned int mz0380_set_buf_opcode = 0x02;
 module_param_named(set_buf_opcode, mz0380_set_buf_opcode, uint, 0644);
 MODULE_PARM_DESC(set_buf_opcode,
 		 "M75: opcode that programs encoder DMA buffers - 2 (def), or 4/5/8 as the Windows driver uses");
+
+/*
+ * M76: SET_VIC bytes 24..27 ("input_frame_width/height") are the ONLY host
+ * input that reaches the VIC's own width register. video_capture_mgr patches
+ * them straight into the cfg lines "input frame width"/"input frame height"
+ * (vcm FUN_0000a290, args 9 and 10), separately from the capture width, and
+ * libvideocap writes that value to VIC channel register +0x68. vpl_vic's ISR
+ * compares the incoming line against it and reports
+ * "(CCIR or width(%lu) chck fail)" on a mismatch - one of the three status
+ * bits behind "No signal !!".
+ *
+ * If the MST3367 is emitting 8-bit double-rate samples rather than true
+ * 16-bit BT1120, the VIC counts 3840 samples per line where we declared 1920.
+ * This is the only way to test that from the host without a scope. 0 keeps
+ * the detected geometry.
+ */
+/*
+ * M76: how many bytes of the card's /mnt/flash/PIC_ENC /proc/mz0380-cardlog
+ * pages back. One mailbox round-trip per 16 bytes, so keep it small until the
+ * transport is proven.
+ */
+unsigned int mz0380_cardlog_bytes = 256;
+bool mz0380_cardlog_probe_enabled;
+module_param_named(cardlog_probe, mz0380_cardlog_probe_enabled, bool, 0644);
+MODULE_PARM_DESC(cardlog_probe,
+		 "M76: WRITES 16 bytes to the card's /mnt/flash/PIC_ENC and reads them back, to prove vcm services op 0x6e (def:0)");
+module_param_named(cardlog_bytes, mz0380_cardlog_bytes, uint, 0644);
+MODULE_PARM_DESC(cardlog_bytes,
+		 "M76: bytes of the card's PIC_ENC to page via /proc/mz0380-cardlog (def:256, 16 B per mailbox command)");
+
+unsigned int mz0380_vic_in_w;
+module_param_named(vic_in_w, mz0380_vic_in_w, uint, 0644);
+MODULE_PARM_DESC(vic_in_w,
+		 "M76: override SET_VIC bytes 24..25 input_frame_width (0=detected; try 3840 for 8-bit double-rate)");
+
+unsigned int mz0380_vic_in_h;
+module_param_named(vic_in_h, mz0380_vic_in_h, uint, 0644);
+MODULE_PARM_DESC(vic_in_h,
+		 "M76: override SET_VIC bytes 26..27 input_frame_height (0=detected)");
+
+/*
+ * SET_VIC byte7: the capture INPUT FORMAT enum (1=8-bits Raw, 2=CCIR656i,
+ * 3=CCIR656p, 4=Bayer, 5=16-bits Raw, 6=BT1120p, 7=BT1120i), from the SDK
+ * capture config. We derive 6/7 from the detected scan.
+ *
+ * M103 briefly reclassified this as the interlace flag, on the strength of the
+ * card's own printf calling it "interlace" and M71's disassembly of the op-41
+ * handler. M104 settled it on hardware and the enum reading won: 3, 6 and 7 all
+ * reach the card's NOSG splash and are indistinguishable, while 0 - not in the
+ * enum - produces nothing at all, which is VideoCap failing to open and
+ * tinyvenc exiting before it can draw. The printf label is loose, not wrong:
+ * 6 vs 7 is BT1120p vs BT1120i.
+ *
+ * The same run PROVED the byte is consumed at all, which three
+ * indistinguishable values never could.
+ *
+ * MZ0380_VIC_IN_FMT_AUTO is the "derive it" sentinel. It exists because the old
+ * `vic_in_fmt ?: derived` idiom could not express 0, so this field's own sweep
+ * knob could not reach part of its own range - which is why the one informative
+ * value went untried for so long. The derived default is unchanged.
+ */
+unsigned int mz0380_vic_in_fmt = MZ0380_VIC_IN_FMT_AUTO;
+module_param_named(vic_in_fmt, mz0380_vic_in_fmt, uint, 0644);
+MODULE_PARM_DESC(vic_in_fmt,
+		 "SET_VIC byte7 input format (2=CCIR656i, 3=CCIR656p, 6=BT1120p, 7=BT1120i). Unset = derive 6/7 from the scan. M104: 0 is NOT in the enum and stops the card writing anything - it is the proof the byte is consumed, not a usable setting");
 
 bool mz0380_signal_confirm;
 module_param_named(signal_confirm, mz0380_signal_confirm, bool, 0644);
@@ -635,11 +1056,246 @@ module_param_named(aic_periods, mz0380_aic_periods, uint, 0644);
 MODULE_PARM_DESC(aic_periods, "M33: SET_AIC period_num_of_buffer (def:4)");
 
 /*
+ * M82: SET_AIC byte17. ep.ko stores it as G[0x63c] ("aic_int_mode") and the
+ * Windows driver logs aic_int_mode=1 in every trace; we have always sent 0.
+ * Its value is board-derived there and resolves to 1 for board id 0xFA.
+ */
+unsigned int mz0380_aic_int_mode = 1;
+module_param_named(aic_int_mode, mz0380_aic_int_mode, uint, 0644);
+MODULE_PARM_DESC(aic_int_mode, "M82: SET_AIC byte17 aic_int_mode (def:1, what Windows sends)");
+
+/* ---- M82: the Windows capture-start sequence ---------------------------- */
+
+/*
+ * The retail driver reconfigures with
+ *   0x07(all channels) -> ~1.9 s -> 0x29 -> 0x2a -> 0x2d(main) -> 0x2d(sub)
+ *   -> 0x31
+ * and never sends START_STREAMING (0x06) on the capture path: 0x2d and 0x31
+ * are themselves bare sysfs_notify("epint") doorbells in ep.ko, which is the
+ * same wake 0x06 performs. Buffers are registered before the reconfiguration,
+ * when the capture pin opens.
+ *
+ * 1 selects that order. 0 is the pre-M82 order
+ * (0x29 -> 0x2d -> SET_BUF -> 0x2a -> 0x06), which is what every run up to and
+ * including M81 used.
+ *
+ * DEFAULT IS 0, deliberately. M90 showed on hardware that win_seq=1 renders
+ * nothing at all - not even the card's NO SIGNAL splash - while win_seq=0 with
+ * fw=5 reliably renders it (760/1024 pages, M88). Both variables are necessary
+ * and they interact. A default that is known not to reach the splash is a trap:
+ * it silently confounds every experiment run "with defaults", which is exactly
+ * how the vic_b0=0x20 test was wasted. Defaults track the best known-working
+ * configuration; set win_seq=1 explicitly to work on the Windows ordering.
+ */
+bool mz0380_win_seq;
+module_param_named(win_seq, mz0380_win_seq, bool, 0644);
+MODULE_PARM_DESC(win_seq,
+		 "M82: use the Windows capture-start order and opcode set. DEFAULT 0 - win_seq=1 does not reach the splash (M90); 0 is the known-good baseline");
+
+/*
+ * Belt and braces: send 0x06 as well at the end of the Windows sequence. Off
+ * because Windows does not, and an extra epint notify could re-enter the
+ * encoder's read loop out of turn.
+ */
+bool mz0380_win_start_op6;
+module_param_named(win_start_op6, mz0380_win_start_op6, bool, 0644);
+MODULE_PARM_DESC(win_start_op6,
+		 "M82: also fire START_STREAMING(0x06) after the Windows sequence (def:0)");
+
+/*
+ * The measured gap between "[FIRMWARE RESET]" and the [CH00] that follows it
+ * was 1.84-1.91 s in every one of the six observed reconfigurations. Only a
+ * few hundred ms of that is accounted for by sleeps inside the config
+ * function, so treat the rest as the card settling and do not shorten it
+ * without evidence.
+ */
+unsigned int mz0380_stop_settle_ms = 1900;
+module_param_named(stop_settle_ms, mz0380_stop_settle_ms, uint, 0644);
+MODULE_PARM_DESC(stop_settle_ms,
+		 "M82: delay between the pre-STOP and SET_VIC (def:1900, Windows measures 1840-1910)");
+
+/*
+ * M84: SET_BUF placement, split out so it can be bisected without touching
+ * win_seq. Windows registers its buffers when the capture pin opens, i.e.
+ * before the reconfiguration, which is what 1 does. But M23 established on
+ * hardware that op6 is what makes vpl_dmac latch channels[] into the outbound
+ * iATU, and put SET_BUF *after* SET_VIC so our addresses are the ones latched.
+ * Those two orderings only agree if op6 is absent; set 0 to keep the M23
+ * placement while the rest of the Windows sequence stays.
+ */
+bool mz0380_win_bufs_first = true;
+module_param_named(win_bufs_first, mz0380_win_bufs_first, bool, 0644);
+MODULE_PARM_DESC(win_bufs_first,
+		 "M84: with win_seq, program SET_BUF before SET_VIC as Windows does (def:1; 0 = M23 placement, after SET_VIC)");
+
+/* M82: Windows configures a second (sub) encoder stream on every start. */
+bool mz0380_enc_sub = true;
+module_param_named(enc_sub, mz0380_enc_sub, bool, 0644);
+MODULE_PARM_DESC(enc_sub,
+		 "M82: also send SET_ENC_PARAMS for the sub stream (main_or_sub=1) (def:1)");
+
+/*
+ * SET_ENC_PARAMS validity mask. We send bits 0/1/6 (fps, gop, bitrate) and
+ * leave the rest masked out because their enums were never verified; Windows
+ * sends 0x3FFF with every field populated. 0 keeps the conservative mask.
+ */
+unsigned int mz0380_enc_mask;
+module_param_named(enc_mask, mz0380_enc_mask, uint, 0644);
+MODULE_PARM_DESC(enc_mask,
+		 "SET_ENC_PARAMS validity mask - 0=conservative fps/gop/bitrate, 0x3fff=Windows (def:0)");
+
+/* M82: POST_PROC (0x31). Windows sends mask 0x1F with di=1, everything else 0. */
+/*
+ * M128d/M131: DEFAULT CHANGED 0x1f -> 0. The mask gates three stores in
+ * tinyvenc5's SET_PREVIEW_PARAMS handler - bit 0 skip, bit 1 avg, bit 4 die_en
+ * - and with 0x1f one of them TRUNCATES THE DMA to a single 16-byte burst.
+ * Proven on hardware: same command, mask 0x1f -> 16 bytes, mask 0 -> a whole
+ * 3110400-byte frame. It is also the entire reason win_seq=1 "renders nothing"
+ * (M90/M91), since that path sends 0x31 with this mask.
+ *
+ * Which of the three bits does it is still unbisected: post_mask=0x10 (die_en
+ * alone) against 0x01 (skip alone), one spawn each. Prior is die_en - a
+ * de-interlacer switched on for a progressive source, set only because Windows
+ * sends it.
+ */
+unsigned int mz0380_post_mask;
+module_param_named(post_mask, mz0380_post_mask, uint, 0644);
+MODULE_PARM_DESC(post_mask,
+		 "SET_PREVIEW_PARAMS(0x31) validity mask (def:0 - M128d: 0x1f truncates the DMA to 16 bytes; 0x1f was the old Windows-parity default)");
+
+unsigned int mz0380_post_di = 1;
+module_param_named(post_di, mz0380_post_di, uint, 0644);
+MODULE_PARM_DESC(post_di, "M82: POST_PROC(0x31) deinterlace flag (def:1, what Windows sends)");
+
+/*
+ * M128: op 0x31 is not "POST_PROC", it is SET_PREVIEW_PARAMS, and its payload
+ * byte 0x0e is `fake_frame_off`. Decoded statically from tinyvenc5's dispatch
+ * table (main+0x804, index = cmd - 6) and its verbose printf at 0xf570:
+ *
+ *   [4..7]=mask(u32, sticky-OR'd)  [8]=ch  [9]=fps  [0x0a]=skip  [0x0b]=avg
+ *   [0x0c]=die_en  [0x0d]=preview_off  [0x0e]=fake_frame_off
+ *   [0x0f]=preview_no_osd  [0x10]=mirror  [0x11]=flip  [0x12]=hw_d
+ *
+ * The handler at 0xef24 stores byte 0x0e to
+ * EncodingGroup::preview_params_settings[ch].byte[0x0a] UNCONDITIONALLY - the
+ * validity mask gates only byte 0x0c (die_en, mask bit 4). That is the exact
+ * byte M127 identified as the standby-splash gate: EncodingGroup::init_func
+ * (0x10ac0) does
+ *
+ *   if (preview_params_settings[ch].byte[0x0a] == 0)
+ *           pthread_create(&t, NULL, EncodingGroup::fake_frame_process, this);
+ *
+ * and main zeroes it at startup (0xe400). So on our baseline the standby
+ * thread that draws NOSG_LOGO_Y is created because we have never told the card
+ * otherwise. The second spawn site, in EncodingGroup::Start (0x10f30), is
+ * gated by is_nosg instead, which we already send as 0.
+ *
+ * The guard runs inside the op-0x06 handler (which news the EncodingGroups,
+ * then pthread_create's on_start_thread -> Start -> init_func), so 0x31 only
+ * has an effect if it lands BEFORE START_STREAMING.
+ *
+ * Why it is worth a spawn: the "real frames are rejected in
+ * libtkmf_video_source.so.0" mechanism is static RE only - the card's console
+ * is not reachable, so we have never observed the drop. With the standby
+ * thread suppressed there is nothing left to emit a frame except the real
+ * encode path, which splits the two remaining stories cleanly:
+ *   NO FRAME   -> the rejection is real; nothing ever reaches the encoder.
+ *   real frame -> the standby thread was winning the race and masking it.
+ * M131: DEFAULT CHANGED 0 -> 1. With it at 0 the card draws NOSG_LOGO_Y over a
+ * perfectly good capture, which is what hid real video from this project for
+ * its entire life (M129). Set it to 0 only to reproduce a pre-M129 result.
+ */
+bool mz0380_fake_frame_off = true;
+module_param_named(fake_frame_off, mz0380_fake_frame_off, bool, 0644);
+/*
+ * M128b: the control for the above. The first fake_frame_off run changed TWO
+ * things at once relative to the baseline - it sent op 0x31, which win_seq=0
+ * never does, AND it set byte 0x0e in it - and it came back with M91's exact
+ * 16-byte DMA stall. M91 saw that stall under win_seq=1, whose sequence also
+ * contains 0x31, so "0x31 itself truncates the transfer" is a live and
+ * parsimonious explanation that the run cannot separate from "the standby
+ * thread is gone and the real path stalls".
+ *
+ * post_proc=1 sends 0x31 on the baseline with fake_frame_off left at 0, i.e.
+ * one variable from that run. Method rule 1: every other variable is at a
+ * value already known to permit a full frame, so it is informative either way.
+ *   full splash (3110400 B) -> 0x31 is harmless; the stall belongs to
+ *                              fake_frame_off, i.e. to the real path
+ *   16 bytes of 0x11        -> 0x31 truncates; that is also M91's answer
+ */
+bool mz0380_post_proc = true;
+module_param_named(post_proc, mz0380_post_proc, bool, 0644);
+/*
+ * M128b: how long to wait between op 0x31 and op 0x06.
+ *
+ * The control run pinned the truncation on 0x31 but NOT on anything 0x31
+ * means. The handler is inert on this card: for ch 0 it falls through to
+ * fopen("/tmp/PIC_INSERT","rb"), which cannot exist, so it sets
+ * g_insert_pic = 0 and bare-ACKs (tinyvenc5 0xf068 -> 0xffac). The MemBroker
+ * allocation that would have followed is never reached. Nothing it writes
+ * touches capture, DMA or the VIC.
+ *
+ * What DID change is the mailbox cadence in front of START_STREAMING. ep.ko
+ * serves one command at a time out of the mailbox and pokes it at the card as
+ * a bare sysfs_notify("epint"); tinyvenc5 wakes, reads 44 bytes, and services
+ * it. Measured on the two runs:
+ *
+ *   baseline   SET_AIC -> [156 ms, spent in the output-stage diag] -> 0x06
+ *   with 0x31  SET_AIC -> [156 ms diag] -> 0x31 -> [9 us] -> 0x06
+ *
+ * Nine microseconds. 0x06 is fire-and-forget (timeout_ms = 0), so it does not
+ * wait for anything, and it lands on the doorbell while tinyvenc5 is still
+ * inside the 0x31 handler. Every other command in the sequence is tens to
+ * hundreds of ms apart. That is the one thing 0x31 changes that could plausibly
+ * truncate a transfer, and it also explains M91 without needing win_bufs_first.
+ *
+ * A gap is one variable from the run that produced the stall. Nonzero and the
+ * frame comes back whole => cadence, and 0x31 is usable, which is what
+ * fake_frame_off needs. Still 16 bytes at, say, 200 ms => the race is not it
+ * and the 0x31 handler needs another read.
+ */
+unsigned int mz0380_post_proc_gap_ms;
+module_param_named(post_proc_gap_ms, mz0380_post_proc_gap_ms, uint, 0644);
+/*
+ * M128c: which opcode goes into the pre-START slot. Default 0x31, i.e. no
+ * change. The point of making it a variable is the control that partitions the
+ * remaining space: op 0x09 is provably inert on BOTH sides - ep.ko routes it to
+ * the same 0x1824 arm of pciep_isr that 0x2f/0x50/0x51/0x52/0x62 use, and
+ * tinyvenc5's handler (0xe93c) is a bare pwrite(epint, payload, 44) with no
+ * side effect whatsoever.
+ *
+ *   0x09 also truncates -> the fault is "an extra epint command immediately
+ *                          before START", not anything 0x31 means. Structural,
+ *                          and it would apply to the whole win_seq ordering.
+ *   0x09 is clean        -> 0x31's own writes into tinyvenc5 are the cause,
+ *                          and post_mask / post_di split them further.
+ */
+unsigned int mz0380_post_proc_opcode = MZ0380_CMD_POST_PROC;
+module_param_named(post_proc_opcode, mz0380_post_proc_opcode, uint, 0644);
+MODULE_PARM_DESC(post_proc_opcode,
+		 "M128c: opcode for the pre-START slot (def:0x31). 0x09 is the inert control - same ep.ko arm, and tinyvenc5's handler is a bare ACK");
+MODULE_PARM_DESC(post_proc_gap_ms,
+		 "M128b: ms to wait between SET_PREVIEW_PARAMS(0x31) and START_STREAMING(0x06). 0 reproduces the 16-byte stall exactly; try 200 (def:0)");
+MODULE_PARM_DESC(post_proc,
+		 "send SET_PREVIEW_PARAMS(0x31) on the win_seq=0 baseline (def:1 since M131 - it is what carries fake_frame_off). 0 restores the pre-M129 sequence");
+MODULE_PARM_DESC(fake_frame_off,
+		 "M128: SET_PREVIEW_PARAMS(0x31) byte 0x0e - 1 suppresses the card's standby NOSG_LOGO_Y thread, so a delivered frame is a real one (def:1 since M131; 0 restores the splash)");
+
+/*
  * M4 diagnostic: enable bus mastering + MSI/ISR BEFORE firmware load, but do
  * NOT program any (still-unverified) ring addresses. Safe because the card has
  * no host DMA target to write to; tests whether the post-boot mailbox doorbell
  * only reaches the card once bus mastering is on.
  */
+/*
+ * M82: run the card on legacy INTx, which is the only interrupt path the
+ * Windows driver has ever used on this device. See mz0380_irq_request().
+ */
+bool mz0380_irq_intx = true;
+module_param_named(irq_intx, mz0380_irq_intx, bool, 0444);
+MODULE_PARM_DESC(irq_intx,
+		 "M82: force legacy INTx instead of MSI, as the Windows driver does (def:1)");
+
 bool mz0380_dma_handshake;
 module_param_named(dma_handshake, mz0380_dma_handshake, bool, 0444);
 MODULE_PARM_DESC(dma_handshake,
@@ -3191,8 +3847,8 @@ static int mz0380_proc_show(struct seq_file *m, void *v)
 		else if (!mz0380_enable_video)
 			seq_puts(m,
 				 "  video node : disabled (load with enable_video=1 to register /dev/video*)\n");
-		seq_printf(m, "  firmware   : %s\n",
-			   mz0380_boards[dev->board].firmware_name);
+		seq_puts(m,
+			 "  firmware   : card's own flash image (host never uploads)\n");
 		seq_printf(m, "  bar%d start: 0x%llx\n",
 			   dev->bar_nr[MZ0380_MAP_BAR_MMIO],
 			   (unsigned long long)dev->bar_start[MZ0380_MAP_BAR_MMIO]);
@@ -3402,7 +4058,7 @@ static void mz0380_dump_periph_scan(struct seq_file *m, struct mz0380_dev *dev)
 	unsigned int end = start + periph_count;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
-		seq_puts(m, "  periph     : firmware not ready (load firmware_upload=1)\n");
+		seq_puts(m, "  periph     : card handshake not complete\n");
 		return;
 	}
 	if (end > 0x100)
@@ -3752,7 +4408,7 @@ static int mz0380_activate_hdmi_sink(struct mz0380_dev *dev)
 	int ret;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY) {
-		pr_warn("%s: HDMI sink refresh skipped - firmware not ready (load firmware_upload=1 dma_handshake=1)\n",
+		pr_warn("%s: HDMI sink refresh skipped - card handshake not complete (load dma_handshake=1)\n",
 			dev->name);
 		return -ENODEV;
 	}
@@ -4595,8 +5251,213 @@ static struct proc_ops mz0380_proc_cmd_fops = {
 };
 #endif
 
+/*
+ * M76: read 16 bytes from the card's /mnt/flash/PIC_ENC via LOAD_FILES.
+ *
+ * The card echoes the whole 44-byte command back after servicing it, so the
+ * data lands in PARAM1..PARAM4. Costs one mailbox round-trip per chunk.
+ */
+static int mz0380_load_files_read(struct mz0380_dev *dev, u16 offset,
+				  u8 out[MZ0380_LOAD_FILES_CHUNK])
+{
+	u32 reply[MZ0380_MB_COMMAND_WORDS] = { 0 };
+	u32 params[5];
+	unsigned int i;
+	int ret;
+
+	params[0] = (u32)offset << 16;	/* is_write = 0 in the low half */
+	/*
+	 * Sentinel, not zero-fill. If the card cannot open PIC_ENC it prints
+	 * "[LOGO_LOAD] cannot open %s" and returns WITHOUT touching the
+	 * payload, so the command still completes and whatever we sent comes
+	 * straight back. A zero payload therefore cannot distinguish "the file
+	 * is 256 zero bytes" from "the file does not exist". 0xA5 can.
+	 */
+	for (i = 1; i < ARRAY_SIZE(params); i++)
+		params[i] = 0xa5a5a5a5;
+
+	ret = mz0380_send_command_reply(dev, MZ0380_CMD_LOAD_FILES,
+					params, ARRAY_SIZE(params), NULL, 2000,
+					reply, ARRAY_SIZE(reply));
+	if (ret)
+		return ret;
+
+	/*
+	 * reply[0] is the PARAM0 slot, which is the OPCODE word (reg.h:
+	 * MZ0380_MB_OPCODE == MZ0380_MB_PARAM(0) == 0x04). Our params[0]
+	 * therefore comes back in reply[1], and the 16 data bytes - card
+	 * struct[8..23] - in reply[2..5].
+	 */
+	for (i = 0; i < MZ0380_LOAD_FILES_CHUNK; i++)
+		out[i] = reply[2 + (i / 4)] >> ((i % 4) * 8);
+
+	return 0;
+}
+
+/*
+ * M76: write 16 bytes to the card's /mnt/flash/PIC_ENC via LOAD_FILES.
+ *
+ * vcm opens "wb+" when the offset is 0 (create/truncate) and "ab" otherwise,
+ * so offset 0 is the only one that reliably lands where we asked. Used solely
+ * by the cardlog_probe self-test: an untouched read sentinel cannot tell
+ * "the file is missing" from "vcm never serviced the command", and a
+ * write-then-read-back can.
+ *
+ * This is the only thing in-tree that writes to the card's flash. PIC_ENC is
+ * the encoder's logo scratch file, not boot-critical, and the probe truncates
+ * it to the 16 bytes it writes.
+ */
+static int mz0380_load_files_write(struct mz0380_dev *dev, u16 offset,
+				   const u8 in[MZ0380_LOAD_FILES_CHUNK])
+{
+	u32 params[5] = { 0 };
+	unsigned int i;
+
+	params[0] = 1u | ((u32)offset << 16);	/* is_write = 1 */
+	for (i = 0; i < MZ0380_LOAD_FILES_CHUNK; i++)
+		params[1 + (i / 4)] |= (u32)in[i] << ((i % 4) * 8);
+
+	return mz0380_send_command(dev, MZ0380_CMD_LOAD_FILES, params,
+				   ARRAY_SIZE(params), NULL, 2000);
+}
+
+static void mz0380_cardlog_probe(struct seq_file *m, struct mz0380_dev *dev)
+{
+	static const u8 pattern[MZ0380_LOAD_FILES_CHUNK] = {
+		'M', 'Z', '0', '3', '8', '0', '-', 'M',
+		'7', '7', '-', 'P', 'R', 'O', 'B', 'E',
+	};
+	u8 back[MZ0380_LOAD_FILES_CHUNK];
+	unsigned int i;
+	int ret;
+
+	seq_puts(m, "probe: writing a 16-byte pattern to PIC_ENC offset 0, then reading it back\n");
+
+	ret = mz0380_load_files_write(dev, 0, pattern);
+	if (ret) {
+		seq_printf(m, "probe: write failed: %d\n", ret);
+		return;
+	}
+
+	ret = mz0380_load_files_read(dev, 0, back);
+	if (ret) {
+		seq_printf(m, "probe: read-back failed: %d\n", ret);
+		return;
+	}
+
+	seq_puts(m, "probe: read back |");
+	for (i = 0; i < MZ0380_LOAD_FILES_CHUNK; i++)
+		seq_putc(m, (back[i] >= 0x20 && back[i] < 0x7f) ? back[i] : '.');
+	seq_puts(m, "|\n");
+
+	if (!memcmp(back, pattern, sizeof(pattern)))
+		seq_puts(m, "probe: PASS - vcm services op 0x6e and PIC_ENC is readable and writable\n");
+	else if (back[0] == 0xa5 && !memchr_inv(back, 0xa5, sizeof(back)))
+		seq_puts(m, "probe: FAIL - sentinel untouched, vcm never serviced the command\n");
+	else
+		seq_puts(m, "probe: MISMATCH - the command was serviced but the bytes differ\n");
+}
+
+static int mz0380_proc_cardlog_show(struct seq_file *m, void *v)
+{
+	struct mz0380_dev *dev;
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist) {
+		unsigned int off;
+
+		seq_printf(m, "%s: /mnt/flash/PIC_ENC via LOAD_FILES(0x6e), %u bytes\n",
+			   dev->name, mz0380_cardlog_bytes);
+
+		if (mz0380_cardlog_probe_enabled)
+			mz0380_cardlog_probe(m, dev);
+
+		for (off = 0; off < mz0380_cardlog_bytes;
+		     off += MZ0380_LOAD_FILES_CHUNK) {
+			u8 buf[MZ0380_LOAD_FILES_CHUNK];
+			unsigned int i;
+			int ret;
+
+			if (off > U16_MAX)
+				break;
+
+			ret = mz0380_load_files_read(dev, off, buf);
+			if (ret) {
+				seq_printf(m, "%04x: <read failed: %d>\n",
+					   off, ret);
+				break;
+			}
+
+			if (buf[0] == 0xa5 && !memchr_inv(buf, 0xa5,
+							  sizeof(buf))) {
+				seq_printf(m, "%04x: <untouched sentinel - the card did not read the file>\n",
+					   off);
+				break;
+			}
+
+			seq_printf(m, "%04x:", off);
+			for (i = 0; i < MZ0380_LOAD_FILES_CHUNK; i++)
+				seq_printf(m, " %02x", buf[i]);
+			seq_puts(m, "  |");
+			for (i = 0; i < MZ0380_LOAD_FILES_CHUNK; i++)
+				seq_putc(m, (buf[i] >= 0x20 && buf[i] < 0x7f) ?
+					 buf[i] : '.');
+			seq_puts(m, "|\n");
+		}
+	}
+	mutex_unlock(&devlist);
+	return 0;
+}
+
+static int mz0380_proc_cardlog_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, mz0380_proc_cardlog_show, NULL);
+}
+
+static struct proc_ops mz0380_proc_cardlog_fops = {
+	.proc_open = mz0380_proc_cardlog_open,
+	.proc_read = seq_read,
+	.proc_lseek = seq_lseek,
+	.proc_release = single_release,
+};
+
+/*
+ * M76: raw dump of stream buffer 0.
+ *
+ * The poison scan proved the card writes ~3.1 MB into buf0 on the REAL
+ * (is_nosg=0) path while the receiver holds lock - head bytes 0x11, i.e. the
+ * card's own NO-SIGNAL splash, not H.264. Identifying that content offline is
+ * the difference between "the encoder produced nothing" and "the encoder
+ * produced the wrong picture", so expose the buffer verbatim.
+ */
+static ssize_t mz0380_proc_buf0_read(struct file *file, char __user *buf,
+				     size_t count, loff_t *ppos)
+{
+	struct mz0380_dev *dev;
+	ssize_t ret = 0;
+
+	mutex_lock(&devlist);
+	list_for_each_entry(dev, &mz0380_devlist, devlist) {
+		if (!dev->stream_bufs[0].va)
+			continue;
+		ret = simple_read_from_buffer(buf, count, ppos,
+					      dev->stream_bufs[0].va,
+					      MZ0380_STREAM_BUF_SIZE);
+		break;
+	}
+	mutex_unlock(&devlist);
+	return ret;
+}
+
+static struct proc_ops mz0380_proc_buf0_fops = {
+	.proc_read = mz0380_proc_buf0_read,
+	.proc_lseek = default_llseek,
+};
+
 static void mz0380_proc_remove(void)
 {
+	remove_proc_entry("mz0380-cardlog", NULL);
+	remove_proc_entry("mz0380-buf0", NULL);
 	remove_proc_entry("mz0380-cmd", NULL);
 	remove_proc_entry("mz0380-hdmi", NULL);
 	remove_proc_entry("mz0380-events", NULL);
@@ -4639,6 +5500,19 @@ static int mz0380_proc_create(void)
 
 	pe = proc_create("mz0380-experiment", 0644, NULL,
 			 &mz0380_proc_experiment_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-cardlog", 0400, NULL,
+			 &mz0380_proc_cardlog_fops);
+	if (!pe) {
+		mz0380_proc_remove();
+		return -ENOMEM;
+	}
+
+	pe = proc_create("mz0380-buf0", 0400, NULL, &mz0380_proc_buf0_fops);
 	if (!pe) {
 		mz0380_proc_remove();
 		return -ENOMEM;
@@ -4802,6 +5676,25 @@ void mz0380_mb_ack_event(struct mz0380_dev *dev)
 	mz_mmio_write(dev, MZ0380_MB_DOORBELL, MZ0380_MB_INT_ACK);
 	spin_unlock_irqrestore(&dev->event_lock, flags);
 }
+
+/*
+ * M118: the credit re-arm, lifted out of the ISR so the poll-drain can fire the
+ * same sequence. The card's completion channel is a one-shot: msi_enable is
+ * consumed when it posts an event and only this doorbell restores it. On the
+ * poll path no event ever posts, so nothing has ever re-armed it.
+ */
+void mz0380_credit_rearm(struct mz0380_dev *dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->event_lock, flags);
+	mz_cfg_write(dev, MZ0380_CFG_INT_FLAG, MZ0380_CFG_INT_ACK_VAL);
+	mz_mmio_write(dev, MZ0380_MB_EVENT, 0);
+	wmb();
+	mz_mmio_write(dev, MZ0380_MB_DOORBELL, MZ0380_MB_INT_ACK);
+	spin_unlock_irqrestore(&dev->event_lock, flags);
+}
+EXPORT_SYMBOL_GPL(mz0380_credit_rearm);
 
 /* dev->cmd_lock must remain held until any opcode-specific late reply is read. */
 static int mz0380_send_command_locked(struct mz0380_dev *dev, u32 opcode,
@@ -5229,10 +6122,11 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 
 	pci_clear_master(pci_dev);
 	/*
-	 * We service the card by polling (like the Windows event thread);
-	 * no IRQ handler is registered, so mask INTx at the PCI level.
-	 * A pending assert on the (shared) line otherwise spins the kernel
-	 * in unclaimed-interrupt handling between event and ack.
+	 * Mask INTx for the duration of probe: nothing is registered to service
+	 * the line yet, and a pending assert on a shared line would spin the
+	 * kernel in unclaimed-interrupt handling between event and ack.
+	 * mz0380_irq_request() unmasks it again once an ISR exists, which on
+	 * the default INTx path (M82) is required for any interrupt at all.
 	 */
 	pci_intx(pci_dev, 0);
 	pci_read_config_byte(pci_dev, PCI_CLASS_REVISION, &dev->pci_rev);
@@ -5262,9 +6156,8 @@ static int mz0380_initdev(struct pci_dev *pci_dev,
 		goto fail_disable;
 
 	/*
-	 * Phase 1: firmware load. request_firmware succeeds regardless
-	 * of upload; the actual upload is gated by firmware_upload=1
-	 * because the mailbox protocol still has CHECKME offsets.
+	 * Phase 1: card handshake. Nothing is uploaded - the card boots
+	 * its own flash image; we only shake hands and read its version.
 	 */
 	err = mz0380_firmware_load(dev);
 	if (err) {
@@ -5336,8 +6229,19 @@ static void mz0380_finidev(struct pci_dev *pci_dev)
 
 	mz0380_nosg_capture_stop(dev);	/* join before the bufs it polls die */
 	mz0380_dma_stop(dev);
-	mz0380_dev_unregister(dev);
+	/*
+	 * M84: free the IRQ BEFORE any MMIO mapping goes away. This was the
+	 * other way round, which was survivable only because we ran on MSI: an
+	 * MSI source stops signalling once the device is quiesced, so the
+	 * handler was never entered after the unmap. On the shared INTx line
+	 * the Windows driver uses, every other device on the line enters our
+	 * handler, and the first one to do so between mz0380_dev_unregister()
+	 * and free_irq() dereferenced a NULL bmmio and oopsed inside rmmod -
+	 * leaving the module wedged in MODULE_STATE_GOING (refcnt -1), which
+	 * only a reboot clears.
+	 */
 	mz0380_irq_release(dev);
+	mz0380_dev_unregister(dev);
 	mz0380_dma_teardown(dev);
 	mz0380_firmware_release(dev);
 	pci_clear_master(pci_dev);
@@ -5364,8 +6268,12 @@ static const struct pci_device_id mz0380_pci_tbl[] = {
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, mz0380_pci_tbl);
-MODULE_FIRMWARE("mz0380/MZ0380.HD.HEX");
-MODULE_FIRMWARE("mz0380/MZ0381.HD.HEX");
+/*
+ * The only file this driver ever asks the firmware loader for: the 6-byte
+ * ASCII version sidecar, read so a version mismatch can be reported. No image
+ * is ever sent to the card.
+ */
+MODULE_FIRMWARE("mz0380/MZ0380.FW.TXT");
 
 static struct pci_driver mz0380_pci_driver = {
 	.name = "mz0380",

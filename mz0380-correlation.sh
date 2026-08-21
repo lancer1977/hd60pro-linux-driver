@@ -72,8 +72,6 @@ Options:
       --record-mode-shift S
                      BAR5 bit shift for the record-mode field (default: 0)
       --enable-video  load the probe-safe V4L2 node (required for --input-api v4l2)
-      --firmware-upload
-                     upload mz0380/MZ0380.HD.HEX during probe (Phase 1)
       --enable-dma    alloc rings, request MSI, set bus master  (Phase 2)
                      implies --allow-bus-master
       --enable-audio  register ALSA HDMI audio capture          (Phase 5)
@@ -105,9 +103,9 @@ Examples:
   ./mz0380-correlation.sh --out-dir /tmp/mz0380-run
 
 Bring-up correlation (Phase 1-5):
-  ./mz0380-correlation.sh --profile 5 --firmware-upload --enable-video
-  ./mz0380-correlation.sh --profile 5 --firmware-upload --enable-dma --enable-video
-  ./mz0380-correlation.sh --profile 5 --firmware-upload --enable-dma --enable-audio --enable-video
+  ./mz0380-correlation.sh --profile 5 --enable-video
+  ./mz0380-correlation.sh --profile 5 --enable-dma --enable-video
+  ./mz0380-correlation.sh --profile 5 --enable-dma --enable-audio --enable-video
 
 For the full Phase 1..6 bring-up gate runner see mz0380-bringup.sh.
 EOF
@@ -156,7 +154,7 @@ record_mode_shift="0"
 enable_video=0
 video_node=""
 capture_v4l2=0
-firmware_upload=0
+
 enable_dma=0
 enable_audio=0
 allow_bus_master_arg=0
@@ -315,10 +313,6 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--enable-video)
 		enable_video=1
-		shift
-		;;
-	--firmware-upload)
-		firmware_upload=1
 		shift
 		;;
 	--enable-dma)
@@ -1598,10 +1592,6 @@ fi
 
 if [[ $enable_video -eq 1 ]]; then
 	insmod_args+=(enable_video=1)
-fi
-
-if [[ $firmware_upload -eq 1 ]]; then
-	insmod_args+=(firmware_upload=1)
 fi
 
 if [[ $enable_dma -eq 1 ]]; then

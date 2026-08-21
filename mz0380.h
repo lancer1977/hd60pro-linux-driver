@@ -118,21 +118,19 @@ enum mz0380_property_experiment_result {
 struct mz0380_board {
 	const char *name;
 	const char *windows_driver;
-	const char *firmware_name;       /* main firmware: "MZ0380.HD.HEX"   */
-	const char *firmware_base_name;  /* base/loader firmware (optional)  */
 };
 
 /*
- * Firmware upload state machine.
+ * Card bring-up state machine.
  *
- * The card boots its onboard ARM Linux from the uploaded blob. Bus
- * mastering must stay disabled until READY, otherwise an AMD-Vi
- * IO_PAGE_FAULT was observed at 0x90000000.
+ * The card boots its onboard ARM Linux from its OWN FLASH - the host never
+ * sends an image. REQUESTED means the handshake is in flight. Bus mastering
+ * must stay disabled until READY, otherwise an AMD-Vi IO_PAGE_FAULT was
+ * observed at 0x90000000.
  */
 enum mz0380_fw_state {
 	MZ0380_FW_STATE_NONE = 0,
 	MZ0380_FW_STATE_REQUESTED,
-	MZ0380_FW_STATE_UPLOADING,
 	MZ0380_FW_STATE_READY,
 	MZ0380_FW_STATE_FAILED,
 };
@@ -368,6 +366,7 @@ struct mz0380_dev {
 	 * delivers it as NV12 and respawns (M39: one frame per fresh spawn).
 	 */
 	struct task_struct *nosg_task;
+	struct task_struct *poll_task;
 	u32 nosg_sequence;
 	u32 nosg_spawns;            /* encoder spawns this session (wedge budget) */
 	bool aic_armed;             /* SET_AIC(on=1) already sent this session    */
@@ -386,6 +385,14 @@ struct mz0380_dev {
 	bool have_last_good;
 	bool signal_locked;
 	bool mst3367_ready;	/* receiver reset released + init applied */
+	/*
+	 * M133: last BANK2 0x48 the output diag read successfully. The CSC mode
+	 * is chosen from bits 6:5 of this, and a standalone read of it is not
+	 * reliable - see mz0380_mst3367_apply_csc_mode(). hdcapm caches the same
+	 * register (regb2r48_cached) and now we know why.
+	 */
+	u8 mst_b2_48;
+	bool mst_b2_48_valid;
 
 	/* ALSA */
 	struct snd_card *snd_card;
@@ -599,6 +606,7 @@ void mz0380_signal_event(struct mz0380_dev *dev);
 int mz0380_mst3367_bringup(struct mz0380_dev *dev);
 void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m);
 void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag);
+void mz0380_mst3367_apply_csc_mode(struct mz0380_dev *dev);
 int mz0380_mst3367_ramtest(struct mz0380_dev *dev);	/* M44 */
 int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs);	/* M45 */
 int mz0380_mst3367_reload_edid(struct mz0380_dev *dev);	/* M47 */
@@ -623,8 +631,28 @@ static inline void mz0380_audio_unregister(struct mz0380_dev *dev) {}
 static inline void mz0380_audio_period_elapsed(struct mz0380_dev *dev) {}
 #endif
 
+/*
+ * "derive byte7 from the detected scan" sentinel for vic_in_fmt. Needed so
+ * vic_in_fmt=0 is expressible - see the comment on the parameter in
+ * mz0380-core.c and M103.
+ */
+#define MZ0380_VIC_IN_FMT_AUTO		(~0u)
+
+/*
+ * "do not touch pin 8 at all" sentinel for rx_strap. 0 and 1 are both real
+ * levels, so the leave-alone case needs a third value - see M109.
+ */
+#define MZ0380_RX_STRAP_LEAVE		(~0u)
+
 /* Module-param gates */
-extern bool mz0380_firmware_upload_enabled;
+extern bool mz0380_stream_without_signal;
+extern unsigned int mz0380_op6_kick_ms;
+extern unsigned int mz0380_kick_opcode;
+extern bool mz0380_kick_repeat;
+extern bool mz0380_poll_drain_credit;
+extern unsigned int mz0380_poll_drain_ms;
+void mz0380_credit_rearm(struct mz0380_dev *dev);
+extern unsigned int mz0380_rx_strap;
 extern bool mz0380_enable_dma;
 extern unsigned int mz0380_start_delay_ms;
 extern bool mz0380_stream_nosg;
@@ -649,8 +677,21 @@ extern bool mz0380_aic_every_frame;
 extern bool mz0380_signal_confirm;
 extern unsigned int mz0380_vic_fw;
 extern unsigned int mz0380_vic_out_format;
+extern unsigned int mz0380_cardlog_bytes;
+extern bool mz0380_cardlog_probe_enabled;
+extern unsigned int mz0380_vic_in_w;
+extern unsigned int mz0380_vic_in_h;
+extern unsigned int mz0380_vic_in_fmt;
 extern unsigned int mz0380_vic_saturation;
 extern unsigned int mz0380_vic_b0;
+extern unsigned int mz0380_mst_b1;
+extern unsigned int mz0380_mst_b2;
+/* M130: mz0380_mst_csc_ctl - AUTO picks the mode from BANK2 0x48. */
+#define MZ0380_MST_CSC_CTL_AUTO		0xffffffffu
+#define MZ0380_MST_CSC_CTL_HDCAPM	0x40
+extern unsigned int mz0380_mst_csc_ctl;
+extern unsigned int mz0380_mst_b5;
+extern bool mz0380_mst_b0_late;
 extern unsigned int mz0380_set_buf_opcode;
 extern unsigned int mz0380_signal_cache_ms;
 extern unsigned int mz0380_aic_channels;
@@ -658,6 +699,32 @@ extern unsigned int mz0380_aic_bits;
 extern unsigned int mz0380_aic_freq;
 extern unsigned int mz0380_aic_period_frames;
 extern unsigned int mz0380_aic_periods;
+extern unsigned int mz0380_aic_int_mode;
+/*
+ * M82: no legal saturation value can exceed 255, so a sentinel above the byte
+ * range means "leave vic_color_info untouched".
+ */
+#define MZ0380_VIC_SATURATION_UNSET	0xffffffffu
+extern unsigned int mz0380_vic_color_info;
+extern unsigned int mz0380_vic_fast_kill;
+extern unsigned int mz0380_vic_int_mode;
+extern unsigned int mz0380_vic_nosg;
+extern bool mz0380_win_seq;
+extern bool mz0380_win_start_op6;
+extern bool mz0380_win_bufs_first;
+extern unsigned int mz0380_stop_settle_ms;
+extern bool mz0380_enc_sub;
+extern unsigned int mz0380_enc_mask;
+extern unsigned int mz0380_post_mask;
+extern unsigned int mz0380_post_di;
+extern bool mz0380_fake_frame_off;
+extern bool mz0380_post_proc;
+extern unsigned int mz0380_post_proc_gap_ms;
+extern unsigned int mz0380_post_proc_opcode;
+extern bool mz0380_irq_intx;
+extern bool mz0380_set_buf_op8;
+extern bool mz0380_mst_win_output;
+extern unsigned int mz0380_mst_ad;
 extern bool mz0380_dma_handshake;
 extern bool mz0380_enable_audio;
 extern unsigned int mz0380_video_ring_entries;

@@ -106,8 +106,8 @@ reload_with_fw() {
 	echo "[hunt] building..."; make -s || exit 1
 	rmmod mz0380 2>/dev/null || true
 	load_deps
-	echo "[hunt] loading with firmware_upload=1 $extra (boots the card, ~20s)..."
-	insmod "$MOD" procfs_verbosity=2 firmware_upload=1 enable_video=1 $extra \
+	echo "[hunt] loading with $extra (boots the card, ~20s)..."
+	insmod "$MOD" procfs_verbosity=2 enable_video=1 $extra \
 		|| { echo "[hunt] insmod failed"; dmesg | tail -20; exit 1; }
 }
 

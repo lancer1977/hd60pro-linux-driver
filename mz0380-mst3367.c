@@ -173,10 +173,20 @@ static int mz0380_mst3367_reset(struct mz0380_dev *dev)
 	if (ret)
 		return ret;
 	msleep(50);
-	ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_STRAP, 0);
-	if (ret)
-		return ret;
-	msleep(50);
+	/*
+	 * M109: pin 8 is the companion reset/power strap and this line has
+	 * driven it LOW since the original bring-up, never varied. Pin 9 next
+	 * door is active-low and we release it high; if pin 8 shares that
+	 * convention, LOW holds the companion in reset all session - which
+	 * would explain the dead HDMI passthrough output.
+	 */
+	if (mz0380_rx_strap != MZ0380_RX_STRAP_LEAVE) {
+		ret = mz0380_gpio_set(dev, MZ0380_GPIO_RX_STRAP,
+				      mz0380_rx_strap ? 1 : 0);
+		if (ret)
+			return ret;
+		msleep(50);
+	}
 	return 0;
 }
 
@@ -329,11 +339,34 @@ static int mz0380_mst3367_init_regs(struct mz0380_dev *dev)
 	/* RxVideoInit */
 	MST3367_TRY(mst_bank(dev, MST3367_BANK0));
 	MST3367_TRY(mst_wr(dev, 0xb0, 0x14));
+	/*
+	 * M101: this set does NOT stick. Every output diag since the readback
+	 * was added reads 0xae = 0x20, bit2 clear, on runs where this line has
+	 * executed - while 0xad and 0xb4, written by the same helper two lines
+	 * below, both read back exactly as written. So the bus is fine and
+	 * something specific to 0xae bit2 is going on: either it is write-only
+	 * or self-clearing (a strobe), or the card's own firmware rewrites the
+	 * register. Read it straight back here to tell those apart - if it
+	 * reads 0x24 now and 0x20 later, something clears it; if it reads 0x20
+	 * now, the write is simply rejected.
+	 *
+	 * Consequence either way: M99 scored "0xae |= 0x04 is neutral" on a
+	 * write that was never in the register. That register is UNTESTED, not
+	 * neutral.
+	 */
 	MST3367_TRY(mst_set(dev, 0xae, 0x04));
+	{
+		u8 ae_rb = 0;
+
+		if (!mst_rd(dev, 0xae, &ae_rb))
+			pr_info("%s: RxVideoInit: 0xae |= 0x04 -> reads back %02x%s\n",
+				dev->name, ae_rb,
+				(ae_rb & 0x04) ? "" : " (BIT2 DID NOT STICK)");
+	}
 	MST3367_TRY(mst_wr(dev, 0xad, 0x05)); /* enable low-pass filter */
 	/* Exact HD60 Pro FUN_14024dc28 values (the sibling uses e0/08). */
-	MST3367_TRY(mst_wr(dev, 0xb1, 0xc0));
-	MST3367_TRY(mst_wr(dev, 0xb2, 0x00));
+	MST3367_TRY(mst_wr(dev, 0xb1, mz0380_mst_b1 & 0xff));
+	MST3367_TRY(mst_wr(dev, 0xb2, mz0380_mst_b2 & 0xff));
 	MST3367_TRY(mst_wr(dev, 0xb3, 0x00));
 	MST3367_TRY(mst_wr(dev, 0xb4, 0x55));
 
@@ -385,13 +418,35 @@ static int mz0380_mst3367_init_regs(struct mz0380_dev *dev)
 	MST3367_TRY(mst_wr(dev, 0x1e, 0x11));
 	MST3367_TRY(mst_wr(dev, 0x1f, 0x01));
 	MST3367_TRY(mst_wr(dev, 0x73, 0x90));
-	MST3367_TRY(mst_wr(dev, 0xb5, 0x0c));
+	MST3367_TRY(mst_wr(dev, 0xb5, mz0380_mst_b5 & 0xff));
 
 	/* CSC */
 	MST3367_TRY(mst_wr(dev, 0x90, 0x15));
 	MST3367_TRY(mst_wr(dev, 0x91, 0x15));
-	for (i = 0; i < ARRAY_SIZE(csctbl); i++)
-		MST3367_TRY(mst_wr(dev, 0x92 + i, csctbl[i]));
+	for (i = 0; i < ARRAY_SIZE(csctbl); i++) {
+		/*
+		 * M130: csctbl[0] lands on 0x92, the CSC control byte - the
+		 * only entry that is not a coefficient. Overridable so a
+		 * YUV444 source can try bypassing the conversion entirely.
+		 * See mz0380_mst_csc_ctl in mz0380-core.c.
+		 */
+		u8 val = csctbl[i];
+
+		if (!i && mz0380_mst_csc_ctl != MZ0380_MST_CSC_CTL_AUTO)
+			val = mz0380_mst_csc_ctl & 0xff;
+
+		MST3367_TRY(mst_wr(dev, 0x92 + i, val));
+	}
+	/*
+	 * AUTO leaves hdcapm's byte here on purpose: this runs before HPD, so
+	 * nothing is transmitting and the input colour space is not yet
+	 * knowable. mz0380_mst3367_apply_csc_mode() re-applies it at stream
+	 * start, once the receiver has locked.
+	 */
+	if (mz0380_mst_csc_ctl != MZ0380_MST_CSC_CTL_AUTO &&
+	    (mz0380_mst_csc_ctl & 0xff) != csctbl[0])
+		pr_info("%s: MST3367 CSC control 0x92 forced to 0x%02x (hdcapm default 0x%02x)\n",
+			dev->name, mz0380_mst_csc_ctl & 0xff, csctbl[0]);
 
 	/* YUV422, 8-bit, external sync */
 	MST3367_TRY(mst_wr(dev, 0xb0, 0x20));
@@ -1197,7 +1252,10 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_watch);
 void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag)
 {
 	u8 r55 = 0, ab = 0, b0 = 0, b1 = 0, b2 = 0, b3 = 0, b7 = 0, r51 = 0;
+	u8 ad = 0, ae = 0, b4 = 0, b5 = 0;
 	u8 b2_01 = 0, b2_02 = 0, b2_07 = 0;
+	u8 b1_01 = 0, b1_34 = 0, b2_0b = 0, b2_0c = 0, b2_0e = 0, b2_48 = 0;
+	bool link_read = false;
 
 	if (dev->fw_state != MZ0380_FW_STATE_READY || !dev->mst3367_ready)
 		return;
@@ -1207,6 +1265,19 @@ void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag)
 		goto out;
 	mst_rd(dev, MST3367_B0_DETECT, &r55);
 	mst_rd(dev, 0xab, &ab);
+	/*
+	 * M99: the three registers the Windows output-stage block writes and
+	 * that we never read back. Write ops return result 0x00 whatever the
+	 * bus does - the firmware forces it - so ret=0 on mst_wr() is NOT
+	 * evidence a write landed. Only a read-back is. M99 scored MSTOUT=1 as
+	 * neutral without them; that verdict is only sound if these three read
+	 * ad=00 ae|=04 b4=54 on a MSTOUT=1 run.
+	 */
+	mst_rd(dev, 0xad, &ad);
+	mst_rd(dev, 0xae, &ae);
+	mst_rd(dev, 0xb4, &b4);
+	/* M126: 0xb5 is resolution-dependent in gchd and a fixed constant here. */
+	mst_rd(dev, 0xb5, &b5);
 	mst_rd(dev, 0xb0, &b0);
 	mst_rd(dev, 0xb1, &b1);
 	mst_rd(dev, 0xb2, &b2);
@@ -1217,13 +1288,52 @@ void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag)
 		mst_rd(dev, 0x01, &b2_01);
 		mst_rd(dev, 0x02, &b2_02);
 		mst_rd(dev, 0x07, &b2_07);
+		/* M78: HDMI packet reception (hdcapm MST3367_HdmiGetPacketStatus). */
+		mst_rd(dev, 0x0b, &b2_0b);
+		mst_rd(dev, 0x0c, &b2_0c);
+		mst_rd(dev, 0x0e, &b2_0e);
+		mst_rd(dev, 0x48, &b2_48);
+		mst_bank(dev, MST3367_BANK0);
+		/*
+		 * M133: cache it for mz0380_mst3367_apply_csc_mode(). This read
+		 * path is the one proven to work on hardware; the standalone one
+		 * returned 0x00 while this returned 0xd2 156 ms later.
+		 */
+		dev->mst_b2_48 = b2_48;
+		dev->mst_b2_48_valid = true;
+	}
+	/*
+	 * M78: the LINK layer, which we have never read. R55 lock only says the
+	 * timing front end recovered a clock; whether the receiver forwards
+	 * pixels to BT1120 depends on whether the source came up in HDMI mode
+	 * and on HDCP. hdcapm's RxTmdsGetType: BANK1 0x01 bit2 = HDMI (else
+	 * DVI), bit0 = HDCP present, BANK1 0x34 bit7 = HDCP active. These are
+	 * the same two registers the Windows driver reads right after its
+	 * output-stage commit.
+	 */
+	if (!mst_bank(dev, MST3367_BANK1)) {
+		mst_rd(dev, 0x01, &b1_01);
+		mst_rd(dev, 0x34, &b1_34);
+		link_read = true;
 		mst_bank(dev, MST3367_BANK0);
 	}
 
-	pr_info("%s: output stage [%s]: R55=%02x %s | B0: ab=%02x b0=%02x b1=%02x b2=%02x b3=%02x b7=%02x 51=%02x | B2: 01=%02x 02=%02x 07=%02x\n",
+	pr_info("%s: output stage [%s]: R55=%02x %s | B0: ab=%02x ad=%02x ae=%02x b0=%02x b1=%02x b2=%02x b3=%02x b4=%02x b5=%02x b7=%02x 51=%02x | B2: 01=%02x 02=%02x 07=%02x\n",
 		dev->name, tag, r55,
 		mst3367_status_locked(r55) ? "LOCKED" : "no-lock",
-		ab, b0, b1, b2, b3, b7, r51, b2_01, b2_02, b2_07);
+		ab, ad, ae, b0, b1, b2, b3, b4, b5, b7, r51,
+		b2_01, b2_02, b2_07);
+	if (link_read)
+		pr_info("%s: link [%s]: B1 01=%02x 34=%02x -> %s, HDCP %s%s | B2 0b=%02x 0c=%02x 0e=%02x 48=%02x, input colorspace %s\n",
+			dev->name, tag, b1_01, b1_34,
+			(b1_01 & 0x04) ? "HDMI" : "DVI (source fell back - EDID?)",
+			(b1_01 & 0x01) ? "present" : "absent",
+			(b1_34 & 0x80) ? ", ACTIVE (encrypted)" : "",
+			b2_0b, b2_0c, b2_0e, b2_48,
+			/* hdcapm MST3367_HdmiGetPacketColor: B2 0x48 bits 6:5 */
+			(b2_48 & 0x60) == 0x00 ? "RGB" :
+			(b2_48 & 0x60) == 0x20 ? "YUV422" :
+			(b2_48 & 0x60) == 0x40 ? "YUV444" : "undefined");
 	if (ab & 0x80)
 		pr_warn("%s: output stage [%s]: 0xab bit7 is STILL SET - the output is frozen\n",
 			dev->name, tag);
@@ -1231,6 +1341,93 @@ out:
 	mutex_unlock(&mst3367_lock);
 }
 EXPORT_SYMBOL_GPL(mz0380_mst3367_output_diag);
+
+/*
+ * M130: choose the CSC mode from the colour space the source is ACTUALLY
+ * sending, and apply it.
+ *
+ * hdcapm reads the input colour space (BANK2 0x48 bits 6:5) into
+ * regb2r48_cached and then never uses it: its CSC table goes out
+ * unconditionally. That is harmless on its board, whose EDID makes sources
+ * send RGB, so its fixed RGB->YCbCr matrix is always right. We push no EDID
+ * (M127) and this source picks YUV444, so the same matrix converts YCbCr as
+ * though it were RGB - measured on hardware as chroma 96% ANTI-correlated
+ * with luma (M129/M130), because HDMI puts Cb on blue, Y on green and Cr on
+ * red and an RGB matrix therefore computes Cb_out = -0.291*Y + ...
+ *
+ * With a YCbCr input and a YCbCr 4:2:2 output over BT1120 there is nothing to
+ * convert, and clearing 0x92 bypasses the conversion. Verified on hardware:
+ * corr(chroma, luma) went -0.966/-0.749 to -0.319/+0.349 and the picture came
+ * out in correct, natural colour.
+ *
+ * This cannot live in init_regs(): that runs at bring-up, before HPD is even
+ * asserted, so nothing is transmitting and 0x48 is meaningless. It has to be
+ * re-applied once the receiver has locked, which is why the stream-start path
+ * calls it.
+ */
+void mz0380_mst3367_apply_csc_mode(struct mz0380_dev *dev)
+{
+	static const char * const names[] = {
+		"RGB", "YUV422", "YUV444", "undefined"
+	};
+	u8 b2_48 = 0;
+	unsigned int cs;
+	bool cached;
+	u8 want;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY || !dev->mst3367_ready)
+		return;
+
+	/*
+	 * M133: prefer the value the output diag last read. A standalone
+	 * BANK2 0x48 read from here is NOT reliable - on the M133 run it
+	 * returned 0x00 (which decodes as RGB, the wrong branch) while the
+	 * diag read 0xd2 (YUV444) from the same register 156 ms later, and the
+	 * receiver was locked throughout. Rather than add a second read path
+	 * and hope, reuse the one that demonstrably works. This is also why
+	 * hdcapm caches the register instead of re-reading it.
+	 *
+	 * The stream-start path calls the diag immediately before us, so the
+	 * cache is fresh. Falling back to our own read keeps this correct for
+	 * any caller that has not.
+	 */
+	cached = dev->mst_b2_48_valid;
+	if (cached) {
+		b2_48 = dev->mst_b2_48;
+		mutex_lock(&mst3367_lock);
+	} else {
+		mutex_lock(&mst3367_lock);
+		if (mst_bank(dev, MST3367_BANK2))
+			goto out;
+		if (mst_rd(dev, 0x48, &b2_48))
+			goto out;
+		if (mst_bank(dev, MST3367_BANK0))
+			goto out;
+	}
+
+	cs = (b2_48 & 0x60) >> 5;
+	if (mz0380_mst_csc_ctl == MZ0380_MST_CSC_CTL_AUTO) {
+		/*
+		 * Convert only for an RGB source. "undefined" keeps hdcapm's
+		 * value: it is what every board that works today ships with,
+		 * so it is the safer thing to fall back to when 0x48 has not
+		 * settled.
+		 */
+		want = (cs == 1 || cs == 2) ? 0x00 : MZ0380_MST_CSC_CTL_HDCAPM;
+	} else {
+		want = mz0380_mst_csc_ctl & 0xff;
+	}
+
+	if (mst_wr(dev, 0x92, want))
+		goto out;
+	pr_info("%s: MST3367 CSC 0x92 = 0x%02x (%s, input colorspace %s from 0x48=%02x, %s)\n",
+		dev->name, want,
+		mz0380_mst_csc_ctl == MZ0380_MST_CSC_CTL_AUTO ? "auto" : "forced",
+		names[cs], b2_48, cached ? "cached" : "read here");
+out:
+	mutex_unlock(&mst3367_lock);
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_apply_csc_mode);
 
 void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m)
 {
@@ -1500,6 +1697,22 @@ static bool mst3367_in_range(const struct mst3367_mode *e, u16 htotal,
  * So the table stays verbatim and only htotal is normalised. Raw units are
  * tried first, since the chip does report the x1.5 domain for some sources.
  *
+ * M79 (hardware). A third domain exists, and it is HDMI DEEP COLOUR. The
+ * chip counts htotal in TMDS character clocks, which deep colour scales:
+ * 24-bit = x1, 30-bit = x1.25, 36-bit = x1.5. That is exactly why hdcapm
+ * carries 720p60 twice (1650 true, 2475 = x1.5): the second row is a 36-bit
+ * source, not a different mode.
+ *
+ * A source arriving here read htot=2750 vtot=1125 hact=1920 hper=674
+ * vper=599 - self-consistent 1080p60 in every field except htotal, and
+ * 2750 == 2200 x 1.25, i.e. 30-bit deep colour. Only the TMDS-domain counter
+ * moves: hperiod and vperiod run off a fixed reference and read unchanged
+ * (67.4 kHz / 59.9 Hz), and hactive is a video-domain counter and reads a
+ * true 1920. The table sits in the x1.5 domain, so the correction from a
+ * 30-bit measurement is x1.5/x1.25 = x6/5: 2750 * 6 / 5 == 3300, dead centre
+ * of the 1080p60 row. Without it a perfectly good 1080p60 source is rejected
+ * as "coherent but unsupported" and never reaches STREAMON at all.
+ *
  * (M57 read x1.25/x0.8 into the vertical fields too. That was fitted to one
  * torn sample - htot=2200 vtot=899 vper=750 is a self-consistent 75Hz, the
  * right TMDS clock with vsync still settling, not a unit mismatch. Retracted.)
@@ -1519,6 +1732,16 @@ mst3367_match_mode(const struct mst3367_measured *m, bool *scaled)
 
 	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++)
 		if (mst3367_in_range(&mst3367_modes[i], m->htotal * 3 / 2,
+				     m->vtotal, m->hperiod,
+				     m->vperiod, m->interlaced)) {
+			if (scaled)
+				*scaled = true;
+			return &mst3367_modes[i].timings;
+		}
+
+	/* M79: 30-bit deep colour reports x1.25; the table is x1.5. */
+	for (i = 0; i < ARRAY_SIZE(mst3367_modes); i++)
+		if (mst3367_in_range(&mst3367_modes[i], m->htotal * 6 / 5,
 				     m->vtotal, m->hperiod,
 				     m->vperiod, m->interlaced)) {
 			if (scaled)
@@ -1603,17 +1826,112 @@ mst3367_commit_digital_output(struct mz0380_dev *dev,
 	ret = mst_bank(dev, MST3367_BANK0);
 	if (ret)
 		return ret;
-	ret = mst_wr(dev, 0xb2, special_720p30 ? 0x03 : 0x00);
+
+	/*
+	 * M94: the Windows output-stage block, recovered from
+	 * e60MZ0380.X64.SYS 0x14024fc08..0x14024fd0e. The I2C write helper takes
+	 * the register in [rsp+0x20] and the value in [rsp+0x28] with r8b = 0x9c
+	 * and edx = 0 (bank 0), which makes the whole sequence readable:
+	 *
+	 *   0xb0  = 0x14          (plain write - dil, loaded at 0x14024fc08)
+	 *   0xae |= 0x04          (read-modify-write via the read helper)
+	 *   0xad  = 0 or 1        (seta on a context flag at rbx+0x8540)
+	 *   0xb1  = 0xc0
+	 *   0xb2  = 0             (bpl)
+	 *   0xb3  = 0             (0xff only on the board whose id bytes are
+	 *                          0x5f/0x05 - explicitly not this one)
+	 *   0xb4  = 0x55, then &= 0xfc   -> 0x54
+	 *
+	 * Our long-standing commit writes 0xb2, brackets 0xab bit7 and
+	 * read-modify-writes 0xb0 - and never touches 0xad, 0xae or 0xb4 at all.
+	 * 0xb1/0xb2/0xb3 read back matching Windows already; 0xb0 does not
+	 * (0x21 vs 0x14), and three registers are simply unset.
+	 *
+	 * M80 swept vic_b0 0x21 against 0x14 and found 0x14 WORSE - but that was
+	 * 0xb0 alone, with 0xae/0xad/0xb4 still at power-on. This is the first
+	 * time the block has been written as a block. Off by default; the
+	 * receiver output stage is the one place a "VIC sees nothing on BT1120"
+	 * verdict can originate that the host can still reach.
+	 */
+	if (mz0380_mst_win_output) {
+		ret = mst_set(dev, 0xab, 0x80);	/* freeze while retiming */
+		if (!ret)
+			ret = mst_wr(dev, 0xb0, mz0380_vic_b0 & 0xff);
+		if (!ret)
+			ret = mst_set(dev, 0xae, 0x04);
+		if (!ret)
+			ret = mst_wr(dev, 0xad, mz0380_mst_ad & 0xff);
+		if (!ret)
+			ret = mst_wr(dev, 0xb1, mz0380_mst_b1 & 0xff);
+		if (!ret)
+			ret = mst_wr(dev, 0xb2, mz0380_mst_b2 & 0xff);
+		if (!ret)
+			ret = mst_wr(dev, 0xb3, 0x00);
+		if (!ret)
+			ret = mst_wr(dev, 0xb4, 0x55);
+		if (!ret)
+			ret = mst_clr(dev, 0xb4, 0x03);
+		clear_ret = mst_clr(dev, 0xab, 0x80);
+		pr_info("%s: MST3367 output stage: Windows block applied (b0=%02x ae|=04 ad=%02x b1=%02x b2=%02x b3=00 b4=54) ret=%d\n",
+			dev->name, mz0380_vic_b0 & 0xff,
+			mz0380_mst_ad & 0xff, mz0380_mst_b1 & 0xff,
+			mz0380_mst_b2 & 0xff, ret);
+		return ret ? ret : clear_ret;
+	}
+
+	/*
+	 * M100: BANK0 0xb0 is fully decoded now, from hdcapm's own commented-out
+	 * alternatives (mst3367-drv.c, end of the init function) - the same
+	 * receiver, values straight off a vendor trace:
+	 *
+	 *   0x25  RX_OUTPUT_YUV422 / 10.BITS / (EMBEDDED sync, by the bit rule)
+	 *   0x24  RX_OUTPUT_YUV422 / 10.BITS / EXTERNAL SYNC
+	 *   0x21  RX_OUTPUT_YUV422 / 08.BITS / EMBEDDED SYNC   <- ours
+	 *   0x20  RX_OUTPUT_YUV422 / 08.BITS / EXTERNAL SYNC
+	 *
+	 * so: bit0 = embedded (1) vs external (0) sync, bit2 = 10-bit (1) vs
+	 * 8-bit (0). This RETIRES the "bit0 is unidentified" comment that stood
+	 * for months, and corrects M96, which inferred bit0 was a bus-width /
+	 * clock-rate select from the receiver's period counters halving.
+	 *
+	 * It also explains every result we have. Both values that write nothing
+	 * at all (Windows' 0x14 and hdcapm's 0x20) have bit0 = 0, i.e. EXTERNAL
+	 * sync; the only value that gets the VIC to initialise (0x21) is the
+	 * EMBEDDED-sync one. The SoC's VIC wants CCIR timing codes in-stream,
+	 * which is also the half of "(CCIR or width chck fail)" we can now see
+	 * we are on the right side of.
+	 *
+	 * Untried and the obvious next step: 0x25, which is 0x21 plus bit2 -
+	 * one bit off the only value known to reach VIC init, and BT.1120 is
+	 * natively a 20-bit interface (10-bit Y + 10-bit C). Feeding a 10-bit
+	 * VIC an 8-bit stream is precisely a width/structure mismatch.
+	 */
+	ret = mst_wr(dev, 0xb2, special_720p30 ? 0x03 : (mz0380_mst_b2 & 0xff));
 	if (ret)
 		return ret;
 	ret = mst_set(dev, 0xab, 0x80);
 	if (ret)
 		return ret;
 	ret = mst_rd(dev, 0xb0, &b0);
-	if (!ret)
-		ret = mst_wr(dev, 0xb0, (b0 & 0xc2) |
-			     (special_720p30 ? 0x20 : (mz0380_vic_b0 & 0x3d)));
-	clear_ret = mst_clr(dev, 0xab, 0x80);
+	if (!ret) {
+		u8 b0val = (b0 & 0xc2) |
+			   (special_720p30 ? 0x20 : (mz0380_vic_b0 & 0x3d));
+
+		/*
+		 * M126: gchd's order - configuration first with the embedded-sync
+		 * bit low, then assert it as the last write, outside the freeze.
+		 */
+		ret = mst_wr(dev, 0xb0,
+			     mz0380_mst_b0_late ? (u8)(b0val & ~0x01) : b0val);
+		clear_ret = mst_clr(dev, 0xab, 0x80);
+		if (mz0380_mst_b0_late && !ret && !clear_ret) {
+			ret = mst_wr(dev, 0xb0, b0val);
+			pr_info("%s: MST3367 0xb0 committed in two steps: %02x (frozen) then %02x (after unfreeze) ret=%d\n",
+				dev->name, (u8)(b0val & ~0x01), b0val, ret);
+		}
+	} else {
+		clear_ret = mst_clr(dev, 0xab, 0x80);
+	}
 
 	return ret ? ret : clear_ret;
 }

@@ -63,19 +63,77 @@ LOCKWAIT=${2:-45}
 NOSG=${NOSG:-0}
 make >/dev/null || { echo "build failed"; exit 1; }
 
+# M85: never spend a hardware run on a module that cannot unload cleanly.
+# An oops in the exit path wedges the module in MODULE_STATE_GOING, which
+# no rmmod (not even -f) can clear - it costs a full power-cycle. The check
+# is a few seconds and zero encoder spawns. SKIPSMOKE=1 to bypass.
+if [ "${SKIPSMOKE:-0}" != 1 ]; then
+	state=$(cat /sys/module/mz0380/initstate 2>/dev/null || true)
+	if [ "$state" = going ]; then
+		echo "mz0380 is wedged in MODULE_STATE_GOING - power-cycle required"; exit 1
+	fi
+	./mz0380-m85-unload-smoke.sh >/tmp/mz0380-smoke.log 2>&1 || {
+		echo "load/unload smoke test FAILED - see /tmp/mz0380-smoke.log"
+		tail -20 /tmp/mz0380-smoke.log
+		exit 1
+	}
+	echo "(load/unload smoke test clean)"
+fi
+
 VIDEO_NODE=$(find_mz_video_node 2>/dev/null || true)
 [ -z "$VIDEO_NODE" ] || fuser -k "$VIDEO_NODE" 2>/dev/null
 rmmod mz0380 2>/dev/null
 VIDEO_NODE=
 sleep 1
 modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
+# M89: pass a knob ONLY when the caller actually set it, so the DRIVER's own
+# default always governs otherwise. Hardcoding "${VAR:-<literal>}" here silently
+# overrides the module default the moment the two drift apart - which is exactly
+# what happened after M88: vic_fw's default was corrected to 5 in the driver
+# while this script still forced vic_fw=0, and 0 means "use the Windows rule",
+# so the run went out at fw=7 and burned a hardware pass proving nothing.
+OPTARGS=""
+add_opt() {   # add_opt <module-param> <env-value>
+	[ -z "$2" ] || OPTARGS="$OPTARGS $1=$2"
+}
+add_opt vic_fw          "${VICFW:-}"
+add_opt vic_out_format  "${VICM:-}"
+add_opt win_seq         "${WINSEQ:-}"
+add_opt irq_intx        "${INTX:-}"
+add_opt enc_sub         "${ENCSUB:-}"
+add_opt win_start_op6   "${OP6:-}"
+add_opt win_bufs_first  "${WINBUFS:-}"
+add_opt set_buf_op8     "${OP8:-}"
+add_opt probe_windows   "${PROBEWIN:-}"
+add_opt mst_win_output  "${MSTOUT:-}"
+add_opt mst_ad          "${MSTAD:-}"
+# M96: these five used to be hardcoded in the insmod line below with literal
+# defaults (0/0/0/0x21/2). They all happened to match the driver, but that is
+# exactly the drift trap method rule 4 names - route them through add_opt too.
+add_opt vic_in_w        "${VICINW:-}"
+add_opt vic_in_h        "${VICINH:-}"
+add_opt vic_in_fmt      "${VICINFMT:-}"
+add_opt vic_b0          "${VICB0:-}"
+add_opt mst_b1          "${MSTB1:-}"
+add_opt mst_b2          "${MSTB2:-}"
+add_opt mst_b5          "${MSTB5:-}"
+add_opt mst_b0_late     "${B0LATE:-}"
+add_opt set_buf_opcode  "${SETBUF:-}"
+add_opt rx_strap        "${RXSTRAP:-}"
+add_opt poll_drain_ms   "${POLLDRAIN:-}"
+add_opt poll_drain_credit "${POLLCREDIT:-}"
+add_opt op6_kick_ms     "${OP6KICK:-}"
+add_opt kick_opcode     "${KICKOP:-}"
+add_opt kick_repeat     "${KICKREP:-}"
+add_opt stream_without_signal "${NOSRC:-}"
+
 dmesg -C
-insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
+insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
 	enable_video=1 procfs_verbosity=2 dma_iova_remap=1 aic_on=1 \
 	stream_nosg="$NOSG" force_timings=0 signal_poll_ms=4000 \
-	set_buf_opcode="${SETBUF:-2}" vic_fw="${VICFW:-5}" \
+	$OPTARGS ${EXTRA:-} \
 	|| { echo "insmod failed"; exit 1; }
-echo "waiting for firmware upload + boot..."
+echo "waiting for the card to finish booting its own flash image..."
 sleep 25
 
 VIDEO_NODE=$(find_mz_video_node) || {
@@ -102,6 +160,12 @@ v4l2-ctl -d "$VIDEO_NODE" --set-input=0 || {
 # only after the transient lock had already disappeared.
 if [ "$NOSG" = 1 ]; then
 	echo "=== 1. NOSG=1: skipping receiver lock (card-side diagnostic only) ==="
+elif [ "${NOSRC:-0}" = 1 ]; then
+	# M113: deliberately no source connected. There is nothing to lock, so
+	# skip the gate entirely - the card still runs its capture path and
+	# falls back to its own no-signal splash, which is what Windows shows
+	# in OBS in exactly this situation.
+	echo "=== 1. NOSRC=1: no source connected, skipping the receiver lock ==="
 else
 	echo "=== 1. HPD edge, then poll timings while YOU power-cycle the source ==="
 	dmesg -C
@@ -139,11 +203,26 @@ else
 fi
 
 echo
-echo "=== 2. capture $FRAMES frames - POWER-CYCLE THE SOURCE ONCE STREAMING STARTS ==="
-# M58: the nosg path delivers raw NV12, not H.264 - name the file for what it
+if [ "${NOSRC:-0}" = 1 ]; then
+	echo "=== 2. capture $FRAMES frames - NO SOURCE, expecting the card's own splash ==="
+else
+	echo "=== 2. capture $FRAMES frames - POWER-CYCLE THE SOURCE ONCE STREAMING STARTS ==="
+fi
+# M130: the payload is planar I420 (Y, then two 960x540 planes), NOT NV12.
+# The .nv12 name is historical and has cost two viewing mistakes; the ffplay
+# hints below say yuv420p. Decoding it as nv12 gives magenta/green interleave
+# banding on an otherwise perfect picture.
+# M58: the nosg path delivers raw 4:2:0, not H.264 - name the file for what it
 # actually holds so the check below is not nonsense (the M57 run "failed"
-# ffprobe purely because raw NV12 was written to a .h264 name).
-if [ "$NOSG" = 1 ]; then CAP=/tmp/cap-m55.nv12; else CAP=/tmp/cap-m55.h264; fi
+# ffprobe purely because raw 4:2:0 was written to a .h264 name).
+# M111: with POLLDRAIN set the real path also delivers raw 4:2:0, not H.264 -
+# the card writes a 1920x1080 4:2:0 frame and no bitstream. Name the file for
+# what it holds, or the ffprobe check below is nonsense (same trap as M57).
+if [ "$NOSG" = 1 ] || [ -n "${POLLDRAIN:-}" ] || [ "${NOSRC:-0}" = 1 ]; then
+	CAP=/tmp/cap-m55.nv12
+else
+	CAP=/tmp/cap-m55.h264
+fi
 rm -f "$CAP"
 dmesg -C
 
@@ -157,7 +236,15 @@ dmesg -C
 # The concurrent watch is read-only and correlates what the receiver saw with
 # what the encoder produced: without it, "0 bytes" cannot distinguish "the
 # source never transmitted" from "it did and the card dropped the frames".
-CAPWAIT=${CAPWAIT:-60}
+# M113: with no source there is nothing to wait for - no burst to catch, no
+# power-cycle to prompt for. A 60s window would just be 60s of nothing, which
+# is most of why this script feels slow.
+if [ "${NOSRC:-0}" = 1 ]; then
+	CAPWAIT=${CAPWAIT:-10}
+	WATCH=${WATCH:-0}
+else
+	CAPWAIT=${CAPWAIT:-60}
+fi
 
 # M68: give the source a REASON to transmit while the encoder is armed.
 #
@@ -196,7 +283,14 @@ echo "   >>> ALSO power-cycle the source a couple of times over ${CAPWAIT}s   <<
 echo "   >>> - whichever makes it transmit, the encoder is already armed.  <<<"
 echo
 
-timeout "$CAPWAIT" v4l2-ctl -d "$VIDEO_NODE" --stream-mmap --stream-count="$FRAMES" \
+# M116: v4l2-ctl blocks until --stream-count frames arrive. While the card
+# delivers only ONE frame per stream (the open cadence problem), asking for more
+# guarantees that `timeout` SIGTERMs it mid-write and the last frame loses its
+# unflushed stdio tail - the first OP8 run captured 3108864 of 3110400 bytes,
+# short by exactly the 1536-byte remainder, and ffplay rejected the whole file.
+# SIGINT first gives v4l2-ctl a chance to close the file cleanly.
+timeout -s INT --foreground "$CAPWAIT" \
+	v4l2-ctl -d "$VIDEO_NODE" --stream-mmap --stream-count="$FRAMES" \
 	--stream-to="$CAP"
 SZ=$(stat -c %s "$CAP" 2>/dev/null || echo 0)
 [ -z "$WATCH_PID" ] || wait "$WATCH_PID" 2>/dev/null
@@ -206,15 +300,35 @@ echo "--- did the receiver see the source while the encoder was running? ---"
 dmesg | grep -E "detect 55=|MST3367 signal" | tail -12
 
 echo "=== 3. what did the card do? ==="
-dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal" | head -20
+# M132: "MST3367 CSC" added - mz0380_mst3367_apply_csc_mode() logs which CSC
+# mode it picked and why, and the old pattern filtered it out, so the one line
+# that confirms the colour knob landed was invisible. Method rule 9.
+dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal|poll-drain|MST3367 CSC" | head -24
 # M70: the per-buffer poison scan is the "did H.264 bytes land without a
 # completion" measurement - it has been printed at every stop and filtered
 # out by the grep above this whole time.
 echo "--- MST3367 output stage (is the receiver clocking BT1120 out?) ---"
 dmesg | grep -E "output stage" | tail -6
+# M78: the link layer. R55 lock is only the timing front end; BANK1 0x01 bit2
+# says whether the source actually came up in HDMI mode or fell back to DVI.
+echo "--- link layer (HDMI vs DVI, HDCP) ---"
+dmesg | grep -E "link \[" | tail -6
 echo "--- buffer poison scan (pages touched = card wrote data) ---"
 dmesg | grep -E "stop buf\[" | tail -8
 dmesg | grep -E "encoder spawns|entering the range|SET_AIC\(on=0\)" | tail -3
+
+# M76: the card writes ~3.1 MB into buf0 on the real path (head 0x11 = its own
+# NO-SIGNAL splash). Dump it before the module is unloaded so the content can
+# be identified offline instead of guessed from 16 head bytes.
+BUF0=${BUF0:-/tmp/mz0380-buf0.bin}
+if [ -r /proc/mz0380-buf0 ]; then
+	dd if=/proc/mz0380-buf0 of="$BUF0" bs=1M status=none 2>/dev/null
+	echo "--- buf0 dumped to $BUF0 ($(stat -c %s "$BUF0" 2>/dev/null || echo 0) bytes) ---"
+	echo "    first 32 bytes:"
+	head -c 32 "$BUF0" | od -An -tx1
+	echo "    bytes at 0xbdd80 (UV plane if this is the 720x1080 splash):"
+	dd if="$BUF0" bs=1 skip=$((0xbdd80)) count=16 status=none | od -An -tx1
+fi
 
 # M59: a wall of SET_VIC ret=-110 is the known wedge, not a capture bug. The
 # mailbox stops answering after enough encoder spawns and ONLY a mains-off
@@ -228,10 +342,41 @@ if [ "$(dmesg | grep -c 'ret=-110')" -gt 2 ]; then
 fi
 if [ "$SZ" -gt 0 ] && [ "$NOSG" = 1 ]; then
 	echo "=== 4. NOSG diagnostic frame (card-generated; not HDMI pixels) ==="
-	echo "The NV12 payload proves only the fake-frame encoder/DMA path."
+	echo "The raw payload proves only the fake-frame encoder/DMA path."
 	head -c 64 "$CAP" | od -An -tx1
 elif [ "$SZ" -gt 0 ]; then
-	echo "=== 4. does it look like H.264? (expect 00 00 00 01 NAL starts) ==="
-	head -c 32 "$CAP" | od -An -tx1
-	command -v ffprobe >/dev/null && ffprobe -v error -show_streams "$CAP" 2>&1 | head -20
+	if [ -n "${POLLDRAIN:-}" ] || [ "$NOSG" = 1 ]; then
+		# M115: this path delivers RAW planar 4:2:0, so the H.264 NAL check and
+		# ffprobe are nonsense on it - the first run reported the file as
+		# "ADPCM Nintendo Gamecube DTK", which is ffprobe guessing at
+		# planar YUV. Check what actually matters instead: whole frames.
+		SZ4=$(stat -c %s "$CAP")
+		FRAMESZ=$((1920 * 1080 * 3 / 2))
+		echo "=== 4. raw planar I420 sanity ($FRAMESZ bytes per frame) ==="
+		head -c 32 "$CAP" | od -An -tx1
+		WHOLE=$((SZ4 / FRAMESZ))
+		REM=$((SZ4 % FRAMESZ))
+		echo "  captured $SZ4 bytes = $WHOLE whole frames + $REM bytes"
+		if [ "$REM" -ne 0 ] && [ "$WHOLE" -ge 1 ]; then
+			# M116: drop the partial tail so the file is playable. The
+			# tail is either a torn DMA or v4l2-ctl killed mid-write;
+			# either way it is not a frame and ffplay rejects the file
+			# because of it.
+			truncate -s $((WHOLE * FRAMESZ)) "$CAP"
+			echo "  trimmed the $REM-byte partial tail -> $WHOLE playable frame(s)"
+		elif [ "$REM" -ne 0 ]; then
+			echo "  WARNING: $REM bytes and NOT ONE whole frame."
+			echo "  The driver log above shows what it delivered - if it says"
+			echo "  length=$FRAMESZ then v4l2-ctl was killed mid-write, so ask"
+			echo "  for a count the card can actually deliver:"
+			echo "      sudo POLLDRAIN=20 $0 1"
+		fi
+		echo "  view it:  ffplay -f rawvideo -pixel_format yuv420p -video_size 1920x1080 $CAP"
+		echo "  score it: ./mz0380-m127-splash.py $CAP   # splash, or a real frame"
+		echo "            ./mz0380-m130-chroma.py $CAP   # is the colour right"
+	else
+		echo "=== 4. does it look like H.264? (expect 00 00 00 01 NAL starts) ==="
+		head -c 32 "$CAP" | od -An -tx1
+		command -v ffprobe >/dev/null && ffprobe -v error -show_streams "$CAP" 2>&1 | head -20
+	fi
 fi

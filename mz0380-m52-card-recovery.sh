@@ -41,7 +41,7 @@ unload() {
 # Load the module and report whether the card's mailbox answered.
 mailbox_alive() {
 	dmesg -C
-	insmod ./mz0380.ko firmware_upload=1 dma_handshake=1 enable_dma=1 \
+	insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
 		enable_video=1 procfs_verbosity=2 dma_iova_remap=1 || return 1
 	# upload+boot can take ~25 s; the failure path (-110) shows in ~10 s
 	for i in $(seq 30); do
