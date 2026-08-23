@@ -569,21 +569,13 @@ M82/M127/M128:
 ordering unscoreable - that is the entire content of M90/M91's "win_seq renders
 nothing". Mask is 0 by default since M131.
 
-**SUPERSEDED BY M150/M151 - the sentinel is blind. Read the FRAME COUNT.**
-The registers below are written by `ep.ko`'s `store_channel_done`, which runs
-only when the card's userspace `pwrite`s `channel_done` - and M150 proved that
-`pwrite` unreachable (guarded by `mma_already_start`, nine reads and zero
-writes in the whole binary). **`token[0x40]` cannot move whatever the card
-does**, so every "moves off `a5a5a5a5`" row here is unsatisfiable and the runs
-that used it were reading a constant. "producer watch saw 0 change(s)" means
-"the dead path is still dead", nothing more.
-
-The frame counts in those runs are unaffected - the poll-drain measures them
-against the poison boundary, independently. **Frames delivered is the only
-working oracle this project has for card-side progress.** Design future tests
-against it.
-
-Original text, kept because the run history refers to it:
+**The M151 "the sentinel is blind" warning that stood here was WRONG and has
+been withdrawn (M152).** It rested on M150 treating an address range as a basic
+block; three unconditional branches from outside (0x13e9c, 0x142b0, 0x1582c)
+jump into 0x134a0, which is inside that range and *before* the `channel_done`
+`pwrite` at 0x13538. The write is reachable without passing the
+`mma_already_start` test, so the sentinel **can** move and the table below
+stands as written.
 
 **Read the result off `token[0x40]`, not off the frame count.** The M139
 sentinel turned the card's own encoder into a host-visible oracle that is
@@ -638,17 +630,15 @@ it can also leave the loop entirely.
   same address (0x13d20) and loops. The first two receives are discarded; the
   main body runs from the third. It is not `bitstream_num`, which is why M148's
   hardware sweep was flat.
-- **`channel_done` is dead code.** The 24-byte `pwrite` at 0x13538 (fd from the
-  `open()` at 0x12c64) sits in a block jumped over by
-  `mma_already_start == 0` at 0x133f0 - and that flag has nine reads and zero
-  writes in the whole binary. So the completion path the driver waits on
-  **cannot fire for anybody, Windows included**, and the poll-drain is not a
-  workaround but the only mechanism this image offers. A second 24-byte
-  `pwrite` at 0x13dfc is on a path that is *not* behind the dead flag; it did
-  not fire either, and it is where any surviving report would come from.
-- The `TK_MMA_ProcessOneFrame` at 0x1349c is inside the same dead block, so the
-  delivered frame comes from one of the other push sites (0x13e64, 0x142ac,
-  0x1430c). Known already: `EncodingGroup::mma_already_start`
+- **`channel_done` is NOT dead code** - M150 said so and M152 withdrew it. The
+  `pwrite` at 0x13538 is skipped on the fall-through from 0x133f0 when
+  `mma_already_start == 0` (which is always), but 0x13e9c, 0x142b0 and 0x1582c
+  branch unconditionally into 0x134a0, inside the range and ahead of the write.
+  Reaching it does not require the flag.
+- What IS established about `mma_already_start`: nine reads, zero writes, no
+  literal-pool reference to 0x7eda0. It is 0 for the process lifetime, so every
+  branch that needs it set is not taken - including the synchronous
+  `TK_MMA_WaitOneFrameComplete` at 0x14358, which therefore never waits. Known already: `EncodingGroup::mma_already_start`
 (.bss 0x7eda0, `[base-0xfa8]`) has **nine reads and zero writes** - it is
 permanently 0, so every branch requiring it is dead, including the synchronous
 `TK_MMA_WaitOneFrameComplete` at 0x14358. Map those dead branches before

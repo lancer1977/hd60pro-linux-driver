@@ -8967,3 +8967,61 @@ of complete frames the poll-drain delivers.** Nothing else that has been tried
 observes the producer at all. Any future test must be designed against frame
 count, not against the sentinel.
 
+
+---
+
+## M152 (static, 2026-08-23): CORRECTION - M150's "dead code" and M151's "blind sentinel" are both withdrawn
+
+M150 claimed the `channel_done` `pwrite` at tinyvenc5 0x13538 is unreachable
+because `encode_handler` jumps over it whenever `mma_already_start == 0`, which
+is always. M151 built on that and declared the M139 frame-token sentinel blind,
+marking several decision tables in `NEXT_SESSION_START.md` unsatisfiable.
+
+**Both are wrong.** The error: an address *range* was treated as a basic block.
+ARM code here is not laid out linearly, and three unconditional branches from
+outside the range jump into the middle of it, ahead of the write:
+
+    13e9c  b 0x134a0
+    142b0  b 0x134a0
+    1582c  b 0x134a0
+
+0x134a0 lies inside 0x133f4..0x13538 and **before** the `pwrite`. Entering
+there reaches 0x134b8 -> 0x134d4 -> 0x134e8 -> 0x13500 -> 0x13538 without ever
+testing `mma_already_start`. Targets 0x1341c, 0x13438, 0x13458 and 0x134b8 are
+likewise branched to from outside.
+
+So:
+
+| claim | status |
+|---|---|
+| `channel_done`'s `pwrite` is unreachable (M150) | **withdrawn** |
+| the completion path cannot fire for anybody, Windows included (M150) | **withdrawn** |
+| the M139 sentinel cannot move (M151) | **withdrawn** - it can |
+| the decision tables keyed on `token[0x40]` are unsatisfiable (M151) | **withdrawn** - they stand |
+
+### What survives, and it was verified differently
+
+- **`mma_already_start` has nine reads and zero writes**, and no literal-pool
+  word holds its address (0x7eda0). That was checked directly, not inferred
+  from layout, and it stands. It is 0 for the process lifetime, so the
+  fall-through at 0x133f0 always skips, and the synchronous
+  `TK_MMA_WaitOneFrameComplete` at 0x14358 - guarded by the same flag at
+  0x14330 - **never waits**.
+- **`[chan+0x34]` is a self-incrementing warm-up counter.** Verified by address
+  arithmetic: 0x12f48 loads from `r10 + ch*60 + 0x34`, and 0x13d10-0x13d20
+  recomputes the identical address and stores value+1. Independent of layout,
+  and it stands. It also independently explains M148's flat result.
+- **M151's hardware measurements stand in full** - they were measurements, not
+  inference. `enc_stat_ack=0` changes nothing, the driver makes no writes to
+  the card after START in that configuration, and `enc[0x50]=0` is a
+  card-authored value.
+
+### Method note, at cost
+
+M150 and M151 were both committed before this was caught. The specific mistake
+is worth naming because it is easy to repeat on this codebase: **`beq` over a
+range does not make the range dead.** Before calling any code unreachable in
+these binaries, enumerate the branches whose *target* lies inside the range,
+not just the branch that skips it. `grep -oE "0x1[0-9a-f]{4} <"` over the
+function and a numeric filter takes seconds and would have prevented both.
+
