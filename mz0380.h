@@ -719,6 +719,7 @@ extern unsigned int mz0380_stop_settle_ms;
 extern bool mz0380_enc_sub;
 extern unsigned int mz0380_enc_mask;
 extern unsigned int mz0380_post_mask;
+extern unsigned int mz0380_bitstream_num;
 extern unsigned int mz0380_post_di;
 extern bool mz0380_fake_frame_off;
 extern bool mz0380_post_proc;

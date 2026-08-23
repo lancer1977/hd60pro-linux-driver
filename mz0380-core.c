@@ -370,6 +370,27 @@ module_param_named(vic_out_h, mz0380_vic_out_h, uint, 0644);
 MODULE_PARM_DESC(vic_out_h,
 		 "M139: SET_VIC bytes 10..11 override. 0 = use the v4l2 capture height (def:0)");
 
+/*
+ * M148: SET_VIC byte 28, bitstream_num. Hardcoded to 1 since M22 and never
+ * varied - the only thing ever established about it is that the firmware
+ * rejects 0 ("MUST be >=1"), so 1 was chosen and frozen.
+ *
+ * tinyvenc5's EncodingGroup::encode_handler tests a per-channel field at
+ * [chan+0x34] immediately after its first successful SSM_ReleaseAndReceive
+ * (0x12f4c: cmp #1 / bls 0x13d04) and takes a different path when the value is
+ * <= 1. Our streams report "bitstreams=1", the encoder has never produced a
+ * bitstream (enc[0x50]=0, channel_done never written), and the one frame that
+ * does reach the host arrives raw over the MMA path rather than as H.264 -
+ * which is what that alternate path would look like.
+ *
+ * The identification of [chan+0x34] as this field is INFERENCE, not proof.
+ * Default stays 1 so nothing changes unless the knob is set.
+ */
+unsigned int mz0380_bitstream_num = 1;
+module_param_named(bitstream_num, mz0380_bitstream_num, uint, 0644);
+MODULE_PARM_DESC(bitstream_num,
+		 "M148: SET_VIC byte 28. Firmware requires >=1; hardcoded to 1 since M22 and never swept (def:1)");
+
 unsigned int mz0380_token_seed = 0xa5a5a5a5;
 module_param_named(token_seed, mz0380_token_seed, uint, 0644);
 MODULE_PARM_DESC(token_seed,

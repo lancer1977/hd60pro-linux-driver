@@ -1242,7 +1242,9 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	vic_in_w = mz0380_vic_in_w ?: in_w;
 	vic_in_h = mz0380_vic_in_h ?: in_h;
 	params[5] = ((vic_in_h & 0xffff) << 16) | (vic_in_w & 0xffff);
-	params[6] = 1u | ((mz0380_stream_nosg ? 1u : 0u) << 24); /* [28]=bitstream_num=1, [31]=is_nosg */
+	/* [28]=bitstream_num (M148 knob, def 1), [31]=is_nosg */
+	params[6] = (mz0380_bitstream_num & 0xffu) |
+		    ((mz0380_stream_nosg ? 1u : 0u) << 24);
 	/*
 	 * M82: byte 33 is fast_kill and Windows sends 1, always ("fk=1" in
 	 * every [CH00] line of every trace). We have sent 0 for the life of
@@ -1312,12 +1314,13 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 		 * never landed" - method rule 9, in a line that has been short
 		 * of these two bytes all along.
 		 */
-		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u vic_in=%ux%u fk=%u int_mode=%u -> H.264 output=%ux%u, bitstreams=1) ret=%d\n",
+		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u vic_in=%ux%u fk=%u int_mode=%u -> H.264 output=%ux%u, bitstreams=%u) ret=%d\n",
 			dev->name, in_w, in_h, interlaced ? "i" : "p",
 			fps, fw, in_fmt, out_fmt, vic_in_w, vic_in_h,
 			mz0380_vic_fast_kill & 0xff,
 			mz0380_vic_int_mode & 0xff,
-			out_w, out_h, ret);
+			out_w, out_h,
+			mz0380_bitstream_num & 0xffu, ret);
 	if (ret)
 		goto err_events;
 
