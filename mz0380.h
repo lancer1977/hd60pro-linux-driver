@@ -724,6 +724,7 @@ extern unsigned int mz0380_post_mask;
 extern unsigned int mz0380_bitstream_num;
 extern bool mz0380_enc_stat_ack_on;
 extern bool mz0380_setvic_once;
+extern bool mz0380_stop_on_streamoff;
 extern unsigned int mz0380_post_di;
 extern bool mz0380_fake_frame_off;
 extern bool mz0380_post_proc;

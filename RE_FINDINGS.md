@@ -9237,3 +9237,63 @@ dmesg for this run names the opcode that timed out. If `0x2d` times out, the
 command loop itself is gone; if only `0x06` does, the loop lives and only the
 frame path is stuck. Read it before designing anything else.
 
+
+---
+
+## M156 (hardware, 2026-08-23): our STOP is not what kills tinyvenc5
+
+M155 left one obvious suspect: `video_capture_mgr` contains two
+`system("killall -9 tinyvenc5")` sites (0x8d1c, 0x95c4), and if either sits in
+the `0x07` handler then the driver's own streamoff removes the encoder. Tested
+with `stop_on_streamoff=0` instead of hand-tracing vcm's dispatch.
+
+The knob demonstrably took effect:
+
+    stream stop: STOP_STREAMING SKIPPED (stop_on_streamoff=0) - the card is left
+                 streaming on purpose
+
+And the result is unchanged from M155:
+
+    d1  3110400 bytes
+    d2  0 bytes   VIDIOC_STREAMON returned -1 (Connection timed out)
+    d3  0 bytes   VIDIOC_STREAMON returned -1 (Connection timed out)
+
+    cycle 1: SET_ENC_PARAMS(op 0x2d ...) ret=-110
+    cycle 2: SET_ENC_PARAMS(op 0x2d ...) ret=-110
+
+**STOP is exonerated.** tinyvenc5 stops answering `0x2d` on its own, whether or
+not the host tears the stream down.
+
+### What is still answering, and what is not
+
+`CMD_INIT` answers immediately on the next load
+(`answered on attempt 1 (status=0xdddddddd)`), so the card's firmware and
+`ep.ko`'s command service are fine. What has gone is specifically the process
+that services `0x2d` - tinyvenc5. The card is healthy at roughly eight spawns
+into this power cycle, with no wedge.
+
+### Where that leaves the one-frame bound
+
+Three independent host-side levers have now been removed and none changed
+anything:
+
+| lever | milestone | result |
+|---|---|---|
+| the per-frame `enc_stat` ack (the last mid-stream write) | M151 | no change |
+| skipping the respawn (`setvic_once=1`) | M155 | no frame at all |
+| skipping STOP (`stop_on_streamoff=0`) | M156 | no change |
+
+**There is no host-side lever left on the cadence.** One frame per tinyvenc5
+process, the process becomes unresponsive by itself afterwards, and only a new
+SET_VIC - i.e. a new process - produces another frame.
+
+### The next question, and it is static
+
+Does tinyvenc5 **exit** or **hang** after its single push? The distinction
+matters because an exit is a decision the code takes and may be conditional,
+while a hang is the `SSM_ReleaseAndReceive` park M138 described.
+
+`mz0380-cfg.py` can answer it: from the `TK_MMA_StartOneFrame` success block at
+0x14318, check which is reachable - the loop head at 0x12f04, the loop exit at
+0x12fc0, or a function epilogue. That costs nothing and does not need the card.
+

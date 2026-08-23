@@ -430,6 +430,32 @@ MODULE_PARM_DESC(vic_out_h,
  * Default 0 = every stream start sends SET_VIC, which is what every prior
  * result used.
  */
+/*
+ * M156: whether streamoff sends STOP_STREAMING (op 0x07) to the card.
+ *
+ * M155 found that with SET_VIC suppressed, every later cycle's op 0x2d times
+ * out (ret=-110) - nothing on the card answers the mailbox any more. The
+ * obvious suspect is our own STOP: video_capture_mgr contains two
+ * system("killall -9 tinyvenc5") sites (0x8d1c and 0x95c4), and if either sits
+ * in the 0x07 handler then our streamoff is what removes the encoder.
+ *
+ * Proving which handler owns them means more hand-tracing of vcm, which has
+ * already produced one wrong result today (M150/M152). Testing is cheaper and
+ * decisive: with stop_on_streamoff=0 and setvic_once=1, a second cycle whose
+ * 0x2d returns 0 proves tinyvenc5 survived, i.e. STOP was killing it.
+ *
+ * Safety: skipping STOP leaves the card free to keep writing the stream
+ * buffers after streamoff. They stay allocated for the life of the module, and
+ * mz0380_dma_teardown() clears bus mastering BEFORE freeing them, so DMA is
+ * disarmed at the PCI level on unload either way.
+ *
+ * Default 1 = send STOP, the behaviour every prior result used.
+ */
+bool mz0380_stop_on_streamoff = true;
+module_param_named(stop_on_streamoff, mz0380_stop_on_streamoff, bool, 0644);
+MODULE_PARM_DESC(stop_on_streamoff,
+		 "M156: send STOP_STREAMING (op 0x07) at streamoff (def:1 = every prior result; 0 = leave the card streaming so a later cycle can find tinyvenc5 alive)");
+
 bool mz0380_setvic_once;
 module_param_named(setvic_once, mz0380_setvic_once, bool, 0644);
 MODULE_PARM_DESC(setvic_once,

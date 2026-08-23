@@ -1643,8 +1643,19 @@ static void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 		/* Freeze the diagnostic reader before changing buffer ownership. */
 		mz0380_extent_watch_stop(dev);
 
-	if (dev->dma_armed)
-		mz0380_stream_stop_all(dev, 2000);
+	if (dev->dma_armed) {
+		if (mz0380_stop_on_streamoff) {
+			mz0380_stream_stop_all(dev, 2000);
+		} else {
+			/*
+			 * M156: leave the card streaming. Buffers stay mapped
+			 * until unload, and teardown clears bus mastering
+			 * before freeing them.
+			 */
+			pr_info("%s: stream stop: STOP_STREAMING SKIPPED (stop_on_streamoff=0) - the card is left streaming on purpose\n",
+				dev->name);
+		}
+	}
 
 	if (verbose) {
 		/*
