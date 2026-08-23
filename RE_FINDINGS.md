@@ -9188,3 +9188,52 @@ per-process `mma_already_start` latch predicts. This is the same "one frame per
 spawn" the NOSG diagnostic has always shown (M60), now confirmed on the real
 capture path.
 
+
+---
+
+## M155 (hardware, 2026-08-23): a cycle without the respawn yields nothing - one frame per tinyvenc5 process, confirmed
+
+`setvic_once=1`, so only the first stream cycle after insmod sends SET_VIC and
+later cycles do not respawn tinyvenc5. Three consecutive v4l2 captures in one
+module load:
+
+    c1  3110400 bytes                 (cycle 1 - SET_VIC sent, encoder spawned)
+    c2  0 bytes   VIDIOC_STREAMON returned -1 (Connection timed out)
+    c3  0 bytes   VIDIOC_STREAMON returned -1 (Connection timed out)
+
+(`e3b0c442...b855` is the SHA-256 of the empty file.)
+
+**M153's prediction holds exactly.** The frame comes from the *respawn*, not
+from the cycle. `mma_already_start` is a per-process static that is never
+written, so a tinyvenc5 process gets exactly one reachable
+`TK_MMA_StartOneFrame` and a cycle that reuses the parked process gets nothing.
+
+### What this closes
+
+**"Cycle cheaply for cadence" is dead.** M154 raised it; this kills it. The
+only way to get another frame is another SET_VIC, which forks another
+tinyvenc5, which costs one of the 8-18 spawn budget and a ~2 s settle. There is
+no cheap cycle.
+
+Combined with M154, the whole cadence question now has a single, consistent
+answer that fits every measurement in this file:
+
+**one frame per tinyvenc5 process, and SET_VIC is the only way to get a new
+process.**
+
+That is why OBS shows one image and then freezes, why every m55 run reports
+`1 deliveries`, and why the NOSG diagnostic's respawn-per-frame loop (M60) was
+the only thing that ever produced a sequence.
+
+### A new datum worth chasing: the parked encoder stops answering the mailbox
+
+`VIDIOC_STREAMON` did not merely fail to deliver - it **timed out**. With
+SET_VIC skipped, some later command in the start sequence got no answer, which
+means the parked tinyvenc5 stops servicing the mailbox commands it normally
+handles (`0x2d`, `0x31`, `0x06` are all in its set per M127/M128).
+
+That is a fingerprint of *where* it is parked, and it is free to read: the
+dmesg for this run names the opcode that timed out. If `0x2d` times out, the
+command loop itself is gone; if only `0x06` does, the loop lives and only the
+frame path is stuck. Read it before designing anything else.
+
