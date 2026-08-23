@@ -602,6 +602,12 @@ So: a frame arrived -> the ring was non-empty -> `img_handler` was called **at
 least twice** -> **the VIC captured at least two frames**, and `encode_handler`
 ran at least one complete iteration.
 
+M150's warm-up counter pushes that further: if the first two receives are
+discarded, the delivered frame is the **third**, so `img_handler` published
+three times and was called at least four. That is stacked inference and flagged
+as such - but every closer look has moved the captured-frame count **up**, never
+down. The card's capture is not the broken part.
+
 **Read the loop body, 0x12f24 to the branch back to 0x12f04**, in
 `re-dump/tinyvenc5.txt`. The loop has four back-edges (0x12fa8, 0x13734,
 0x13d28, 0x13dd0) and one **exit** on an SSM error: a return of -1 or -2 leaves
@@ -609,10 +615,24 @@ via 0x1512c, which sets a flag and jumps to the cleanup at 0x12fc0. So "parked
 forever in `pthread_cond_wait`" (M138) is not the only way this thread stops -
 it can also leave the loop entirely.
 
-**Already tested and negative:** the first post-receive test at 0x12f4c
-(`[chan+0x34] <= 1 -> 0x13d04`) is not `bitstream_num`. M148 set SET_VIC byte 28
-to 2, the firmware accepted it (`ret=0`), and every observable was identical to
-baseline. Known already: `EncodingGroup::mma_already_start`
+**Already read, do not redo (M150):**
+
+- The first post-receive test at 0x12f4c (`[chan+0x34] <= 1 -> 0x13d04`) is a
+  **self-incrementing warm-up counter**: the branch it takes increments that
+  same address (0x13d20) and loops. The first two receives are discarded; the
+  main body runs from the third. It is not `bitstream_num`, which is why M148's
+  hardware sweep was flat.
+- **`channel_done` is dead code.** The 24-byte `pwrite` at 0x13538 (fd from the
+  `open()` at 0x12c64) sits in a block jumped over by
+  `mma_already_start == 0` at 0x133f0 - and that flag has nine reads and zero
+  writes in the whole binary. So the completion path the driver waits on
+  **cannot fire for anybody, Windows included**, and the poll-drain is not a
+  workaround but the only mechanism this image offers. A second 24-byte
+  `pwrite` at 0x13dfc is on a path that is *not* behind the dead flag; it did
+  not fire either, and it is where any surviving report would come from.
+- The `TK_MMA_ProcessOneFrame` at 0x1349c is inside the same dead block, so the
+  delivered frame comes from one of the other push sites (0x13e64, 0x142ac,
+  0x1430c). Known already: `EncodingGroup::mma_already_start`
 (.bss 0x7eda0, `[base-0xfa8]`) has **nine reads and zero writes** - it is
 permanently 0, so every branch requiring it is dead, including the synchronous
 `TK_MMA_WaitOneFrameComplete` at 0x14358. Map those dead branches before

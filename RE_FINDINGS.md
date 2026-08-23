@@ -8821,3 +8821,88 @@ Method note: this cost one spawn and answered cleanly because the value was the
 **only** thing that changed, on a card whose health had just been confirmed by a
 control capture. That is what M140's method rule asks for.
 
+
+---
+
+## M150 (static, 2026-08-23): `channel_done` is dead code, and `[chan+0x34]` is a warm-up counter
+
+Two findings from the loop body, both of which tighten earlier results.
+
+### 1. The `channel_done` write is guarded by a flag that is never set
+
+`EncodingGroup::encode_handler` writes a 24-byte record at **0x13538**:
+
+    13500..13534   build the record at sp+312
+    13538          pwrite(fd=[sp+0x78], sp+312, 24, 0)
+    1353c          pthread_mutex_unlock ...
+
+`[sp+0x78]` is the fd from the `open()` at 0x12c64 - the `channel_done` open
+M138 identified. And the whole block containing it is jumped over:
+
+    133e4  ldrb r1, [r6, #-0xfa8]      ; EncodingGroup::mma_already_start
+    133ec  cmp  r1, #0
+    133f0  beq  0x1353c                ; always taken -> skips 0x133f4..0x13538
+
+M147 established that `mma_already_start` has **nine reads and zero writes**
+anywhere in the binary; there is also no literal-pool word holding its address
+(0x7eda0), so it is only ever reached through the `[base-0xfa8]` form that was
+enumerated. It is 0 for the process lifetime.
+
+**So this `pwrite` can never execute**, and with it the `TK_MMA_ProcessOneFrame`
+at 0x1349c in the same block. That is the mechanical explanation for M139's
+sentinel result: `store_channel_done` has never run because the code that would
+call it is unreachable in this firmware image.
+
+The consequence is worth stating plainly: **the completion/reporting path the
+host driver waits on cannot fire for anybody**, us or Windows. The poll-drain
+(M111) is not a workaround for a driver we got wrong - on this image it is the
+only mechanism there is.
+
+A second 24-byte `pwrite` to the same fd exists at **0x13dfc**, on a different
+path (reached from the `bne` at 0x134d8/0x134e4), and it jumps to 0x1353c
+afterwards. That one is not behind the dead flag, so it is where any surviving
+report would come from. It did not fire either.
+
+### 2. `[chan+0x34]` is a self-incrementing warm-up counter, not `bitstream_num`
+
+The first test after the receive turns out to be a counter against itself:
+
+    12f48  ldr  r2, [r12, #0x34]       ; r12 = r10 + ch*60
+    12f4c  cmp  r2, #1
+    12f50  bls  0x13d04                ; <= 1 -> discard path
+    ...
+    13d10  rsb  r3, r1, r3             ; r3 = ch*15
+    13d14  add  r3, r10, r3, lsl #2    ; = r10 + ch*60, the SAME address
+    13d18  add  r2, r2, #1
+    13d20  str  r2, [r3, #0x34]        ; counter++
+    13d28  b    0x12f04                ; back to the loop head
+
+The branch taken when the value is `<= 1` increments that same value and loops.
+So the first two receives are **discarded as warm-up** and the main body does
+not run until the third.
+
+This independently confirms M148's negative: the field is a counter, so
+`bitstream_num` was never going to move it, which is exactly what the hardware
+said.
+
+### What it does to the frame accounting
+
+If the counter means what it appears to, the arithmetic is:
+
+| receive | counter on entry | action |
+|---|---|---|
+| 1 | 0 | discard, counter -> 1, loop |
+| 2 | 1 | discard, counter -> 2, loop |
+| 3 | 2 | main body - MMA push, i.e. **our one delivered frame** |
+
+Working backwards through M147's chain: three receives means `img_handler`
+published three times, and its first call is the init path that publishes
+nothing - so **`img_handler` was called at least four times and the VIC
+delivered at least four frames.**
+
+That is stacked inference and is flagged as such. But it moves the same
+direction as M147 and away from M140: every time this has been examined more
+closely, the number of frames the card actually captured has gone **up**, and
+the "captures once and halts" model has looked worse. The defect is not that
+the card cannot capture.
+
