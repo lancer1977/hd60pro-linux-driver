@@ -771,6 +771,11 @@ M138/M139 proved the reporting path correct end to end and never reached.
 | `/proc/mz0380-buf0` | raw stream buffer 0 |
 | `mz0380-m126-score.py` | **superseded** by m127-splash.py. |
 
+New knob (M151): `enc_stat_ack` - clear enc_stat after each delivered frame,
+default 1 (the M40 behaviour every prior result used). Setting 0 removes the
+**last** write the driver makes to the card after START; measured, and the
+cadence is unchanged, so no host-side write after START causes the stall.
+
 New knob (M148): `bitstream_num` - SET_VIC byte 28, default 1. Hardcoded since
 M22, swept once and negative; kept because the field is now settable for free.
 

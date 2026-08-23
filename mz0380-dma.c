@@ -547,6 +547,15 @@ EXPORT_SYMBOL_GPL(mz0380_dma_setup);
  */
 static void mz0380_enc_stat_ack(struct mz0380_dev *dev)
 {
+	/*
+	 * M151: the knob covers the per-frame ack only. The single clear at
+	 * stream start (mz0380_dma_start_stream) is deliberately left in - it
+	 * establishes a known value to read back, and every result in the file
+	 * was taken with it.
+	 */
+	if (!mz0380_enc_stat_ack_on)
+		return;
+
 	mz_mmio_write(dev, MZ0380_MB_ENC_STATUS, MZ0380_MB_ENC_STAT_FREE);
 	wmb();
 }
@@ -1396,8 +1405,14 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * a bitstream DMA) and never clears it, so a stale 1 left by a
 	 * previous stream would make the encoder retry 10x and then skip
 	 * every frame.
+	 *
+	 * M151: this one is unconditional on purpose - the enc_stat_ack knob
+	 * covers only the per-frame ack. Clearing once at start establishes a
+	 * known value to read back at stop, and every result in the file was
+	 * taken with it.
 	 */
-	mz0380_enc_stat_ack(dev);
+	mz_mmio_write(dev, MZ0380_MB_ENC_STATUS, MZ0380_MB_ENC_STAT_FREE);
+	wmb();
 
 	/*
 	 * M33: release the audio gate BEFORE START. tinyvenc5's is_nosg path

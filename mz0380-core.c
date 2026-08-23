@@ -386,6 +386,32 @@ MODULE_PARM_DESC(vic_out_h,
  * The identification of [chan+0x34] as this field is INFERENCE, not proof.
  * Default stays 1 so nothing changes unless the knob is set.
  */
+/*
+ * M151: whether to clear the card's enc_stat word (BAR0+0x50) after each
+ * delivered frame.
+ *
+ * M40 added this on the theory that the card's encoder "produces exactly one
+ * bitstream and then skips every subsequent frame" without the ack, and it has
+ * been unconditional ever since - the one write the driver still makes to the
+ * card on every delivered frame.
+ *
+ * M150 undermines the theory it rests on. The completion record the ack is
+ * supposed to be answering is written by a pwrite in tinyvenc5's
+ * encode_handler that sits inside a block guarded by
+ * EncodingGroup::mma_already_start, a flag with nine reads and zero writes in
+ * the whole binary. That path cannot execute, so the card never reports a
+ * completed frame to anybody - and an ack for a report that never happens is
+ * at best inert and at worst a mid-stream write to a register whose meaning we
+ * inferred from a protocol that does not run.
+ *
+ * Default is 1, i.e. the behaviour every prior measurement was taken with.
+ * Set 0 to remove the write and leave the card alone after a frame.
+ */
+bool mz0380_enc_stat_ack_on = true;
+module_param_named(enc_stat_ack, mz0380_enc_stat_ack_on, bool, 0644);
+MODULE_PARM_DESC(enc_stat_ack,
+		 "M151: clear enc_stat (BAR0+0x50) after each delivered frame (def:1 = the M40 behaviour all prior results used; 0 = do not write the card after a frame)");
+
 unsigned int mz0380_bitstream_num = 1;
 module_param_named(bitstream_num, mz0380_bitstream_num, uint, 0644);
 MODULE_PARM_DESC(bitstream_num,

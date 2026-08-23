@@ -8906,3 +8906,64 @@ closely, the number of frames the card actually captured has gone **up**, and
 the "captures once and halts" model has looked worse. The defect is not that
 the card cannot capture.
 
+
+---
+
+## M151 (hardware, 2026-08-23): the enc_stat ack is inert - and the frame-token sentinel has been measuring dead code
+
+`enc_stat_ack=0`, removing the last write the driver makes to the card after
+START. Result identical to baseline in every field: one delivery, one frame,
+`R55=0x7f` held, `EVENT=0`, sentinel untouched.
+
+    poll-drain stopped after 1 deliveries, 0 kicks; producer watch saw 0 change(s)
+    stream stop: EVENT[0x30]=0 token[0x40]=a5a5a5a5 enc[0x50]=00000000
+                 irq_total=6 frame_events=0 fifo_drops=0
+
+### What it settles
+
+**M40's rationale was wrong, and harmless.** "Without this ack the card's
+encoder produces exactly one bitstream and then skips every subsequent frame"
+has been in the tree since M40 and shaped M117/M118. Removing the ack changes
+nothing, which is what M150 predicted: the completion record it answers is
+written by a `pwrite` that cannot execute.
+
+**The driver now provably does not disturb the card mid-stream.** After START it
+makes no writes at all in this configuration - no ack, no credit re-arm
+(default off), no kicks (default off) - and the cadence is unchanged. Every
+host-side write after START is eliminated as a cause of the one-frame stall.
+
+**`enc[0x50]=0` was measured for the first time as a CARD-authored value.**
+Every previous run had the driver clearing that register after the frame, so
+the 0 in the stop line was partly self-inflicted. With the ack disabled the
+card owns it for the whole stream, and it is still 0: the card genuinely never
+set enc_stat. The encoder never wrote a bitstream, independent of anything we
+did.
+
+### The sentinel is blind, and several decision tables in this file relied on it
+
+M139 seeded `a5a5a5a5` into BAR0 0x40/0x44/0x48/0x4c and called the result "a
+host-visible oracle" for whether the card's encoder ran. Those registers are
+written by `ep.ko`'s `store_channel_done`, which runs when the card's userspace
+`pwrite`s the `channel_done` node.
+
+**M150 showed that `pwrite` is unreachable** - it sits inside the block guarded
+by `mma_already_start`, a flag with nine reads and zero writes in the whole
+binary. So the sentinel **cannot move, no matter what the card does**. It is
+not an oracle for the producer; it is a detector for a code path that does not
+exist in this firmware image.
+
+Consequences, and they are not small:
+
+- Every "token moves off `a5a5a5a5` -> the encoder ran" row in this file's
+  decision tables (M140's Windows-ordering table, M142, M146, M148, M151) is
+  **unsatisfiable**. Those runs were reading a constant.
+- The "producer watch saw 0 change(s)" line means nothing about the producer.
+  It should be read as "the dead path is still dead".
+- The *frame counts* in all those runs remain valid, because they were measured
+  by the poll-drain against the poison boundary, which is independent.
+
+**The only working oracle this project has for card-side progress is the number
+of complete frames the poll-drain delivers.** Nothing else that has been tried
+observes the producer at all. Any future test must be designed against frame
+count, not against the sentinel.
+
