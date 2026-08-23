@@ -9025,3 +9025,75 @@ these binaries, enumerate the branches whose *target* lies inside the range,
 not just the branch that skips it. `grep -oE "0x1[0-9a-f]{4} <"` over the
 function and a numeric filter takes seconds and would have prevented both.
 
+
+---
+
+## M153 (static, 2026-08-23): the reachability question settled mechanically - M150's conclusion restored, its argument replaced
+
+M150 claimed `channel_done` is unreachable. M152 withdrew that because the
+argument was invalid (a branch over a range says nothing about branches into
+it). Rather than hand-trace a third time, the analysis was **mechanised**:
+`mz0380-cfg.py` builds a basic-block CFG from the objdump text and computes
+reachability from `encode_handler`'s loop head.
+
+The CFG deliberately **over-approximates** - `bl` is treated as returning, and
+an unrecognised branch form falls through - so anything it reports as
+unreachable is unreachable under a strictly more permissive model than reality.
+
+`mma_already_start` is provably 0 for the process lifetime (nine `ldrb`, zero
+stores, no literal-pool word holding 0x7eda0 - checked directly, and unaffected
+by the M152 error). Both `beq`s guarded by it are therefore always taken, so
+their fall-through edges are removed:
+
+    (0x133f0 -> 0x133f4)   and   (0x14334 -> 0x14338)
+
+With just those two edges gone, 2452 of 3110 instructions remain reachable, and:
+
+| site | reachable with the flag at 0? |
+|---|---|
+| `channel_done` `pwrite` 0x13538 | **no** |
+| second `pwrite` 0x13dfc | **no** |
+| `TK_MMA_ProcessOneFrame` 0x1349c / 0x13e64 / 0x142ac | **no** (all three) |
+| `TK_MMA_WaitOneFrameComplete` 0x14358 | **no** |
+| 0x134a0 - the entry M152 found | **no** |
+| **`TK_MMA_StartOneFrame` 0x1430c** | **YES** |
+
+The three unconditional branches into 0x134a0 that M152 correctly identified
+(0x13e9c, 0x142b0, 0x1582c) are themselves reachable only *through* the
+flag-guarded fall-through. Removing that one edge makes them, and 0x134a0,
+unreachable. That is what hand-reading missed in both directions.
+
+### Where this leaves the three claims
+
+| claim | status |
+|---|---|
+| `channel_done` cannot be written in this image (M150) | **restored**, on a mechanical proof rather than a range argument |
+| the M139 sentinel cannot move (M151) | **restored** - `store_channel_done` needs that `pwrite` |
+| M152's correction of M150's *argument* | **stands** - the argument really was invalid, and the CFG is the reason the right answer is now trustworthy |
+
+Three revisions on one question is expensive. The lesson is in the tool: on this
+codebase, reachability claims are not eyeball-able and should not be made
+without the CFG.
+
+### The substantive finding
+
+**The only MMA push that can execute is the asynchronous
+`TK_MMA_StartOneFrame` at 0x1430c, and its completion is never waited on**,
+because `TK_MMA_WaitOneFrameComplete` sits behind the same permanently-false
+flag. Every synchronous push path and every host-reporting path in
+`encode_handler` is unreachable in this firmware image.
+
+That is consistent with everything measured: the host receives a raw frame (a
+DMAC outbound transfer, started but never awaited), no `channel_done`, no
+`enc_stat`, no EVENT, and the sentinel never moves. It also supplies a
+mechanism for the one-frame stall that requires nothing else to be true - a
+transfer that is started and never completed leaves the DMAC profile in use, so
+the next `StartOneFrame` fails, takes the error path at 0x1513c, and loops
+silently. **That last step is inference about `TK_MMA_*` semantics, not
+proof** - the libraries would have to be read to confirm it.
+
+### Consequence for testing
+
+Frame count remains the only working oracle, and this time the reason is
+proven rather than asserted: the sentinel's writer is unreachable.
+
