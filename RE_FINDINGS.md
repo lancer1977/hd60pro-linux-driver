@@ -9154,3 +9154,37 @@ not been: every previous harness unloaded the module between captures, so
 `mz0380-m55-real-capture.sh` unloads on exit by design (M60), which is correct
 for its purpose and hid this for the entire history of the file.
 
+
+### M154 addendum: a stream cycle IS a spawn, and OBS confirms the user-visible shape
+
+The dmesg for that run settles the open question the wrong way for hopes of a
+cadence mechanism. The second capture's stream carries its own full start
+sequence:
+
+    4773.13  stream start: SET_VIC(...) ret=0
+    4775.31  stream start: START_STREAMING(op 0x06) fired
+    4776.56  poll-drain: buf 0 holds 3110400 bytes; delivering
+    4776.84  stream stop
+    4785.13  stream stop            (module unload)
+
+So every STREAMON re-sends SET_VIC, which is what makes `video_capture_mgr`
+spawn a fresh tinyvenc5. **One stream cycle = one encoder spawn.** The 8-18
+spawn budget therefore caps the whole approach, and each cycle also pays the
+~2 s SET_VIC settle. Cycling is a diagnostic, not a path to video.
+
+**The user-visible behaviour agrees, and is worth recording as the plain-English
+statement of the defect:** with the module loaded and OBS opened on
+`/dev/video0`, the preview shows **one image and then freezes** - moving the
+object in front of the camera changes nothing. OBS holds a single stream open,
+so it receives that stream's one frame and never gets another. The two distinct
+frames of M154 came from running `v4l2-ctl` twice, i.e. two cycles, not from
+one stream producing two frames.
+
+So M154's headline stands in a narrower form: **the producer is healthy and
+re-captures fresh content on each cycle** - the two frames were 13 s apart with
+83% of pixels changed, which proves the card is not stuck holding one image -
+but the bound remains one frame per tinyvenc5 process, exactly as M153's
+per-process `mma_already_start` latch predicts. This is the same "one frame per
+spawn" the NOSG diagnostic has always shown (M60), now confirmed on the real
+capture path.
+
