@@ -8139,3 +8139,685 @@ The defect is now stated in one line: **the card's VIC captures a single frame
 and stops.** Everything this project has spent spawns on since M111 - the
 completion credit, enc_stat, kicks, `vic_int_mode`, the poll-drain - is
 downstream of that and cannot affect it.
+
+---
+
+## M141 (hardware, 2026-08-23): the Windows ordering was finally run - and it is worse than the baseline
+
+The run M140's handoff called `START HERE`. It had never been executed with a
+scoreable path: until M135a the `0x31` inside `win_seq` carried
+`post_mask=0x1f`, which truncates the DMA to one 16-byte burst, and that is the
+entire content of M90/M91's "win_seq renders nothing".
+
+### Environment note - the kernel is NOT a variable, and this was checked
+
+The session opened on a boot whose running kernel (`7.1.8-1-cachyos`) had been
+upgraded out from under it: `/lib/modules/7.1.8-1-cachyos` did not exist, so
+nothing out-of-tree could be built or loaded. Both runs below were taken on
+`7.2.0-1-cachyos`, not the `6.18.42-1-cachyos-lts` every prior result used.
+
+That would normally void the result under method rule 1, so the baseline was
+re-measured on the same kernel, same power cycle, immediately after:
+
+| run | sequence | frames | oracle |
+|---|---|---|---|
+| M141 | `win_seq=1` | **0** | - |
+| M141c | baseline (defaults) | **1**, 3110400 bytes | NOT SPLASH (Y 212 / UV 203 distinct); CHROMA OK (luma explains 2% / 0%) |
+
+**7.2.0 reproduces M129/M130 exactly.** The kernel is cleared, and the
+comparison stands.
+
+(The driver now builds on both series. The only 6.x -> 7.x drift was
+`vb2_ops->wait_prepare`/`wait_finish` and the `vb2_ops_wait_*` helpers, removed
+once vb2 core took over `q->lock`. The Makefile greps `videobuf2-v4l2.h` rather
+than testing `LINUX_VERSION_CODE`, because the removal release lies between
+6.18 and 7.2 and a wrong guess builds cleanly and then mishandles a blocking
+DQBUF.)
+
+### What the ordering did
+
+Every command was accepted - this is the first time the sequence has been
+delivered end to end:
+
+    pre-STOP (op 0x07, all channels) ret=0
+      -> 1900 ms settle
+      -> SET_VIC(1920x1080p@60 fw=5 in_fmt=6 vic_in=1920x1080) ret=0
+      -> SET_AIC ret=0
+      -> 0x2d main ret=0, 0x2d sub ret=0
+      -> 0x31 mask=0x00 fake_frame_off=1 die_en=1 ret=0
+      -> no op 0x06
+
+The receiver held `R55=0x7f` LOCKED before, during and after; CSC resolved to
+0x00 from a YUV444 input; HDCP absent. Nothing about the input degraded.
+
+### The result
+
+    token[0x40]=a5a5a5a5  0x44/0x48/0x4c=a5a5a5a5   enc[0x50]=0   EVENT[0x30]=0
+    producer watch: 0 changes over 56 s
+    captured 0 bytes
+    buf[0..3]: 0/1024 sampled pages touched
+
+The M139 sentinel never moved, so **`store_channel_done` did not run** - the
+encoder starved here exactly as it does on the baseline. That was expected.
+
+**What was not expected: zero pages were touched.** The baseline's single frame
+does not come from the SDK frame path at all (M139); it is pushed by
+`vpl_dmac`'s outbound transfer. `win_seq=1` lost *that* too. The Windows
+ordering is the first configuration measured that is strictly worse than the
+baseline while the receiver stays locked and every command returns 0.
+
+### Reading it
+
+Per M140's decision table this is the `a5a5a5a5` + 0 frames row: the ordering is
+not the fix, and the no-`0x06` variant goes with it. The one structural
+difference that can plausibly suppress a DMAC push is the **absence of op
+0x06** - `win_seq` relies on `0x2d`/`0x31` performing the same bare
+`sysfs_notify("epint")`, which is true for the *card's* dispatch but says
+nothing about what arms `vpl_dmac` on the host side. `win_start_op6=1` is the
+single-variable retry.
+
+
+---
+
+## M142 (hardware, 2026-08-23): op 0x06 is what arms the DMAC one-shot - and the Windows ordering is neutral
+
+The single-variable retry M141 called for. Same kernel (`7.2.0-1-cachyos`), same
+power cycle, same source, same lock.
+
+| run | sequence | frames | token[0x40] |
+|---|---|---|---|
+| M141c | baseline | 1 | `a5a5a5a5` |
+| M141 | `win_seq=1` | **0** | `a5a5a5a5` |
+| M142 | `win_seq=1 win_start_op6=1` | **1** | `a5a5a5a5` |
+
+M142's frame scored NOT SPLASH (Y 212 / UV 214 distinct) and CHROMA OK (luma
+explains at most 4%). It is the same real 1080p the baseline gives.
+
+(`v4l2-ctl` was killed mid-write because the run asked for 5 frames and one
+arrived, so the file is 3108864 of 3110400 bytes. The driver log shows it
+delivered the full frame. The oracles were run on a copy zero-padded by those
+1536 tail bytes, which lie in the V plane; the splash crop at (800,420) is in
+luma and unaffected.)
+
+### What it settles
+
+**Op `0x06` gates the `vpl_dmac` outbound push.** Adding it back to `win_seq` is
+the only change between M141 and M142, and it restores the frame exactly. So
+M141's zero was not the ordering breaking capture - it was the missing
+START_STREAMING failing to arm the transfer that carries the card's one frame to
+the host. M140's reading of `ep.ko` - that `0x2d`/`0x31` perform the same bare
+`sysfs_notify("epint")` as `0x06` - is true of the *card's* dispatch and says
+nothing about what arms the DMAC.
+
+**The Windows ordering is neutral.** pre-STOP + 1900 ms settle + SET_BUF-first,
+with `0x06` present, produces precisely the baseline: one frame, sentinel
+intact, `enc[0x50]=0`, `EVENT=0`, 0 producer-watch changes. Every command
+returned 0 and `R55=0x7f` held throughout, so this is a clean negative, not a
+misfire.
+
+**The host-side sequence is now exhausted.** Ordering, opcode set, kicks,
+credit, completion handshake, geometry, preview params, CSC - all measured, all
+either neutral or worse. Nothing the host sends changes how many times the VIC
+captures.
+
+---
+
+## M143 (static, 2026-08-23): the cfg patcher decoded exactly - and `captured frame count` is a host-unreachable 60
+
+`video_capture_mgr` 0xa290 is the patcher. It reads
+`nullsensor_1920x1080.cfg`, rewrites selected lines, and writes
+`/tmp/nullsensor_yuan%d.cfg`. The loop counter is `mov r4, #163` - exactly the
+163 lines of the cfg in the tree, which confirms the template is unchanged on
+the card.
+
+It uses **two** mechanisms, not one. Per line, in order:
+
+| test | line rewritten with |
+|---|---|
+| `strstr "input format"` | arg 4 (r7) |
+| `strstr "output format"` | arg 5 (r8) |
+| `strstr "start x position"` | r9 |
+| `strstr "start y position"` | r10 |
+| `strstr "input frame width"` | r11 |
+| `strstr "input frame height"` | struct halfword |
+| `atoi(line) == 1920` | **and** `strstr "maximum frame width"` -> struct halfword; otherwise -> arg 2 (width) |
+| `atoi(line) == 1080` | arg 3 (height) |
+| `strstr "flip video"` | struct halfword |
+| `strstr "mirror video"` | struct halfword |
+| none of the above | copied through unchanged |
+
+Two corrections to the record:
+
+- **M126 ("tinyvenc5 patches exactly nine keys") and M140 ("the patcher is in
+  `video_capture_mgr`") are both half right.** Both binaries carry the key
+  strings and both reference `/tmp/nullsensor_yuan%d.cfg`; the cfg is patched
+  by vcm and then read (and partly re-patched) by tinyvenc5.
+- **`maximum frame width` is special-cased**, so M140's "rewrites every line
+  valued 1920 blindly" is not quite right - the ISP allocation width takes a
+  different value from the captured width. `maximum frame height` has no such
+  case and does take the SET_VIC height. M140's method rule still stands: nine
+  AE window pairs and the max-height line still move with a height sweep.
+
+### The finding: line 4
+
+    4    60      // captured frame count
+
+**No binary in the image contains the string `captured frame count`** - not
+`libvideocap.so.13`, not `libtk_video_capture.so.0`, not
+`libtkmf_video_source.so.0`, not tinyvenc5, not vcm. The comment text exists
+only in the cfg, so the readers parse it **positionally**, and field 4 is read
+as whatever the file says.
+
+It is not a patcher key, and 60 is neither 1920 nor 1080, so **it passes through
+untouched and no host command can reach it.** Every stream this card runs is
+configured for a 60-frame capture.
+
+This is **not** the one-frame cause - 60 is not 1, and nothing reduces it. But
+it is a hard ceiling that would bite immediately after the cadence is fixed, and
+it is worth knowing before anyone reads "60 frames then stops" as a new defect.
+
+### A caution about what the frame count actually measures
+
+The host's frame count is **not** a measurement of VIC captures. M142 shows the
+one host-visible frame is delivered by the `vpl_dmac` one-shot that op `0x06`
+arms; the SDK frame path (`channel_done` -> `ep.ko`) has never run at all
+(M139). "The VIC captures exactly one frame" remains the simplest model that
+fits, but it is inference, and no host-side counter can distinguish one VIC
+capture from several that were never published.
+
+
+---
+
+## M144 (static, 2026-08-23): `vpl_vic.ko` disassembled - the ISR's re-arm decision located, and the release path cleared
+
+First disassembly of the VIC driver in this tree. Kept as `re-dump/vpl_vic.txt`
+(with relocations, so external calls resolve) and `re-dump/vpl_vic.sym`:
+
+    llvm-objdump -dr --triple=armv5te-linux-gnueabi <unpack>/yuan_demo_sdi/drivers/vpl_vic.ko
+
+| symbol | addr |
+|---|---|
+| `VIC_SetSizeToVIC` | 0x0000 |
+| `VIC_AEWBOneframeWQ` | 0x0154 |
+| `VIC_AutoFocusOneframeWQ` | 0x0768 |
+| `Close` | 0x0b3c |
+| **`ISR`** | **0x0fd8** |
+| `Open` | 0x2150 |
+| `MMap` | 0x27fc |
+| **`Ioctl`** | **0x2850** |
+| `VIC_GetDevNum` / `VIC_DetectStd` / `VIC_AutoDetectStdTasklet` | 0x4a18 / 0x4a68 / 0x4bc0 |
+
+### The ISR wakes the waiter exactly once per frame, and it is conditional
+
+The ISR (0xfd8..0x2150) makes **one** `__wake_up` call, at **0x17a8**, reached
+only from `beq 0x1798` at **0x1468** on a local flag at `[r11-0x48]`. Its other
+external calls are three `schedule_work`s (the AE/AWB/AF one-frame work queues),
+two `printk`s, `do_gettimeofday` and a divide. There is no second wake path, so
+`frame_ready` is set at exactly one place and the whole cadence question reduces
+to how often the ISR reaches it.
+
+### The re-arm decision - first time this project has located one
+
+At **0x17b0** the ISR clears bit **10** (`#1024`) of the channel word at
+`[regbase + (r9+4)*4]`, then:
+
+    17bc  ldr  r3, [r1]              ; register block
+    17cc  ldr  r5, [r3, #0x8]
+    17d0  tst  r5, #0x60             ; bits 5:6
+    17d4  bne  17e4                  ; -> re-arm
+    17d8  ldr  r3, [r3, #0xc]
+    17dc  tst  r3, #0x60
+    17e0  beq  1928                  ; -> STOP
+    17e4  str  r6, [r9, #0x10]       ; r6 = value | 1024  -> capture stays enabled
+
+The `0x1928` arm does **not** simply skip the re-arm - it clears bit **0** of
+`[regblock + 4]`:
+
+    1948  bic  r5, r5, #1
+    194c  str  r5, [r3, #0x4]
+
+So the hardware has an explicit **"capture one more frame, or halt"** decision
+taken inside the ISR, gated on bits 5:6 of two registers at block offsets 8 and
+0xc. This is exactly the shape of the observed defect. **What those bits mean is
+not derivable from the image** - there is no VIC datasheet in the tree and the
+registers are raw offsets - so this locates the mechanism without yet naming it.
+
+### The release path is NOT the re-arm, and adds no lever
+
+`VideoCap_ReleaseBufVIC` (`ioctl(fd, 0x4004e304, idx)`) dispatches at **0x29d4**,
+confirming M140's map, and the handler is purely bookkeeping:
+
+- per-buffer struct is **120 bytes** (`idx*15` then `<<3`), array at `[dev+0x90]`
+- it linearly searches the file's queued list at `[file+0x10]`, length
+  `[file+0x18]`
+- on a hit (0x3dc4) it **compacts the array** and decrements `[file+0x18]`
+- `[file+0x1c] == 1` branches to the **force-release** path at 0x4754 (this is
+  libvideocap's "[yuan][Sleep] Force Release Done"), not the normal one
+- otherwise it decrements the per-buffer refcount at `[buf+0x64]` and returns
+
+**It writes no VIC register at all.** So "the host/consumer releasing a buffer
+is what re-arms the VIC" is dead as stated: release touches only the driver's
+own list and refcount. Whatever sets bits 5:6 at block offsets 8/0xc, it is not
+this ioctl directly.
+
+### `capture_app_infinite` is an AUDIO app - closed
+
+The name is the most inviting thing in the image and it is a false lead. It is
+dynamically linked against `libasound.so.2`, `libmembroker.so.0`,
+`libtk_mass_mem_access.so.0`, `libmassmemaccess.so.9` and `libmemmgr.so.4`, its
+only TK imports are `TK_MMA_Init` / `TK_MMA_SetOptions` /
+`TK_MMA_ProcessOneFrame`, and its own usage string is
+
+    "for HD use ./capture_app_infinite -D -d 0 -R 48000 -F 256 -B 4"
+
+- rate 48000, 256 frames, 4 buffers. It touches no VIC and no video capture
+library. There is **no continuous-video reference application in the image.**
+
+
+### The other half: the same bits gate the ARMING write, in `Ioctl`
+
+`0x60` appears exactly **four** times in the whole module - twice in the ISR
+above, twice at **0x3a3c / 0x3a48** inside `Ioctl`, and nowhere else. The Ioctl
+site tests the identical pair and uses it to skip a write:
+
+    3a38  ldr  r1, [r3, #0x8]
+    3a3c  tst  r1, #0x60
+    3a40  bne  3a8c              ; busy -> skip
+    3a44  ldr  r1, [r3, #0xc]
+    3a48  tst  r1, #0x60
+    3a4c  bne  3a8c              ; busy -> skip
+    3a50..3a84                   ; program the capture target:
+                                 ;   [dev+0x1c] = ([chan+0x40] << 2) | (old >> 16 << 16)
+                                 ;   [dev+0x20] = (old & 0xffff) | ([chan+0x44] << 18)
+
+So bits 5:6 of block offsets 8 and 0xc read as **"a capture is armed / in
+flight"**:
+
+| site | bits set | bits clear |
+|---|---|---|
+| `Ioctl` 0x3a3c | skip - do not disturb an in-flight capture | program the next capture target |
+| `ISR` 0x17d0 | keep bit 10 - capture stays enabled | **0x1928: clear bit 0 of `[block+4]` - halt** |
+
+That is a coherent one-shot machine: the VIC runs while something keeps arming
+it, and the ISR shuts it down the moment it finds nothing armed. It matches the
+observed defect exactly, and it is the first mechanism in this project that
+does.
+
+### The question this leaves, stated precisely
+
+**Who calls the arming ioctl, and is that call gated on a buffer release?**
+
+- If `libtk_video_capture`'s `process()` re-arms unconditionally after
+  `VideoCap_WaitVIC` returns, then arming is independent of the encoder, the
+  deadlock model below is wrong, and the halt is somewhere else.
+- If arming happens only after a consumer releases a buffer, the chain closes
+  into a card-side deadlock: `img_handler`'s first call is init-only and
+  publishes nothing (M139) -> the SSM ring never fills -> `encode_handler` parks
+  -> nothing is released -> nothing re-arms -> the ISR halts the VIC after one
+  frame. Everything observed follows, **and no host command can break it** -
+  which would redirect the whole project to making frame 1 publish rather than
+  to making frame 2 arrive.
+
+Answering it needs the caller chain in `libvideocap.so.13` /
+`libtk_video_capture.so.0`, not more `vpl_vic`. It is static and costs zero
+spawns.
+
+
+---
+
+## M145 (static, 2026-08-23): there is no per-frame software re-arm - the buffer-lifecycle theory is dead
+
+M144 left one question: *who calls the arming ioctl, and is it gated on a
+buffer release?* Answered, and the answer kills the theory that has been step 2
+of the handoff since M140.
+
+### The VIC ioctl map, from `libvideocap.so.13`
+
+| wrapper | ioctl | notes |
+|---|---|---|
+| `VideoCap_WaitVIC` | `0xe301` | bare tail-jump to `ioctl` |
+| `VideoCap_Sleep` | - | **tail-jump to `VideoCap_WaitVIC`.** Confirms M138's chain. |
+| setup | `0x4028e302` | `_IOW`, 40 bytes |
+| `VideoCap_GetBufVIC` | `0x8078e303` | `_IOR`, **120 bytes** - exactly the per-buffer struct size M144 measured in `vpl_vic` |
+| `VideoCap_ReleaseBufVIC` | `0x4004e304` | `_IOW`, 4 bytes (the index) |
+| `VideoCap_StartVIC` | `0xe313` | retries in a loop until it returns 0 |
+
+`vpl_vic`'s dispatch confirms the pairing: `0x8078e303` at 0x2af4 -> handler at
+0x2b00; `0xe313` at 0x299c -> handler at 0x3c54; `0x4020e305` at 0x29b8, from
+which the release cmd `0x4004e304` is built inline (`sub #0x1c0000; sub #1`),
+which is why grepping for the literal finds nothing.
+
+### The per-frame loop does not re-arm
+
+`libtk_video_capture.so.0` imports only the **non-VIC** wrappers -
+`VideoCap_GetBuf`, `VideoCap_ReleaseBuf`, `VideoCap_Start`, `VideoCap_Stop`,
+`VideoCap_Sleep`, `VideoCap_Initial`, `VideoCap_Release`, `VideoCap_SetOptions`.
+So the steady-state loop is `GetBuf` -> consumer -> `ReleaseBuf`.
+
+`VideoCap_GetBuf` (0x43f0) calls **`VideoCap_GetBufVIC` and nothing else** on
+its normal path; its only other calls are `ReleaseBuf`/`ReleaseBufVIC` on the
+reject paths and two `puts` banners. `VideoCap_ReleaseBuf` (0x43d8) is a
+one-line forward to `VideoCap_ReleaseBufVIC`.
+
+The `VideoCap_StartVIC` call at 0x45b0 is **not** inside `GetBuf` - it sits past
+`GetBuf`'s literal pool (0x4594..0x45a8), in an unnamed local helper that
+`VideoCap_Start` uses. `GetBuf` never re-arms.
+
+### And the arming write is in the SETUP ioctl, not a per-frame one
+
+The capture-target programming M144 found at `vpl_vic` 0x3a50 - the block
+guarded by the bits-5:6 busy test - lies inside the long
+`0x4028e302` **setup** path (0x37c0..0x3a8c), which also fills `[chan+0x14]`
+through `[chan+0xc4]` and pushes geometry to `[dev+0x4]`, `[dev+0x8]`. It runs
+**once**, at open/configure time.
+
+### Consequence
+
+**No software re-arms the VIC per frame.** The sequence is: setup programs the
+target once, `StartVIC` (`0xe313`) sets bit 10 plus `0xe8` in the channel word
+at `[regs + chan*4 + 0x10]`, and the hardware then free-runs. The ISR's job is
+only to keep it enabled - and to **halt** it (0x1928, clearing bit 0 of
+`[block+4]`) the moment bits 5:6 of `[block+8]`/`[block+0xc]` read clear.
+
+So the deadlock model from M144 is **dead**: capture does not stop because
+nobody released a buffer, and `VideoCap_ReleaseBufVIC` writing no VIC register
+(M144) is consistent, not suspicious. The card halting after one frame is a
+**hardware-state** condition, not a missing call.
+
+This closes handoff step 2 ("`vpl_vic.ko`'s buffer lifecycle") as an avenue.
+
+### The one lead it leaves
+
+Earlier in the ISR (0x16xx-0x1728) there is a block that copies `[chan+0x200]`
+.. `[chan+0x20c]` into `[block+0x278]` .. `[block+0x284]`, and then two guarded
+extras:
+
+    1728  ldr r3, [r8, #0x210] ; cmp #1 ; streq [chan+0x214] -> [block+0x2c8]
+    173c  ldr r3, [r8, #0x218] ; cmp #1 ; then a read-modify-write of
+                                          [block+0x204] bits 1:0 from [chan+0x21c]
+
+Those are per-frame register updates gated on **software flags in the channel
+struct** (`+0x210`, `+0x218`), which the setup ioctl fills from the SDK's
+options - i.e. ultimately from the cfg. That is the only remaining place where
+something host-influenced changes what the ISR does per frame. It is the next
+thing to read, and it is static.
+
+
+### Addendum: the ISR's two gated extras never execute
+
+`[chan+0x210]` and `[chan+0x218]` - the flags gating the per-frame extras at
+0x1728/0x173c - are **never written anywhere in the module**. Every store to
+those offsets (0x1c88, 0x1e6c, 0x39bc) targets the *register block* (`r3 = [r5]`),
+not the channel struct (`r8`, confirmed as the software struct because 0x1798
+passes it straight to `__wake_up`). Zero-initialised and never set, so both
+`cmp #1` tests always fail and neither extra runs.
+
+That was the last host-influenced per-frame path in the ISR, and it is dead.
+No knob reaches the ISR's behaviour.
+
+### What that leaves: two live models, and they are distinguishable
+
+Everything above assumes the M140 model - the VIC captures once and halts. The
+evidence for it is entirely indirect. A second model fits every observation just
+as well:
+
+**Model B: the VIC keeps capturing; op `0x06` arms exactly one DMAC push.**
+M142 proved `0x06` arms the outbound transfer. If it arms *one* transfer, then
+one frame per stream is a property of the *delivery* path, not the capture path,
+and the SDK path is broken somewhere in publishing (`img_handler` taking the
+init path repeatedly, `TK_ImgProc_Init` failing, etc.) rather than in capture.
+
+The two differ in a directly measurable way. Fire **one** `0x06` several seconds
+after the first frame and compare the delivered images:
+
+- **different image** -> the VIC was still capturing. M140's model is wrong, and
+  the whole project redirects from "make frame 2 arrive" to "make frame 1
+  publish".
+- **byte-identical image** -> the DMAC re-pushed a stale buffer. The VIC halted,
+  M140's model is confirmed, and it is confirmed *directly* for the first time.
+- **no second frame** -> `0x06` arms once per stream and nothing re-arms.
+
+This is not the kick avenue M133 closed. M133 flooded 1224 kicks, lost the
+receiver lock, and was asking whether kicks *pace* the cadence. This uses a
+single well-separated kick as a **probe of the producer**, which is a different
+question and a different regime.
+
+
+---
+
+## M146 (hardware, 2026-08-23): 12 kicks, one frame - the producer is dead, and the flood was what cost M133 its lock
+
+The probe M145 designed. `op6_kick_ms=5000 kick_repeat=1`, one op `0x06` every
+5 s after the first delivery.
+
+    poll-drain: first kick op 0x06 ret=0
+    poll-drain stopped after 1 deliveries, 12 kicks (op 0x06);
+        producer watch saw 0 change(s), final 40=a5a5a5a5 44=a5a5a5a5 48=a5a5a5a5
+    stream stop: EVENT[0x30]=0 token[0x40]=a5a5a5a5 enc[0x50]=0
+                 irq_total=6 frame_events=0 fifo_drops=0
+
+**Model B is dead.** If the VIC were still capturing and each `0x06` armed a
+DMAC push, twelve kicks over 55 s would have produced roughly twelve frames. It
+produced one - the same one the baseline gives, delivered before the first kick.
+The poll-drain kept sampling buffer 0 for the remaining 55 s and it never
+refilled.
+
+So op `0x06` arms the outbound push **once per stream**, at stream start, and
+re-firing it later does nothing. M140's model survives its first direct test:
+the card stops producing, and the defect is upstream of delivery, not in it.
+
+### Correction to M133: kicks do not cost the receiver lock. Flooding does.
+
+M133 fired 1171-1224 kicks and reported that "the receiver **loses lock** under
+either". At 5 s spacing the lock is untouched - `R55=0x7f` before START, after
+START and at stop, and every `detect` line through the whole 55 s reads
+`55=7f LOCKED coherent`. The lock loss was an artefact of the flood rate, not a
+property of the opcode. The rest of M133 stands.
+
+### The frame that arrives is RAW I420, and that is a clue nobody has followed
+
+`enc[0x50]=0` says no bitstream was ever DMA'd and the sentinel says
+`encode_handler` never ran - yet the frame the host receives is a valid planar
+I420 image, not H.264. **It cannot have come from the encoder.** The driver's
+"inferred H.264 length" wording is legacy naming from before M129.
+
+That narrows the producer: something on the card is pushing a **raw preview
+frame** over `vpl_dmac`'s outbound transfer, exactly once, and it is not the SDK
+encoder path. The knobs that pace a preview - op `0x31`'s `fps` (0x09),
+`skip` (0x0a), `avg` (0x0b), `preview_off` (0x0d), `preview_no_osd` (0x0f),
+`hw_d` (0x12) - are host-settable and, apart from `fake_frame_off`, have never
+been swept with a working delivery path. M138 established that `m_fps`/`m_avg`
+are never read and `m_skip` drops one in `(skip+1)`, but that was about
+`img_handler`, i.e. the path *into the SSM ring for the encoder*, which is a
+different consumer from whatever is writing to the host.
+
+**Next, and it is static:** find who initiates the outbound transfer.
+`ep.ko` exports `pcie_set_outbound`; `vpl_dmac.ko` is its only importer
+(`VPL_DMAC_StartTail` 0xc94, `VPL_DMAC_ISRTail` 0xf70). Work out which
+process calls into `vpl_dmac` with a raw frame, and the knobs that pace it
+become visible. `re-dump/vpl_dmac.txt` is already in the tree.
+
+
+---
+
+## M147 (static, 2026-08-23): the raw frame proves the SDK pipeline completes one FULL pass - M139's "the encoder never ran" is too strong
+
+M146 established the delivered frame is raw I420, not H.264. Tracing what can
+write raw video into host memory forces a revision of the M139/M140 model.
+
+### Only one thing on the card can write to host memory
+
+`ep.ko` exports `pcie_set_outbound`; **`vpl_dmac.ko` is its only importer**
+(M139). `vpl_dmac` is reached only through `/dev/vpl_dmac`, and the only
+userspace object that names that node is **`libmassmemaccess.so.9`**, wrapped by
+`libtk_mass_mem_access.so.0`. Of the video binaries, only **tinyvenc5** links
+both (`video_capture_mgr` links just `libmemmgr`; `libtkmf_video_source` links
+only pthread/libc). The audio apps link it too, which is what
+`capture_app_infinite` is doing (M144).
+
+And every `TK_MMA_*` call in tinyvenc5 - `Init`, `SetOptions`,
+`StartOneFrame`, `WaitOneFrameComplete`, `ProcessOneFrame`, `Release` - is
+inside **`EncodingGroup::encode_handler`**. `TK_MMA_Init` is in its prologue
+(0x12b7c, 0x12ba0, before the loop head at 0x12f04); every push site
+(0x1349c, 0x13e64, 0x142ac, 0x1430c) is in the loop body, i.e. **after** the
+first `SSM_ReleaseAndReceive` at 0x12f24 (M138).
+
+### Therefore the ring delivered at least once
+
+`img_handler`'s publish is the `SSM_DeliverAndAllocate` at **0x1290**, reached
+only when `[r4+0xc] != 0`; when it is zero the call goes to 0x129c, the init
+path, which is where `SSM_Writer` (0x14f4) and the priming
+`SSM_DeliverAndAllocate` (0x1544) live. So the first call initialises and
+publishes nothing - M139 is right about that - and **the publish at 0x1290
+requires a second call**.
+
+Chaining it: a raw frame reached the host -> `encode_handler` executed a loop
+body -> its first `SSM_ReleaseAndReceive` returned -> the ring was non-empty ->
+`img_handler` published at 0x1290 -> `img_handler` was called **at least
+twice** -> **the VIC captured at least two frames.**
+
+### What this revises
+
+| claim | status |
+|---|---|
+| `store_channel_done` has never run (M139, sentinel) | **stands** - measured, not inferred |
+| "`encode_handler` is alive but starved, having received zero frames" (M139) | **too strong.** It received at least one and ran at least one full iteration. |
+| "the VIC captures exactly one frame and stops" (M140) | **at least two.** The count was never measured; the host's frame count counts DMA pushes, not captures (M143's caution, now concrete). |
+| "the one frame does not come from the SDK's frame path" (M139) | **wrong.** It is the SDK path - `img_handler` -> SSM -> `encode_handler` -> MMA -> `vpl_dmac` -> host. What it is *not* is the H.264 bitstream path, which is what `channel_done`/`enc_stat` report. |
+
+So the pipeline is not dead. **It completes at least one full pass and then
+stops**, and the failure is narrower than "nothing works": it is whatever
+prevents iteration two.
+
+### `EncodingGroup::mma_already_start` is never written
+
+The symbol (`_ZN13EncodingGroup17mma_already_startE`, .bss 0x7eda0, addressed as
+`[base-0xfa8]`) has **nine `ldrb` reads and zero writes** anywhere in tinyvenc5.
+It is a static bool that stays 0 for the process lifetime, so every branch that
+needs it set is unreachable - including the synchronous
+`TK_MMA_WaitOneFrameComplete` at 0x14358, which is guarded by
+`cmp #0 / beq` at 0x14330 and therefore **never waits for a transfer to
+finish**.
+
+That is not obviously the defect - not waiting makes transfers async, which is
+permissive rather than blocking - but it is a whole family of dead branches in
+the exact function that stopped iterating, and it should be mapped before
+anything else in `encode_handler` is trusted.
+
+### Next
+
+The question is no longer "why does the VIC capture once" - it captured at least
+twice. It is **"why does `encode_handler` not complete a second iteration"**,
+and the answer is somewhere in the loop body between 0x12f24 and the branch back
+to the loop head. That is static, it is a bounded region, and the disassembly is
+in `re-dump/tinyvenc5.txt`.
+
+
+---
+
+## M149 (hardware, 2026-08-23): the wedge's second signature - a deaf mailbox that looks exactly like a dead HDMI source
+
+After M146 the card stopped locking. Four consecutive runs, including a plain
+control capture with no `EXTRA=`, all ended at
+`No coherent HDMI timing was locked during the 45s window`.
+
+It was not the source, and it was not that session's driver changes.
+
+    CMD_INIT got no answer (-110), STATUS=00000000 EVENT=00000000
+        RESULT=00000000 bar5[dc]=00000000 bar5[30]=fc200004 bar5[38]=fc20005f
+    card handshake failed (-110) - the mailbox is deaf
+    MST3367 bring-up skipped - firmware not ready
+
+PCIe is healthy in this state: the device enumerates at 0000:04:00.0, an IRQ is
+assigned, the subsystem ID reads correctly and **BAR reads return sane non-zero
+values**. Only the card's own mailbox service is gone. Since the handshake never
+completes, `mz0380_mst3367_bringup()` is skipped entirely - the receiver is
+never touched - so every run reports no lock. The I2C probe agrees and says so
+plainly: `periph: card handshake not complete`, `0 of 0 registers read`.
+
+This is a **different presentation** of the 8-18 stream wedge from the
+`SET_VIC ret=-110` wall this file has always described. It appeared after
+roughly seven streams on that power cycle.
+
+### The driver changes were ruled out by experiment, not by argument
+
+The suspicion was reasonable - the failures began right after a rebuild - so it
+was tested rather than reasoned away. `ko/mz0380-7.2.0-1-cachyos.ko`, built
+before the `bitstream_num` knob existed, was insmod'd directly and produced the
+identical deaf-mailbox handshake failure. The control run that failed had also
+carried no `EXTRA=`, so `bitstream_num` defaulted to 1 and its `SET_VIC` was
+byte-identical to M146's - and in any case the failure happens before `SET_VIC`
+is ever sent.
+
+### Two traps worth not repeating
+
+- `mz0380-m55-real-capture.sh` prints `waiting for the card to finish booting
+  its own flash image...` and then `using /dev/video0` **regardless of whether
+  the handshake succeeded.** Neither line is evidence the mailbox is alive, and
+  reading them as such cost a wrong diagnosis in this session.
+- A run that aborts before stream start leaves `token[0x40]=00000000`,
+  `irq_total=0` and **all-zero, unpoisoned buffers**, because the sentinel seed
+  and the poison fill both happen *at* stream start. Read as a wedge signature
+  that is badly misleading: it is simply an abort. Only compare those fields
+  across runs that actually reached `stream start:`.
+
+
+### Recovery confirmed, and the 2-second wedge test
+
+A full power-down cleared it: `CMD_INIT answered on attempt 1
+(status=0xdddddddd)`, and the very next control capture delivered a complete
+3110400-byte frame with `R55=0x7f` throughout and the sentinel intact.
+
+The check that distinguishes the two states costs **2 seconds and zero spawns**,
+against 94 seconds for a capture that cannot succeed anyway:
+
+```bash
+sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
+sudo insmod ./mz0380.ko; sudo dmesg | grep -a "CMD_INIT\|handshake" | tail -3; sudo rmmod mz0380
+```
+
+The `modprobe` line is not optional: without it `insmod` fails with
+`Unknown symbol in module`, which is a missing dependency and says nothing about
+the card. `Invalid module format` is a third, unrelated failure - vermagic
+mismatch against the running kernel.
+
+
+---
+
+## M148 (hardware, 2026-08-23): `bitstream_num=2` changes nothing - clean negative on a field frozen since M22
+
+M147 left `encode_handler`'s first post-receive test as the live suspect:
+
+    12f24  bl   SSM_ReleaseAndReceive
+    12f48  ldr  r2, [r12, #0x34]      ; per-channel field, stride 60
+    12f4c  cmp  r2, #1
+    12f50  bls  0x13d04               ; <= 1 -> alternate path
+
+Our streams report `bitstreams=1`, and the alternate path is what we observe: a
+raw frame over MMA, no H.264 bitstream, `channel_done` never written. SET_VIC
+byte 28 (`bitstream_num`) has been **hardcoded to 1 since M22** and never
+varied - the only established fact about it was that firmware rejects 0.
+
+A `bitstream_num` module parameter was added (default 1, so the baseline is
+unchanged) and the SET_VIC log line now prints the real value instead of a
+hardcoded `bitstreams=1`.
+
+    stream start: SET_VIC(... -> H.264 output=1920x1080, bitstreams=2) ret=0
+    poll-drain stopped after 1 deliveries, 0 kicks; producer watch saw 0 change(s)
+    stream stop: EVENT[0x30]=0 token[0x40]=a5a5a5a5 enc[0x50]=0
+                 irq_total=6 frame_events=0 fifo_drops=0
+
+**Identical to the baseline in every field.** The firmware accepts 2 without
+complaint - `ret=0`, no `no_signal` latch, lock held at `R55=0x7f` throughout -
+and it makes no difference at all.
+
+So either `[chan+0x34]` is not `bitstream_num`, or the `<= 1` branch is not what
+starves the encoder. The identification was flagged as inference when the test
+was designed; it did not survive. The knob stays in the tree at its default of
+1, since it costs nothing and the field is now settable if a future hypothesis
+needs it.
+
+Method note: this cost one spawn and answered cleanly because the value was the
+**only** thing that changed, on a card whose health had just been confirmed by a
+control capture. That is what M140's method rule asks for.
+
