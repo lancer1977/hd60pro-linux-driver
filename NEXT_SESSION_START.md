@@ -613,7 +613,52 @@ independent of the DMA, the notification path and the poll-drain:
 
 </details>
 
-### START HERE: why does `encode_handler` not iterate twice? (static, zero spawns)
+### START HERE (2026-08-23): the cadence question is answered. Read this first.
+
+**One frame per tinyvenc5 process, and only a new SET_VIC makes a new process.**
+That single sentence covers every measurement in this file - why OBS shows one
+image and freezes, why every m55 run reports `1 deliveries`, and why the NOSG
+respawn-per-frame loop was the only thing that ever produced a sequence.
+
+The card is **not** broken. M154 captured two frames 13 s apart in one module
+load, 83% of pixels changed, so the producer, receiver, encoder and DMA path
+all work and re-capture fresh content on every cycle.
+
+**There is no host-side lever left.** Three were removed this session and none
+moved the cadence:
+
+| lever removed | milestone | result |
+|---|---|---|
+| the per-frame `enc_stat` ack - the last mid-stream write to the card | M151 | no change |
+| the respawn (`setvic_once=1`) | M155 | no frame at all; `0x2d` times out |
+| STOP at streamoff (`stop_on_streamoff=0`) | M156 | no change; STOP exonerated |
+
+That is on top of ordering (M141/M142), kicks (M146), geometry (M140) and
+`bitstream_num` (M148).
+
+**The mechanism, from M153's CFG:** `EncodingGroup::mma_already_start` is a
+per-process static with nine reads and zero writes, so with it pinned at 0 the
+only reachable MMA push is `TK_MMA_StartOneFrame` (0x1430c) - asynchronous -
+and `TK_MMA_WaitOneFrameComplete` is unreachable. One push per process is
+exactly what the code shape predicts.
+
+**The one live thread.** After its single push the encoder stops answering op
+`0x2d` (`ret=-110` on every later cycle), yet it does not exit: `encode_handler`
+has no `exit`/`abort` call, has one epilogue, and parks on
+`SSM_ReleaseAndReceive` as M138 described. Nor is it a mutex deadlock - cutting
+the unlock at 0x13730 makes both the loop head and the wait unreachable from the
+re-lock, so every path back releases the lock. But `encode_handler` is only a
+*thread*; tinyvenc5's **main** loop services `0x2d`, and nothing yet explains
+why that stops.
+
+**Read tinyvenc5's main command loop.** Last unpulled thread, static, zero
+spawns. Use `mz0380-cfg.py`, not eyeballed branches - that mistake cost three
+milestones today (M150 -> M152 -> M153).
+
+<details>
+<summary>Superseded framing: why does `encode_handler` not iterate twice? (M147-M150)</summary>
+
+### why does `encode_handler` not iterate twice? (static, zero spawns)
 
 M147 relocated the defect. The chain of inference, each link checkable:
 
@@ -749,6 +794,8 @@ Still true and still worth knowing, closed by M144:
 - **`capture_app_infinite` is an AUDIO app** - `libasound`, `TK_MMA_*`,
   `-R 48000 -F 256 -B 4`. There is no continuous-video reference app in the
   image.
+
+</details>
 
 </details>
 
