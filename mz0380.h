@@ -354,6 +354,8 @@ struct mz0380_dev {
 	u8 frame_event_drop_tokens;
 	u64 frame_event_drops;
 	u32 video_sequence;
+	/* M155: stream cycles since insmod, for stream_setvic_once. */
+	u32 stream_cycles;
 	u8 frame_poison_byte;
 	bool frame_poison_active;
 	bool streaming;
@@ -721,6 +723,7 @@ extern unsigned int mz0380_enc_mask;
 extern unsigned int mz0380_post_mask;
 extern unsigned int mz0380_bitstream_num;
 extern bool mz0380_enc_stat_ack_on;
+extern bool mz0380_setvic_once;
 extern unsigned int mz0380_post_di;
 extern bool mz0380_fake_frame_off;
 extern bool mz0380_post_proc;

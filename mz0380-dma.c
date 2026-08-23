@@ -1307,6 +1307,17 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 		}
 	}
 
+	/*
+	 * M155: optionally skip SET_VIC on every cycle after the first, so the
+	 * cycle does not respawn tinyvenc5. See the setvic_once parameter.
+	 */
+	if (mz0380_setvic_once && dev->stream_cycles > 0) {
+		pr_info("%s: stream start: SET_VIC SKIPPED (setvic_once=1, cycle %u) - no respawn; if a frame still arrives it did not come from the spawn\n",
+			dev->name, dev->stream_cycles);
+		ret = 0;
+		goto vic_done;
+	}
+
 	/* Even a timed-out transaction may already have spawned tinyvenc5. */
 	vic_fired = true;
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
@@ -1330,6 +1341,8 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 			mz0380_vic_int_mode & 0xff,
 			out_w, out_h,
 			mz0380_bitstream_num & 0xffu, ret);
+vic_done:
+	dev->stream_cycles++;
 	if (ret)
 		goto err_events;
 

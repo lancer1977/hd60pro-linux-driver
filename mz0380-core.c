@@ -407,6 +407,34 @@ MODULE_PARM_DESC(vic_out_h,
  * Default is 1, i.e. the behaviour every prior measurement was taken with.
  * Set 0 to remove the write and leave the card alone after a frame.
  */
+/*
+ * M155: send SET_VIC only on the FIRST stream cycle after insmod.
+ *
+ * M154 got two distinct frames from one module load by running two v4l2
+ * captures - but the dmesg shows every STREAMON re-sending SET_VIC, and
+ * SET_VIC is what makes video_capture_mgr fork a fresh tinyvenc5. So a cycle
+ * costs an encoder spawn out of the 8-18 budget plus a ~2 s settle, and
+ * "cycle for cadence" is not viable.
+ *
+ * The question this answers: does the frame come from the RESPAWN, or would a
+ * cycle without SET_VIC also produce one? M153 says the one-frame bound is a
+ * per-process latch (mma_already_start, never set, so
+ * TK_MMA_StartOneFrame runs once and is never awaited), which predicts that a
+ * cycle without a respawn yields nothing - the parked tinyvenc5 has already
+ * spent its single push.
+ *
+ * A confirmed negative closes "cycle cheaply for cadence" for good. A positive
+ * would mean the frame does not depend on the respawn, and cycling becomes a
+ * real - if slow - video path.
+ *
+ * Default 0 = every stream start sends SET_VIC, which is what every prior
+ * result used.
+ */
+bool mz0380_setvic_once;
+module_param_named(setvic_once, mz0380_setvic_once, bool, 0644);
+MODULE_PARM_DESC(setvic_once,
+		 "M155: send SET_VIC only on the first stream cycle after insmod, so later cycles do not respawn tinyvenc5 (def:0 = send every cycle, the behaviour all prior results used)");
+
 bool mz0380_enc_stat_ack_on = true;
 module_param_named(enc_stat_ack, mz0380_enc_stat_ack_on, bool, 0644);
 MODULE_PARM_DESC(enc_stat_ack,
