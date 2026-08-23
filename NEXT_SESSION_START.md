@@ -569,6 +569,22 @@ M82/M127/M128:
 ordering unscoreable - that is the entire content of M90/M91's "win_seq renders
 nothing". Mask is 0 by default since M131.
 
+**SUPERSEDED BY M150/M151 - the sentinel is blind. Read the FRAME COUNT.**
+The registers below are written by `ep.ko`'s `store_channel_done`, which runs
+only when the card's userspace `pwrite`s `channel_done` - and M150 proved that
+`pwrite` unreachable (guarded by `mma_already_start`, nine reads and zero
+writes in the whole binary). **`token[0x40]` cannot move whatever the card
+does**, so every "moves off `a5a5a5a5`" row here is unsatisfiable and the runs
+that used it were reading a constant. "producer watch saw 0 change(s)" means
+"the dead path is still dead", nothing more.
+
+The frame counts in those runs are unaffected - the poll-drain measures them
+against the poison boundary, independently. **Frames delivered is the only
+working oracle this project has for card-side progress.** Design future tests
+against it.
+
+Original text, kept because the run history refers to it:
+
 **Read the result off `token[0x40]`, not off the frame count.** The M139
 sentinel turned the card's own encoder into a host-visible oracle that is
 independent of the DMA, the notification path and the poll-drain:
