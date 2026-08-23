@@ -9297,3 +9297,38 @@ while a hang is the `SSM_ReleaseAndReceive` park M138 described.
 0x14318, check which is reachable - the loop head at 0x12f04, the loop exit at
 0x12fc0, or a function epilogue. That costs nothing and does not need the card.
 
+
+### M156 addendum: the encoder hangs rather than exits, and it is not a mutex deadlock
+
+Two mechanical checks with `mz0380-cfg.py`, both cheap, both negative in the
+useful direction.
+
+**Does tinyvenc5 exit after its single push?** No. `encode_handler` contains no
+call to `exit`, `_exit`, `abort` or `pthread_exit` anywhere, it has exactly one
+epilogue (0x13020), and from the `TK_MMA_StartOneFrame` success block at
+0x14318 the loop head at 0x12f04 and the `SSM_ReleaseAndReceive` at 0x12f24 are
+both reachable. So the thread loops back and **parks on the receive**, which is
+M138's model, rather than terminating.
+
+**Is it a mutex deadlock?** No. `encode_handler` locks at 0x13040, does an
+unlock/re-lock pair at 0x13540/0x13548 (the re-lock is executed, because the
+`mma_already_start` skip branches to 0x1353c which is between them), and
+unlocks at 0x13730, immediately before the back-edge at 0x13734. Cutting every
+edge out of that unlock makes both the loop head and the SSM wait
+**unreachable** from the re-lock:
+
+    loop head reachable at all               : True
+    loop head reachable WITHOUT the unlock   : False
+    SSM wait  reachable WITHOUT the unlock   : False
+
+So every path back to the wait releases the mutex first. The encoder does not
+park holding a lock that the command path needs, and the obvious explanation
+for `0x2d` timing out is eliminated.
+
+**What is left unexplained:** `encode_handler` is a thread created by
+`init_func`; tinyvenc5's *main* loop is what services `0x2d`. That thread
+parking should not stop the main loop answering the mailbox, yet `0x2d` returns
+-110 on every cycle after the first. Reading tinyvenc5's main command loop is
+the next static step, and it is the last thread in this investigation that has
+not been pulled.
+
