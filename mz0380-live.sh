@@ -99,7 +99,8 @@ watch)
 	;;
 
 load)
-	make >/dev/null || { echo "build failed"; exit 1; }
+	. ./mz0380-build.sh
+	MZKO=$(mz0380_resolve_module) || exit 1
 
 	# M85: never leave a module loaded that cannot unload cleanly. An oops in
 	# the exit path wedges it in MODULE_STATE_GOING, which no rmmod clears -
@@ -159,7 +160,7 @@ load)
 	add_opt poll_drain_ms   "${POLLDRAIN:-20}"
 
 	dmesg -C
-	insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
+	insmod "$MZKO" dma_handshake=1 enable_dma=1 \
 		enable_video=1 procfs_verbosity=2 dma_iova_remap=1 aic_on=1 \
 		stream_nosg="${NOSG:-0}" force_timings=0 signal_poll_ms=4000 \
 		$OPTARGS ${EXTRA:-} \

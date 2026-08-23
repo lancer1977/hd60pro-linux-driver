@@ -47,14 +47,15 @@ if [ "$state" = "going" ]; then
 	fail "mz0380 is already wedged in MODULE_STATE_GOING (refcnt $(cat /sys/module/mz0380/refcnt 2>/dev/null)). Power-cycle the machine; rmmod -f will not help."
 fi
 
-make >/dev/null || fail "build failed"
+. ./mz0380-build.sh
+MZKO=$(mz0380_resolve_module) || fail "build failed"
 rmmod mz0380 2>/dev/null
 sleep 1
 modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
 dmesg -C
 
 echo "=== load (enable_dma=1: reaches request_irq, which is the point) ==="
-insmod ./mz0380.ko enable_dma=1 enable_video=0 dma_handshake=1 \
+insmod "$MZKO" enable_dma=1 enable_video=0 dma_handshake=1 \
 	irq_intx="${INTX:-1}" || fail "insmod failed"
 
 sleep 2

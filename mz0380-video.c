@@ -869,8 +869,17 @@ static const struct vb2_ops mz0380_qops = {
 	.buf_queue       = mz0380_buf_queue,
 	.start_streaming = mz0380_start_streaming,
 	.stop_streaming  = mz0380_stop_streaming,
+#ifdef MZ0380_HAVE_VB2_WAIT_OPS
+	/*
+	 * Kernels up to 6.x require the driver to drop q->lock around a
+	 * blocking DQBUF itself. The ops and the vb2_ops_wait_* helpers were
+	 * removed once vb2 core took that over, so newer kernels must not set
+	 * them. The Makefile probes videobuf2-v4l2.h rather than testing
+	 * LINUX_VERSION_CODE - the removal release is not worth guessing.
+	 */
 	.wait_prepare    = vb2_ops_wait_prepare,
 	.wait_finish     = vb2_ops_wait_finish,
+#endif
 };
 
 /* ===== HDMI signal detect ============================================ */

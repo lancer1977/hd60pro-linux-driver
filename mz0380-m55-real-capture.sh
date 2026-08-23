@@ -61,7 +61,8 @@ LOCKWAIT=${2:-45}
 # Real capture is the default. NOSG=1 deliberately bypasses HDMI/BT1120 and
 # must never be used to decide whether source pixels are reaching the card.
 NOSG=${NOSG:-0}
-make >/dev/null || { echo "build failed"; exit 1; }
+. ./mz0380-build.sh
+MZKO=$(mz0380_resolve_module) || exit 1
 
 # M85: never spend a hardware run on a module that cannot unload cleanly.
 # An oops in the exit path wedges the module in MODULE_STATE_GOING, which
@@ -128,7 +129,7 @@ add_opt kick_repeat     "${KICKREP:-}"
 add_opt stream_without_signal "${NOSRC:-}"
 
 dmesg -C
-insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
+insmod "$MZKO" dma_handshake=1 enable_dma=1 \
 	enable_video=1 procfs_verbosity=2 dma_iova_remap=1 aic_on=1 \
 	stream_nosg="$NOSG" force_timings=0 signal_poll_ms=4000 \
 	$OPTARGS ${EXTRA:-} \
