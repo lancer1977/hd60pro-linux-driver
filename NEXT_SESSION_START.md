@@ -569,13 +569,37 @@ M82/M127/M128:
 ordering unscoreable - that is the entire content of M90/M91's "win_seq renders
 nothing". Mask is 0 by default since M131.
 
-**The M151 "the sentinel is blind" warning that stood here was WRONG and has
-been withdrawn (M152).** It rested on M150 treating an address range as a basic
-block; three unconditional branches from outside (0x13e9c, 0x142b0, 0x1582c)
-jump into 0x134a0, which is inside that range and *before* the `channel_done`
-`pwrite` at 0x13538. The write is reachable without passing the
-`mma_already_start` test, so the sentinel **can** move and the table below
-stands as written.
+**SUPERSEDED - the sentinel is blind, so read the FRAME COUNT. Proven in M153
+after two wrong turns; the chain is worth knowing because the question is not
+eyeball-able.**
+
+M150 said the `channel_done` `pwrite` (0x13538) is unreachable, arguing from a
+`beq` that skips the range containing it. M152 withdrew that: the argument is
+invalid, because three unconditional branches from outside (0x13e9c, 0x142b0,
+0x1582c) jump into 0x134a0, inside the range and ahead of the write. M153 then
+settled it mechanically with `mz0380-cfg.py`, and the answer is that M150's
+*conclusion* was right after all - those three branches are themselves
+reachable only *through* the flag-guarded fall-through, so removing that one
+edge kills them too.
+
+With `mma_already_start` pinned to 0 (nine reads, zero stores, no pool word for
+0x7eda0), the CFG reports **unreachable** for the `channel_done` write, the
+second `pwrite`, all three `TK_MMA_ProcessOneFrame` sites and
+`TK_MMA_WaitOneFrameComplete`. Exactly one push survives:
+**`TK_MMA_StartOneFrame` at 0x1430c, asynchronous, never awaited.**
+
+So `store_channel_done` never runs, `token[0x40]` cannot move, and every
+"moves off `a5a5a5a5`" row below is unsatisfiable. **Frames delivered is the
+only working oracle** - the poll-drain measures those against the poison
+boundary, independently, so the frame counts in the run history are all valid.
+
+Do not re-derive this by reading branches. Run:
+
+```bash
+python3 mz0380-cfg.py re-dump/tinyvenc5.txt 0x12b00 0x15c60 0x12f04 <addr>...
+```
+
+Original text, kept because the run history refers to it:
 
 **Read the result off `token[0x40]`, not off the frame count.** The M139
 sentinel turned the card's own encoder into a host-visible oracle that is
@@ -630,11 +654,14 @@ it can also leave the loop entirely.
   same address (0x13d20) and loops. The first two receives are discarded; the
   main body runs from the third. It is not `bitstream_num`, which is why M148's
   hardware sweep was flat.
-- **`channel_done` is NOT dead code** - M150 said so and M152 withdrew it. The
-  `pwrite` at 0x13538 is skipped on the fall-through from 0x133f0 when
-  `mma_already_start == 0` (which is always), but 0x13e9c, 0x142b0 and 0x1582c
-  branch unconditionally into 0x134a0, inside the range and ahead of the write.
-  Reaching it does not require the flag.
+- **`channel_done` cannot be written in this image** (M150, withdrawn by M152,
+  restored by M153's CFG). With `mma_already_start` at 0, the write at 0x13538,
+  the second `pwrite`, all three `TK_MMA_ProcessOneFrame` sites and
+  `TK_MMA_WaitOneFrameComplete` are all unreachable. **The one surviving push is
+  `TK_MMA_StartOneFrame` at 0x1430c - asynchronous, and never awaited.**
+  That unifies the whole run history: `mma_already_start` is per-process,
+  tinyvenc5 is spawned per stream, so **one frame per spawn** is exactly what
+  the code shape predicts.
 - What IS established about `mma_already_start`: nine reads, zero writes, no
   literal-pool reference to 0x7eda0. It is 0 for the process lifetime, so every
   branch that needs it set is not taken - including the synchronous
