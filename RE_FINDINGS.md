@@ -9097,3 +9097,60 @@ proof** - the libraries would have to be read to confirm it.
 Frame count remains the only working oracle, and this time the reason is
 proven rather than asserted: the sentinel's writer is unreachable.
 
+
+---
+
+## M154 (hardware, 2026-08-23): TWO frames in one module load - the limit is per stream cycle, and the producer is fine
+
+The test M153 asked for. Module loaded once with `mz0380-live.sh load`, then two
+independent v4l2 captures without unloading:
+
+    v4l2-ctl --stream-mmap --stream-count=1 --stream-to=/tmp/a.raw
+    v4l2-ctl --stream-mmap --stream-count=1 --stream-to=/tmp/b.raw
+
+Both delivered a complete 3110400-byte frame. Both scored **NOT SPLASH**
+(Y 211 / UV 225 and Y 213 / UV 208 distinct values). And they are **different
+frames**, not the same buffer read twice:
+
+    luma mean |a-b| = 45.90    max 209    83.0% of pixels differ by more than 8
+    a: mean 141.6 std 57.0     b: mean 132.5 std 57.4
+    a row-to-row correlation 0.9691   (a real image; noise would be ~0)
+
+Thirteen seconds apart, and the scene moved. This is the **first time this
+project has captured two distinct frames without reloading the driver.**
+
+### What it overturns
+
+Every run in this file until now ended `poll-drain stopped after 1 deliveries`
+and the conclusion drawn, repeatedly, was that the card produces one frame and
+stops. **It does not.** It produces one frame per *stream cycle*, and a second
+STREAMOFF/STREAMON yields another. The producer is healthy; the encoder,
+receiver and DMA path all work; what is bounded is the cycle, not the card.
+
+That also matches M153's code shape exactly. `mma_already_start` is a
+per-process static, `TK_MMA_StartOneFrame` is the only reachable push and its
+completion is never awaited, so the first transfer of a process succeeds and
+nothing arranges a second. A fresh stream cycle gets a fresh start.
+
+### The open question this immediately raises
+
+**Does a stream cycle respawn tinyvenc5?** It matters a great deal:
+
+- If STREAMON re-sends SET_VIC, each cycle costs one encoder spawn, the budget
+  is the familiar 8-18, and this is a diagnostic rather than a path to video.
+- If the cycle is cheaper than a spawn, then cycling is a **cadence mechanism** -
+  crude, but the first one this project has found that yields more than one
+  frame.
+
+The answer is in the dmesg of this run: a second `stream start: SET_VIC(...)`
+line means respawn. Read it before designing anything on top.
+
+### Method note
+
+This cost two spawns and overturned a model that eight milestones had been
+reasoning within. It was worth running earlier than it was. The reason it had
+not been: every previous harness unloaded the module between captures, so
+"one frame per stream" and "one frame per module load" were never separated.
+`mz0380-m55-real-capture.sh` unloads on exit by design (M60), which is correct
+for its purpose and hid this for the entire history of the file.
+
