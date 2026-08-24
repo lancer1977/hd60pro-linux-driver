@@ -1,17 +1,76 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-24. Full history in **RE_FINDINGS.md**. The investigation
-into "why one frame" is **finished** - M158, M163, M165 and M166 close it from
-both ends. This file is the handoff only. Everything below was verified on
-hardware unless it says otherwise._
+_Last updated 2026-08-24. Full history in **RE_FINDINGS.md**. This file is the
+handoff only. Everything below was verified on hardware unless it says
+otherwise._
 
-**If you read one thing: the card, with the firmware it boots, is a
-single-shot 1080p frame grabber. That is a proven bound, not a missing trick.**
+## Where the driver is
 
-The pixel path is `tinyvenc5` **0x14728** - `TK_MMA_StartOneFrame` with
-`a3 = w*h*3/2 = 3110400`, exactly the byte count every capture since M129 has
-delivered (M166). It fires once per encoder process and then the process
-livelocks, for a reason with no host-side lever anywhere in it:
+**It works.** A plain `insmod ./mz0380.ko` with no arguments captures a real,
+correctly-coloured 1080p frame, and `v4l2-compliance` passes 148/148.
+
+| | |
+|---|---|
+| plain `insmod` captures | yes - 1920x1080 planar **I420**, 3110400 bytes |
+| repeat capture | yes - 3 stills in a row, whole and all different (M171) |
+| the one-frame bound | reported as end-of-stream, not a hang (M168) |
+| `v4l2-compliance` | **148/148**, 5 warnings with a documented reason (M173) |
+| non-1080p | never tested - correct by construction only (M174) |
+| audio | not implemented |
+| continuous video | see below |
+
+```bash
+sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
+sudo insmod ./mz0380.ko
+v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=/tmp/f.i420
+ffplay -f rawvideo -pixel_format yuv420p -video_size 1920x1080 /tmp/f.i420
+```
+
+Expect **one frame, then a clean end-of-stream** (`DQBUF` returns `-EIO`).
+STREAMOFF + STREAMON gets the next one. Do not respawn per frame to fake video:
+every stream start forks an encoder and the card wedges somewhere in the
+**8-18 spawn range per power cycle**. `./mz0380-spawns.sh` has the running
+total and needs no root.
+
+## THE ONE THING TO RUN FIRST
+
+```bash
+sudo ./mz0380-m176-fw6-test.sh
+```
+
+One spawn. This is the open question and it is the answer to "how does Windows
+get continuous capture out of this card".
+
+**Windows never sends `fw=5`. This driver always has, and still defaults to it.**
+M82 read it out of every `[CH00]` line of every Windows trace: the Windows
+driver sends SET_VIC byte 6 as **6 or 7, picked by frame rate** - `6` at
+1080p30/29.97, `7` at 1080p60.
+
+`fw=6` does **not** select a different binary. Only `7 -> tinyvenc7` and
+`8 -> tinyvenc8`; `6` falls through to **tinyvenc5, the binary we already run**.
+What it changes is the card's capture config - `video_capture_mgr` writes
+*output format* `2/YUY2` instead of `1/YV12` (M79). So Windows drives
+tinyvenc5, the binary with the pixel path *and* the livelock, in a mode this
+project has never once put it in.
+
+The single run that tried it was **explicitly retro-invalidated** (RE_FINDINGS
+~3536): it carried `out_fmt=0` and other changes, predates M129 (real video),
+`fake_frame_off`, `post_mask=0` and the poll-drain, and ran on INTx.
+RE_FINDINGS' own "genuinely untested" list has it at **number 1**.
+
+**No prediction is attached.** There is no traced mechanism connecting an output
+format to the `mma_already_start` livelock and the prior is low. It is the last
+untested difference between our configuration and Windows' on the same binary,
+and it costs one spawn.
+
+If it delivers, the frame is **4147200 bytes of packed YUY2** (4:2:2), not
+3110400 of planar I420 - view it as `yuyv422`. Both of the driver's size rules
+would have thrown such a frame away in silence until M175 added
+`expect_frame_bytes`, which the test passes for you.
+
+## The one-frame bound, and an important correction
+
+For `fw=5` and `fw=8` the bound is real and fully traced (M153/M158/M166):
 
 1. the DMAC start ioctl `0xDE00` clears `free[profile]` on success;
 2. the only thing that sets it back is the `0xDE01` wait, issued solely by
@@ -23,9 +82,21 @@ livelocks, for a reason with no host-side lever anywhere in it:
 5. only process death (`Close`) returns the profile - which is why a respawn
    yields exactly one more frame.
 
-That single chain explains the one frame, the OBS freeze, `frame_events=0`,
-`0x2d` going unanswered afterwards, and why the respawn was the only thing that
-ever helped. **Stop looking for a knob. There isn't one.**
+That chain explains the one frame, the OBS freeze, `frame_events=0`, and why a
+respawn was the only thing that ever helped.
+
+**This file used to end that paragraph with "Stop looking for a knob. There
+isn't one." That sentence was wrong twice in one session and it is worth
+knowing why**, because it cost several turns before anyone checked:
+
+- it was written when **two** encoder binaries were known. There are three.
+  `tinyvenc8` was named once in RE_FINDINGS in passing, was spawnable by the
+  existing `vic_fw=8` with no upload, and had **never been run**. M175 ran it.
+- it made `fw=6` - the value Windows actually sends - look settled, when the
+  only run that tried it had been retro-invalidated in this same file.
+
+The bound is real. The closure was inherited rather than measured, and a
+closure inherited from a document is not a measurement.
 
 ### The other TWO routes, also closed - M175 measured the third binary
 
@@ -44,8 +115,12 @@ values) and shares tinyvenc5's exact bound. So continuous streaming is closed on
 this firmware **by measurement of every binary the card ships**, rather than by
 having tested two of three - which is what this file used to claim.
 
-Do not re-derive this from the prose below. If you want to re-check it,
-`sudo ./mz0380-m175-fw8-test.sh` costs one spawn.
+Two of the three have pixels and no cadence; one has cadence and no pixels.
+Do not re-derive this from the prose below - `sudo ./mz0380-m175-fw8-test.sh`
+re-checks it for one spawn.
+
+**What this does NOT close is `fw=6`**, which selects none of these three
+paths' behaviour but tinyvenc5 in YUY2 mode - see the top of this file.
 
 ### The fw=7 route, in detail
 
