@@ -9989,3 +9989,92 @@ result - the tool over-approximates, and it only produced M153's answer because
 `mma_already_start` was provably constant and let two edges be cut. tinyvenc7
 has no such constant. Reachability questions here need a proven-constant flag;
 without one the tool says nothing.
+
+
+---
+
+## M163 (static, 2026-08-24): CORRECTION - M162's central claim is WRONG. `a3` IS the length, tinyvenc7 HAS a full-frame push, and three gates divert it to a 16-byte one
+
+### The error
+
+M162 said "`a3` is a control-word field, proven three ways". It is not, and the
+proof was built on one bad identification:
+
+**`MassMemAccess_StartDMAC`'s first argument is the HANDLE, not the per-call
+descriptor.** `MassMemAccess_StartOneFrame(r0=handle, r1=desc)` keeps `r5=handle`
+and `r4=desc`, **copies descriptor fields into the handle** (0x1a74-0x1a88), and
+then calls `StartDMAC(r0 = r5)` - the handle. I read `r4` inside StartDMAC as the
+descriptor, so the field I traced into the control word at `<< 10` was
+`handle[0x14]`, which `TK_MMA_Init` sets to a constant **2** via option 78. Not
+`a3`, and not variable at all.
+
+The third "proof" was worse: I observed two sites passing different `a3` values
+and asserted both delivered 16 bytes. **Nothing established that both sites
+execute.** That was an assumption presented as a measurement.
+
+### What is actually true
+
+`a3` travels `desc[0x14]` -> `handle[0x28]` -> **`MMR[0x18]`**, and the
+neighbouring writes settle what that register is:
+
+    MMR[0x10] = phys(handle[0x58])  = a2            SOURCE
+    MMR[0x14] = handle[0x5c]        = a1 0x90000000 DEST
+    MMR[0x18] = handle[0x28]        = a3            LENGTH
+    MMR[0x1c] = handle[0x30]
+    MMR[0x24] = handle[0x38]
+
+Source, destination, length, in that order. **`a3` is the transfer size.**
+
+And the arithmetic closes exactly. At tinyvenc7 0x12518, `a3 = [r4+0x56] * 3/2`
+- for height 1080 that is **1620**, and a 1080p I420 frame is 1080 luma lines
+plus 540 lines' worth of chroma = **1620 lines x 1920 bytes = 3110400**, the
+precise frame size this project has been receiving since M129. That is not a
+coincidence, and it means **tinyvenc7 contains a full-frame push.**
+
+### The three gates
+
+The full-frame push at 0x125b8 is reached only if all three hold (0x124e0):
+
+```
+124e0  cmp  r0, #1
+124fc  beq  0x12944        ; r0 == 1        -> 16-byte push
+12500  cmp  r10, #1
+12504  bne  0x12944        ; r10 != 1       -> 16-byte push
+12508  ldrb r1, [r7, #-0xf10]
+1250c  cmp  r1, r8         ; r8 = 0
+12510  beq  0x12944        ; global == 0    -> 16-byte push
+12514  ...                 ; full frame, a3 = height*3/2
+```
+
+`0x12944` leads to the `a3 = 16` push at 0x129b0 - the one we are getting. So
+the card is **choosing** the 16-byte path, every frame, and at least one of
+these three conditions is against us.
+
+### Why this is the best lead the project has had
+
+`video_capture_mgr` spawns tinyvenc7 as
+
+    ./tinyvenc7 -D [-L] -a %d -b %d -c %d ... -v %d %d %d %d -w %d
+
+- **26 numeric parameters, built from the per-channel SET_VIC struct.** The
+globals in this cluster (`[r7-0xf10]` here, `[r5-0xf3d]` the sync-mode byte at
+0x125d0, `[r7-0xef8]` = `mma_already_start`) are the shape of argv-parsed config
+flags. If any of the three gates maps to one of those options, **it is
+host-settable through SET_VIC**, and this becomes a knob rather than a defect.
+
+### Next, and it is still static
+
+1. Identify `r0`, `r10` and the global at `[r7-0xf10]` by tracing back through
+   `vcap_handler` from 0x124e0.
+2. Read tinyvenc7's `getopt` loop and map each option letter to its global.
+3. Cross it against vcm's `sprintf` of the tinyvenc7 command line (0xbb00 /
+   0xbba8) to see which SET_VIC field feeds it.
+
+### Method note
+
+Three revisions on `a3` in two milestones. The pattern that produced the error
+is the same one M153 recorded for reachability: **a structural claim about which
+argument is which, made by reading one function in isolation.** StartDMAC alone
+cannot tell you what its parameter is; only its caller can. The check that would
+have caught it is mechanical - before asserting what a field is, read the call
+site that supplies it.
