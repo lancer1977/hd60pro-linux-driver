@@ -10264,3 +10264,96 @@ there, and determine what makes it fire once and only once.** That is where the
 pixels actually come from, it is the path that already delivers whole frames,
 and its bound (M158's livelock) is a defect in tinyvenc5 rather than a missing
 opcode.
+
+
+---
+
+## M166 (static, 2026-08-24): the pixel path is tinyvenc5 0x14728, `a3` is a BYTE count, and the one-frame bound is now fully mechanical
+
+M165's open thread, closed.
+
+### The push that delivers the frame
+
+`encode_handler` has **two** reachable `TK_MMA_StartOneFrame` calls, not one.
+M153 queried `0x1430c` and found it reachable; **it never queried 0x14728.**
+Re-running `mz0380-cfg.py` with M153's two `mma_already_start` edge-cuts
+reproduces its exact 2452/3110 reachable count, so the setup is faithful:
+
+    StartOneFrame a3=16   0x1430c : REACHABLE   (M153 knew)
+    StartOneFrame a3=r9   0x14728 : REACHABLE   (M153 never asked)
+    WaitOneFrameComplete  0x14358 : unreachable
+    ProcessOneFrame       0x1349c : unreachable
+
+And `r9` at 0x14728 is computed at 0x146b8:
+
+    146b8  ldrh  r3, [r4, #44]        ; w
+    146bc  ldrh  r2, [r4, #14]        ; h
+    146c0  mul   r3, r2, r3           ; w * h
+    146c4  addne r3, r3, r3, lsl #1   ; NE -> * 3
+    146d0  lsleq r9, r3, #1           ; EQ -> w*h*2     (4:2:2 / YUY2)
+    146d4  asrne r9, r3, #1           ; NE -> w*h*3/2   (4:2:0 / I420)
+
+For 1920x1080 the NE branch is **3110400** - the exact byte count this project
+has received since M129, and the same number `mz0380_infer_frame_length`
+reconstructs from the poison boundary.
+
+**So `a3` is a byte count**, confirmed independently of M163's reasoning, and
+**0x14728 is where the pixels come from.** The `MemBroker_CacheCopyBack` at
+0x146d8 flushes the same buffer immediately before it.
+
+(Note this also corrects a unit assumption in M163: `a3` is bytes, not lines.
+The "1620 lines x 1920 stride" reading happened to reach the right total for
+the wrong reason. tinyvenc7's `a3 = [r4+0x56] * 3/2` is a **16-bit** field
+written by `-g`, so it cannot hold `w*h` and its push really is small - which is
+consistent with M164/M165 rather than in tension with them.)
+
+### Why exactly one frame, end to end
+
+Every piece is now proven, and they compose without anything left over:
+
+1. `encode_handler` reaches 0x14728 and pushes the **whole frame**. The host
+   receives 3110400 bytes. (M129 onward, every run.)
+2. The DMAC start ioctl `0xDE00` clears `free[profile]` on success (M158).
+3. `TK_MMA_WaitOneFrameComplete` - the **only** caller of the `0xDE01` wait that
+   sets `free[profile]` back to 1 - is **unreachable**, because
+   `mma_already_start` is read nine times and never written (M153).
+4. So the profile stays claimed for the life of the process.
+5. The next `TK_MMA_StartOneFrame` - 0x1430c, or 0x14728 on the next loop
+   iteration - gets `-1` from the driver and **spins forever** in
+   `MassMemAccess_StartDMAC`'s unbounded `sched_yield` retry loop (M158), at
+   `SCHED_FIFO` priority (`main` 0xe40c).
+6. Only `Close` - process death - returns the profile (M158), which is why a
+   respawn yields exactly one more frame (M154, M155).
+
+That accounts for the one frame, for OBS freezing, for `frame_events=0` under
+`fw=5`, for `0x2d` going unanswered afterwards (M156's open question), and for
+the respawn being the only thing that ever helped. **No host-side lever exists
+at any point in that chain** - the defect is a missing store in tinyvenc5's
+build, and the standing rule forbids replacing it.
+
+### What this settles about the project's goal
+
+On this firmware, whole-frame capture is bounded at **one frame per encoder
+process**. `fw=7` removes that bound but its full-frame push needs opcode 0x32,
+which this card's `ep.ko` does not forward (M165). Both routes are now closed by
+proof rather than by exhaustion:
+
+| route | cadence | full frames | blocker |
+|---|---|---|---|
+| `fw=5` / tinyvenc5 | 1 per process | **yes, 3110400 B** | `mma_already_start` never written -> DMAC profile livelock |
+| `fw=7` / tinyvenc7 | continuous, 60 Hz | no, 16 B | interval needs op 0x32; `ep.ko` forwards 0 bytes for it |
+
+The honest summary is that this card, with the firmware it boots, is a
+**single-shot 1080p frame grabber**, and the driver should present it as one.
+Respawn-per-frame is the only sequence mechanism, it costs ~2 s and one of the
+8-18 spawn budget per frame, and M157's `vic_fast_kill=0` is the only thing that
+might widen that budget.
+
+### Method note
+
+The error that hid this for thirteen milestones was a **query list**, not an
+analysis. M153's CFG work was correct, its tooling was right, and its conclusion
+- "the only MMA push that can execute is the asynchronous one" - was drawn from
+a table of five addresses that did not include the sixth. The tool would have
+answered 0x14728 correctly at any point since M153. *Enumerate the call sites
+first, then query all of them.*
