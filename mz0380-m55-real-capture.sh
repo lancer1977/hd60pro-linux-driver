@@ -50,6 +50,13 @@ cleanup() {
 
 	[ -n "$node" ] || node=$(find_mz_video_node 2>/dev/null || true)
 	[ -z "$node" ] || fuser -k "$node" 2>/dev/null
+	# M169: bank this run's encoder spawns BEFORE the module goes away and
+	# takes the count with it. In cleanup rather than at the end of the
+	# script so that an early exit or a Ctrl-C still counts the spawns it
+	# already spent - those are the runs where knowing the budget matters
+	# most. /proc/mz0380-state resets at every insmod and this tree
+	# reinsmods per run, so nothing else accumulates it.
+	./mz0380-spawns.sh commit 2>/dev/null || true
 	rmmod mz0380 2>/dev/null && echo "(module unloaded)"
 }
 trap cleanup EXIT INT TERM
