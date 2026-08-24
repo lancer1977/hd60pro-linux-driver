@@ -11166,3 +11166,95 @@ mismatch as absence. That is M173's failed-experiment-versus-negative-result
 trap exactly, one milestone later, in a script written by the same person who
 had just written that note. The verdict now says: if `holds N of` shows a stable
 N, that N is the card's real frame size - re-run with `EXPECT=N`.
+
+---
+
+## M176 (hardware, 2026-08-24): fw=6 is what Windows sends, it delivers a BETTER frame than fw=5, and it does not free the livelock
+
+The last invalidated verdict, re-run as a single variable. `vic_fw=6`,
+`expect_frame_bytes=4147200`, everything else at the shipping defaults.
+
+    plane size: 4147200
+    10s, 4147200 bytes = 1 whole 4147200-byte frame
+    poll-drain: buf 0 holds 1666176 of 4147200 bytes - DMA still in flight
+    poll-drain: buf 0 holds 4147200 bytes with no completion event; delivering
+    poll-drain: 1 frame(s) delivered and nothing for 5000 ms - end of stream
+    frame_events=0
+
+### The frame arrived, whole, and it is 4:2:2
+
+**4147200 bytes = 1920 x 1080 x 2.** This is the first hardware confirmation of
+M79's static reading that `fw == 6` makes `video_capture_mgr` write a different
+capture output format. The byte count alone proves the format changed: every
+other configuration writes `w*h*3/2`.
+
+**But it is PLANAR 4:2:2, not packed YUY2**, and that is a correction to how
+M79's cfg label has been read ever since - including in the script written to
+run this test, an hour before the test ran:
+
+| hypothesis | luma row-to-row corr |
+|---|---|
+| packed YUY2, luma = every 2nd byte | +0.8997 |
+| **planar, first 1920x1080 bytes = Y** | **+0.9814** |
+| pixel-shuffled control | -0.0044 |
+
+The layout is Y 1920x1080, then U 960x1080, then V 960x1080 - I422. Both chroma
+planes are image-like (row corr 0.96) and the chroma is healthy:
+
+    corr(U, luma) +0.2647    corr(V, luma) -0.2798
+
+against M130's broken-CSC signature of -0.96 / -0.75. Ordinary scene
+correlation, no cast.
+
+    ffplay -f rawvideo -pixel_format yuv422p -video_size 1920x1080 /tmp/cap-m176-fw6.raw
+
+**This makes fw=6 the better still mode.** Same one spawn, same one frame, but
+960x1080 chroma instead of fw=5's 960x540 - double the vertical chroma
+resolution. Nothing in the driver offers it yet; the node advertises I420 and
+`expect_frame_bytes` is a diagnostic knob, not a format.
+
+### It does not free the livelock
+
+One frame, then nothing, `frame_events=0`, producer watch saw no change - the
+tinyvenc5 bound, unchanged. **The capture output format is not what separates
+Windows from us.**
+
+### All four configurations, measured
+
+| | binary | frame | cadence |
+|---|---|---|---|
+| `fw=5` | tinyvenc5 | 1920x1080 **I420** (3110400) | one, then livelock |
+| `fw=6` | tinyvenc5 | 1920x1080 **I422** (4147200) | one, then livelock |
+| `fw=7` | tinyvenc7 | **16 bytes** | continuous 60 Hz, 1621 real IRQs |
+| `fw=8` | tinyvenc8 | 960x540 I420 (777600) | one, then livelock |
+
+Every `tinyvenc5` mode livelocks regardless of output format or resolution, and
+`tinyvenc8` livelocks the same way. Only `tinyvenc7` sustains a cadence, and it
+pushes 16 bytes.
+
+### So how DOES Windows do it - the next thing to check
+
+Windows sends `fw=7` at 1080p60. Under `fw=7` this card pushes 16 bytes per
+frame into all four of our buffers, cycling `0->1->2->3->0`, with real
+completion interrupts, indefinitely (M161). Windows gets video out of that.
+
+**Nobody has ever dumped what those 16 bytes contain.** M161 measured the
+*length* - "holds 16 of" is the only length that ever appears - and M164
+interpreted the surrounding code statically. The driver logs
+`stop buf[N] head=<16 bytes>` at every stream stop, so the content has been one
+`grep` away from being known for the whole investigation, and no `fw=7` run in
+this file quotes it.
+
+If those 16 bytes are a descriptor - an address and a length - then the picture
+is somewhere we have never looked, and the card has been telling us where 60
+times a second. If they are pixels (as the `fw=5` 16-byte truncations were,
+M138: real video at the scene's luma), the frame-interval reading stands.
+
+Related and also never done: **M32's outbound-window probe has only ever run
+under `fw=5`**, where the producer emits one frame and stops. Its conclusion -
+"all three extra windows accepted the addresses, none was ever written" - was
+measured against a producer that was livelocked. `probe_windows=1` under `fw=7`,
+where the producer is demonstrably alive and pushing continuously, is a
+different experiment with the same command.
+
+Both cost one spawn each. Neither has been tried.

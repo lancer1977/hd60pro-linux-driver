@@ -99,8 +99,9 @@ echo "=== VERDICT ==="
 if [ "$WHOLE" -ge 2 ]; then
 	echo "  CONTINUOUS - $WHOLE frames in ${ELAPSED}s from fw=$FW."
 	echo "  This is what Windows sends, and it would be the answer."
-	echo "  YUY2 is 4:2:2 PACKED, not planar - view it as yuyv422:"
-	echo "    ffplay -f rawvideo -pixel_format yuyv422 -video_size 1920x1080 $CAP"
+	echo "  fw=6 delivers PLANAR 4:2:2 (I422), not packed YUY2 - the cfg"
+	echo "  label says YUY2 and M176 measured otherwise:"
+	echo "    ffplay -f rawvideo -pixel_format yuv422p -video_size 1920x1080 $CAP"
 	echo "  Confirm the frames differ (a live scene must):"
 	echo "    split -b $EXPECT $CAP /tmp/m176f- && sha256sum /tmp/m176f-* | awk '{print \$1}' | sort -u | wc -l"
 elif [ "$WHOLE" = 1 ]; then
