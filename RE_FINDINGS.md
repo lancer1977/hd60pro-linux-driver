@@ -10357,3 +10357,58 @@ analysis. M153's CFG work was correct, its tooling was right, and its conclusion
 a table of five addresses that did not include the sixth. The tool would have
 answered 0x14728 correctly at any point since M153. *Enumerate the call sites
 first, then query all of them.*
+
+
+---
+
+## M167 (hardware, 2026-08-24): a plain `insmod` captures - the driver finally does out of the box what took a 60-line script
+
+    sudo rmmod mz0380; sudo insmod ./mz0380.ko     # no arguments at all
+    v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=/tmp/plain.raw
+
+    stream start: SET_VIC(... fw=5 ...) ret=0
+    poll-drain armed every 20 ms
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+    poll-drain stopped after 1 deliveries, 0 kicks
+    stream stop: ... irq_total=6 frame_events=0 fifo_drops=0
+
+    3110400 bytes = 1 whole frame
+    VERDICT: NOT SPLASH   Y 212 distinct values, UV 202
+    VERDICT: CHROMA OK    luma explains A 0.05 / B 0.00
+
+A real, correctly-coloured 1080p I420 frame from a bare `insmod`. Every capture
+before this one required six parameters set by hand.
+
+### How it was found, which is the point
+
+The M166 verification run was attempted as a "plain load" and produced
+**nothing** - no `/dev/video0` at all. The driver had said why, in its own log
+line: `probe-safe V4L2 node disabled; load with enable_video=1`. The test
+command was wrong, not the driver.
+
+But the reason it was easy to get wrong is the finding: **the shipping defaults
+could not capture.** Six parameters were needed - `dma_handshake`, `enable_dma`,
+`enable_video`, `dma_iova_remap`, `aic_on`, `poll_drain_ms` - and only two of
+them defaulted on. Every script in the tree passed all six explicitly, so the
+broken default was invisible for the entire life of the project: nobody ever
+loaded the module the way a user would.
+
+Their own help text admitted the reason - "off by default", "keep unloads simple
+during bring-up", "M4 diagnostic". All bring-up-era, all long past. Flipped in
+M166/M167: `enable_video`, `enable_dma`, `dma_handshake` to true and
+`poll_drain_ms` to 20, each with a comment saying what it was and that `=0`
+restores the old behaviour. No measurement is affected, because every script
+already set them.
+
+### What this confirms about M166
+
+The delivery matched the model with nothing left over: `frame_events=0` (the
+`fw=5` push has no reachable completion handler), the frame found by the
+poll-drain scan, `1 deliveries` and then nothing more. The card wrote a whole
+frame and never said so - exactly as predicted.
+
+### Method note
+
+A default that every caller overrides is not a default, it is dead code with an
+opinion. The way to find these is to run the software the way a user would,
+once, rather than always through the harness that knows the magic arguments.
