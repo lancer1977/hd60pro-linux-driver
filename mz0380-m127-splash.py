@@ -44,7 +44,7 @@ need = W * H * 3 // 2
 print("file      %s (%d bytes, %d whole frames)" % (path, len(data), len(data) // need if need else 0))
 
 if len(data) < need:
-    print("\nVERDICT: NO FRAME - %d bytes, need %d for %dx%d NV12" % (len(data), need, W, H))
+    print("\nVERDICT: NO FRAME - %d bytes, need %d for %dx%d I420" % (len(data), need, W, H))
     sys.exit(2)
 
 y = data[:W * H]
@@ -68,6 +68,9 @@ uv = data[W * H:need]
 print("\nVERDICT: NOT SPLASH - the centre crop is not the known asset.")
 print("         Y outside the crop: %d distinct values" % len(set(outside)))
 print("         UV plane:           %d distinct values" % len(set(uv)))
-print("         View it:  ffplay -f rawvideo -pixel_format nv12 "
+# M130: the payload is planar I420, not NV12. This hint said nv12 and so
+# reproduced the exact viewing mistake that cost two sessions - and it is the
+# line a reader sees at the moment they have a real frame in hand.
+print("         View it:  ffplay -f rawvideo -pixel_format yuv420p "
       "-video_size %dx%d %s" % (W, H, path))
 sys.exit(0)

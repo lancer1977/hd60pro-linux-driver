@@ -16,7 +16,7 @@ H = int(sys.argv[3]) if len(sys.argv) > 3 else 1080
 d = open(path, "rb").read()
 need = W * H * 3 // 2
 if len(d) < need:
-    sys.exit("%s: %d bytes, need %d for %dx%d NV12" % (path, len(d), need, W, H))
+    sys.exit("%s: %d bytes, need %d for %dx%d I420" % (path, len(d), need, W, H))
 y, uv = d[:W * H], d[W * H:need]
 
 yh = collections.Counter(y).most_common(3)
@@ -34,4 +34,6 @@ if uvu == 1:
     print("VERDICT: SPLASH - chroma plane is one value; the VIC wrote no live pixels.")
 else:
     print("VERDICT: NOT THE SPLASH - chroma varies. Look at the frame:")
-    print("  ffplay -f rawvideo -pixel_format nv12 -video_size %dx%d %s" % (W, H, path))
+    # M130: planar I420, not NV12 - decoding it as nv12 gives the magenta/green
+    # interleave banding rather than the picture.
+    print("  ffplay -f rawvideo -pixel_format yuv420p -video_size %dx%d %s" % (W, H, path))
