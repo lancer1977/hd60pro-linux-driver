@@ -1,52 +1,82 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-24. Full history in **RE_FINDINGS.md**; the most recent
-milestones are **M158 - the one-frame bound is a livelock and `fw` picks the
-binary**, **M159/M161 - `fw=7` streams continuously at 1621 completion
-interrupts**, and **M157 - `fast_kill` and the spawn wedge**. This file is the
-handoff only. Everything below was verified on hardware unless it says
-otherwise._
+_Last updated 2026-08-24. Full history in **RE_FINDINGS.md**. The investigation
+into "why one frame" is **finished** - M158, M163, M165 and M166 close it from
+both ends. This file is the handoff only. Everything below was verified on
+hardware unless it says otherwise._
 
-**If you read one thing: `VICFW=7` broke the one-frame bound (M159/M161), and
-everything in this file written before it about "the cadence" was measuring the
-wrong binary.**
+**If you read one thing: the card, with the firmware it boots, is a
+single-shot 1080p frame grabber. That is a proven bound, not a missing trick.**
 
-SET_VIC byte 6 (`fw`) does not select an encoder *mode* - it selects which
-program `video_capture_mgr` spawns: `fw == 7` runs `./tinyvenc7`, anything else
-runs `./tinyvenc5` (vcm 0x9250). They are different architectures, and
-**tinyvenc5's build is defective**: it reads the `mma_already_start` in-flight
-latch nine times and never writes it, so `TK_MMA_WaitOneFrameComplete` is
-unreachable, so the DMAC profile from the first push is never returned to the
-free pool, so the *second* `TK_MMA_StartOneFrame` spins forever in
-`sched_yield` (M158). One frame per process was structural. tinyvenc7 sets and
-clears that latch correctly.
+The pixel path is `tinyvenc5` **0x14728** - `TK_MMA_StartOneFrame` with
+`a3 = w*h*3/2 = 3110400`, exactly the byte count every capture since M129 has
+delivered (M166). It fires once per encoder process and then the process
+livelocks, for a reason with no host-side lever anywhere in it:
 
-Measured on hardware:
+1. the DMAC start ioctl `0xDE00` clears `free[profile]` on success;
+2. the only thing that sets it back is the `0xDE01` wait, issued solely by
+   `TK_MMA_WaitOneFrameComplete`;
+3. that call is **unreachable** - `mma_already_start` is read nine times and
+   never written in this build (M153, CFG-proven);
+4. so the next push gets `-1` and **spins forever** in
+   `MassMemAccess_StartDMAC`'s unbounded `sched_yield` loop, at `SCHED_FIFO`;
+5. only process death (`Close`) returns the profile - which is why a respawn
+   yields exactly one more frame.
+
+That single chain explains the one frame, the OBS freeze, `frame_events=0`,
+`0x2d` going unanswered afterwards, and why the respawn was the only thing that
+ever helped. **Stop looking for a knob. There isn't one.**
+
+### The other route, also closed
+
+`fw` selects which binary the card spawns - `7` runs `./tinyvenc7`, anything
+else `./tinyvenc5` (M158). tinyvenc7 does **not** have the livelock and streams
+beautifully:
 
 | | `fw=5` | `fw=7` |
 |---|---|---|
-| frames per stream | 1, then nothing ever | continuous |
-| `frame_events` | **0 in every run ever** | **1621** in 57 s, `fifo_drops=0` |
-| delivery path | poll-drain scan | **real completion interrupts** |
-| frame-token register | never moves | 1558 transitions, `0->1->2->3` |
-| bytes per frame | 3110400 | **16** |
+| cadence | 1 frame per process | continuous, 60 Hz |
+| `frame_events` | **0**, always | **1621** in 57 s, `fifo_drops=0` |
+| delivery | poll-drain scan | real completion interrupts |
+| bytes/frame | **3110400** | 16 |
 
-The producer, the interrupt path and the cadence all work. **The one remaining
-defect is that the card transfers 16 bytes per frame instead of 3110400**, and
-it is the card's doing, not ours - M161 left every short buffer un-poisoned for
-a whole 57-second stream and none ever grew.
+But tinyvenc7 sends a full frame only every Nth (a modulo, or a 128-bit schedule
+bitmap), and both N and the bitmap are set **only** by mailbox opcode `0x32`.
+This card's `ep.ko` forwards `rodata[0xa0+cmd]` bytes per opcode, and
+`rodata[0xd2] = 0` - **opcode 0x32 is not forwarded at all** (M165, validated
+against M127's twelve known lengths). N stays 0, the bitmap stays zero, and
+every frame takes the 16-byte path. Nothing host-side changes that.
 
-The live question is **what sets the MMA/DMAC transfer size under tinyvenc7**.
-The lead: `TK_MMA_StartOneFrame`'s fourth argument is a literal `16` in
-tinyvenc5 and `value * 3 / 2` - the 4:2:0 size formula - in tinyvenc7. But its
-units are **not** established, and the descriptor's size fields look like they
-come from `MassMemAccess_Initial`/`SetOptions` instead. Read the descriptor
-layout before spending a spawn on it. See M161.
+So: `fw=5` has the pixels and no cadence; `fw=7` has the cadence and no pixels.
+Fixing either needs a different `ep.ko` or a different `tinyvenc5`, and the
+standing rule forbids putting either on the card.
 
-**Everything below this point predates M159.** The "one frame per stream"
-framing throughout is true of `fw=5` only, and the sections on cadence,
-respawn-per-frame and the host-side levers describe a defect that `fw=7` does
-not have.
+### What the driver does about it
+
+`poll_drain_ms` now **defaults to 20** (M166). Under `fw=5` the card raises no
+completion interrupt, so the poll-drain is the only delivery path there is -
+with it off, a plain `insmod` delivered nothing at all and looked like dead
+hardware. Every real frame in this project came from a script passing
+`POLLDRAIN=20` by hand.
+
+Expect from a plain load: **one correct 1080p I420 frame, then a freeze.** That
+is the hardware's actual behaviour. Do not "fix" it by respawning per frame -
+each respawn costs one of the 8-18 spawn budget (`## Card state`), so an OBS
+session would wedge the card within seconds.
+
+### If you want to keep going, the honest options
+
+1. **Widen the spawn budget** so single-shot capture is at least repeatable.
+   M157's `vic_fast_kill=0` is already the default and is the only candidate;
+   it needs ordinary runs to accumulate evidence (18+ spawns on one power cycle
+   without a wedge is the answer).
+2. **Make recovery cheap** - `mz0380-m52-card-recovery.sh` is fixed and has
+   never been run. Do it *while wedged*.
+3. Accept the bound and present the device as a still grabber.
+
+**Everything below this point predates M159.** The cadence, respawn-per-frame
+and "host-side lever" sections describe the search that M166 ended; read them as
+history.
 
 ---
 

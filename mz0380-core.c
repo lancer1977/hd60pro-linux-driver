@@ -494,10 +494,27 @@ module_param_named(poll_drain_credit, mz0380_poll_drain_credit, bool, 0644);
 MODULE_PARM_DESC(poll_drain_credit,
 		 "M118: after a poll-drained frame, fire the credit re-arm the completion ISR would have (BAR5[0xdc]=2, EVENT=0, doorbell 0x400) (def:0)");
 
-unsigned int mz0380_poll_drain_ms;
+/*
+ * M166: on by default, because with the shipping `fw=5` it is the ONLY
+ * delivery path there is.
+ *
+ * Under fw=5 the card never raises a frame-completion interrupt - `frame_events`
+ * has been 0 in every run in this project's history, and M166 explains why: the
+ * push that carries the pixels (tinyvenc5 0x14728, a3 = w*h*3/2 = 3110400) has
+ * no reachable completion handler behind it. So the card writes a whole frame
+ * into the buffer and never tells us.
+ *
+ * With this at 0 a plain `insmod` therefore delivers **nothing at all** - no
+ * events, no polling, no frames - which is indistinguishable from broken
+ * hardware to anyone opening /dev/video0. Every real frame this project has
+ * captured came from a script passing POLLDRAIN=20 by hand.
+ *
+ * 20 ms is what every successful capture since M111 has used.
+ */
+unsigned int mz0380_poll_drain_ms = 20;
 module_param_named(poll_drain_ms, mz0380_poll_drain_ms, uint, 0644);
 MODULE_PARM_DESC(poll_drain_ms,
-		 "M111: poll the stream buffers every N ms and deliver any frame the card has already written, instead of waiting for a completion event that never arrives (def:0 = off; 20 is a reasonable value)");
+		 "M111: poll the stream buffers every N ms and deliver any frame the card has already written, instead of waiting for a completion event that never arrives (def:20; 0 = off, which under fw=5 means nothing is ever delivered - M166)");
 
 unsigned int mz0380_rx_strap;
 module_param_named(rx_strap, mz0380_rx_strap, uint, 0644);
