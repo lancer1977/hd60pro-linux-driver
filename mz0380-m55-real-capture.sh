@@ -308,7 +308,22 @@ echo "=== 3. what did the card do? ==="
 # interval and its baseline/change lines are the only host-visible proof that
 # the card's producer is still running - filtering them out would repeat
 # exactly the mistake method rule 9 records.
-dmesg | grep -E "stream start|stream stop|frame token|enc|no HDMI signal|poll-drain|MST3367 CSC|producer watch" | head -28
+# M159: this was ONE grep ending in `head -28`, and under fw=7 the card
+# produced a per-frame line every ~16 ms. The flood filled all 28 slots, so the
+# `stream stop:` summary - frame_events, irq_total, the final token values - was
+# cut from the output of the most important run in the project. Structural lines
+# and per-frame lines are now capped separately: the summary can never again be
+# pushed out by the thing it is summarising.
+dmesg | grep -aE "stream start|stream stop|enc|no HDMI signal|poll-drain|MST3367 CSC|producer watch" | head -20
+# The per-frame flood, capped. With a continuous producer the COUNT is the
+# result, not the individual lines - so print it either way.
+FRAME_TOKENS=$(dmesg | grep -ac "frame token")
+dmesg | grep -a "frame token" | head -8
+if [ "$FRAME_TOKENS" -gt 8 ]; then
+	echo "  ... $FRAME_TOKENS 'frame token' lines in total (capped at 8)."
+	echo "  A repeating token sequence IS a cadence - the one-frame bound is"
+	echo "  1 delivery per stream, so >1 here is the result worth reading."
+fi
 # M70: the per-buffer poison scan is the "did H.264 bytes land without a
 # completion" measurement - it has been printed at every stop and filtered
 # out by the grep above this whole time.
