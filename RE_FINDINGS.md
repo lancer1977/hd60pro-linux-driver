@@ -9471,3 +9471,158 @@ upload text from the era before that path was deleted. Refresh it to the current
 If the slot's PERST# reaches the SoC's reset tree, the bus-reset stage reboots
 the card's Linux and a wedge becomes a five-second recovery instead of a
 mains-off cold boot. Worth exactly one run, while actually wedged.
+
+
+---
+
+## M158 (static, 2026-08-24): the one-frame bound is a LIVELOCK on an unreleased DMAC profile - and `fw` selects which encoder binary the card spawns
+
+Two findings, and the second is a live experiment. Both came out of reading
+`vpl_dmac.ko`, which M153 named as the missing piece and then could not get:
+*"That last step is inference about `TK_MMA_*` semantics, not proof - the
+libraries would have to be read to confirm it."* They have now been read, and
+the driver is a better authority than the libraries anyway.
+
+### 1. The proof M153 was missing
+
+Four facts, each mechanical:
+
+**a. The start ioctl fails hard when the profile is busy.** `vpl_dmac`'s
+`Ioctl` case `0xDE00` (0x5c8):
+
+```
+5dc  p = VPL_DMAC_StartHead(base)      ; = devinfo[0x140], the caller's profile
+5ec  r3 = free[0x308 + p*4]
+5f0  cmp r3, #0
+5f4  bne 0x7bc                         ; free -> claim it
+5f8  return -1                         ; BUSY -> hard fail
+...
+7c0  free[0x308 + p*4] = 0             ; claimed
+7c4  file->private->profile = p
+7d0  VPL_DMAC_StartTail(...)           ; kick the hardware
+```
+
+**b. `free[p]` is set back to 1 in exactly two places.** The wait ioctl
+`0xDE01` (0x630), which also clears `state[0x208 + p*4]` and forgets the
+profile:
+
+```
+6f4  state[0x208 + p*4] = 0
+6f8  free[0x308 + p*4]  = 1
+6fc  file->private->profile = -1
+```
+
+and `Close` (0xb8), i.e. **process death** - which first busy-waits for
+`state[p] == 1` with no timeout, no `schedule()` and no signal check (0xec).
+
+**c. The wait ioctl is what `TK_MMA_WaitOneFrameComplete` issues.**
+`MassMemAccess_WaitOneFrameComplete` -> `MassMemAccess_WaitDMAC` ->
+`ioctl(fd, 0xDE01)` (libmassmemaccess.so.9 0x1ee4, constant at 0x1f08).
+
+**d. The start does not fail gracefully - it spins.**
+`MassMemAccess_StartDMAC` (0x1df0):
+
+```
+1df0  bl  sched_yield
+1df4  r0 = fd
+1df8  r1 = 0xDE00
+1dfc  bl  ioctl
+1e00  cmp r0, #0
+1e04  bne 0x1df0          ; <<< retry forever, yielding
+1e08  return
+```
+
+M153 proved `TK_MMA_WaitOneFrameComplete` is unreachable in tinyvenc5 (the
+`mma_already_start` guard is permanently 0). So the profile claimed by the
+first push is **never** returned inside that process, and therefore:
+
+**A second `TK_MMA_StartOneFrame` in one tinyvenc5 process can never return.
+It livelocks in `sched_yield`.**
+
+That is stronger than M153's guess that the second start "fails, takes the
+error path at 0x1513c, and loops silently". It never reaches an error path at
+all. One frame per tinyvenc5 process is structural, and `Close` releasing the
+profile on process death is exactly why the respawn is the only thing that ever
+produced another frame (M154, M155).
+
+**It also answers M156's parting question.** M156 ended: *"That thread parking
+should not stop the main loop answering the mailbox, yet `0x2d` returns -110 on
+every cycle after the first."* It is not parked. It is spinning. tinyvenc5's
+`main` calls `sched_setscheduler(0, SCHED_FIFO, ...)` at 0xe40c, and a sibling
+thread spinning at real-time priority is a mechanism for the command loop going
+unserved that requires nothing else to be true. (The thread's inherited
+priority is inference, not read - `pthread_create`'s attr was not checked.)
+
+### 2. `fw` is not "the encoder selector" - it picks the BINARY
+
+`video_capture_mgr` at 0x9244, on the SET_VIC per-channel struct
+(base 0x141d4, **stride 60**, and struct offset == payload byte offset):
+
+```
+9248  r3 = ch*15
+924c  r3 = base + ch*60
+9250  r3 = struct[ch].byte[6]        ; fw
+9254  cmp r3, #7
+9258  beq 0x98f8                     ; -> "call ----> tinyvenc7" -> ./tinyvenc7
+                                     ; else -> "call ----> tinyvenc5" -> ./tinyvenc5
+```
+
+(Bytes 2/3 and 6 take further paths at 0x9a24 and 0x9184; the 5-versus-7 split
+is the one that matters.) The same read incidentally **confirms M157's byte-33
+claim independently**: the SET_VIC handler stores payload byte 0x21 to struct
+offset 0x21 at 0x91a4.
+
+**So M88's "the regression is ONE BYTE - SET_VIC byte 6" was right about the
+byte and blind about the meaning.** `fw=7` did not select a different encoder
+mode; it ran a different program. And `fw=5` is not a magic value - it is
+"anything that is not 7".
+
+### 3. Why that matters now: tinyvenc7 does not have the bug
+
+The three encoders import identical `TK_MMA_*` symbols, but they are different
+architectures. tinyvenc5 is `img_handler` -> SSM ring -> `encode_handler` ->
+MMA. **tinyvenc7 has no SSM ring on the frame path at all** - its MMA calls
+live in `vcap_handler(const video_cap_state*, void*)`, i.e. straight off the
+video-capture callback.
+
+And it drives the latch correctly. tinyvenc7 `vcap_handler` at 0x125b8:
+
+```
+125b8  bl  TK_MMA_StartOneFrame
+125c0  subs r1, r0, #0
+125c4  bne 0x12e1c                   ; start failed -> error path
+125c8  r3 = 1
+125cc  strb r3, [r8, #-0xef8]        ; *** mma_already_start = 1 ***
+125d0  r3 = [r5, #-0xf3d]            ; sync-mode byte
+125d8  cmp r3, #1
+125dc  bne 0x125f0                   ; async -> skip the wait
+125e4  bl  TK_MMA_WaitOneFrameComplete
+125ec  strb r3, [r7, #-0xef8]        ; *** mma_already_start = 0 ***
+```
+
+That is what the variable is *for*: an in-flight latch, set after a successful
+start and cleared after the wait. **tinyvenc5 reads that latch nine times and
+never writes it** (M153: nine `ldrb`, zero stores). tinyvenc5 is not
+mis-configured - the shipped build has a genuine defect, and tinyvenc7 is the
+same vendor's correct version of the same idiom.
+
+### The experiment
+
+`fw=7` is a one-word change (`VICFW=7`), it is the first candidate this project
+has had for more than one frame per stream, and the only evidence against it is
+**M88, which was measured in the regime M129 invalidated** - splash oracle,
+`post_mask=0x1f` truncating the DMA to one 16-byte burst, `fake_frame_off`
+unset. Every negative from that era has to be re-read, and this is one.
+
+    sudo POLLDRAIN=20 VICFW=7 \
+        EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
+        ./mz0380-m55-real-capture.sh 4
+
+Ask for 4 frames, because the whole point is whether more than one arrives.
+**Frame count is the oracle** (M153), so read `poll-drain stopped after N
+deliveries`. N > 1 settles it. N == 1 with a real frame means tinyvenc7 runs on
+this board but hits its own bound. N == 0 means tinyvenc7 does not drive this
+board's VIC, which is a clean negative and costs one spawn.
+
+Risk is one spawn. vcm kills tinyvenc5/7/8 at startup, so the binaries do not
+collide.

@@ -128,6 +128,8 @@ hypotheses derived from device-side `ep.ko` strings. Refine via
 `/proc/mz0380-experiment` correlation runs before flipping
 `firmware_upload=1` / `enable_dma=1` on production hardware.
 
+sudo chown user:user *.o *.ko *.mod *.mod.c Module.symvers modules.order
+
 ## License
 
 GPLv2 or later.
