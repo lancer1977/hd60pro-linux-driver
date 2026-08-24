@@ -1,22 +1,52 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-23. Full history in **RE_FINDINGS.md**; the most recent
-milestones are **M129 - the card captures real video**, **M140 - the VIC
-captures exactly one frame, which explains everything else**, and
-**M141-M143 - the Windows ordering is neutral and the host-side sequence is
-exhausted**. This file is the handoff only. Everything
-below was verified on hardware unless it says otherwise._
+_Last updated 2026-08-24. Full history in **RE_FINDINGS.md**; the most recent
+milestones are **M158 - the one-frame bound is a livelock and `fw` picks the
+binary**, **M159/M161 - `fw=7` streams continuously at 1621 completion
+interrupts**, and **M157 - `fast_kill` and the spawn wedge**. This file is the
+handoff only. Everything below was verified on hardware unless it says
+otherwise._
 
-**If you read one thing:** the "no signal" story that dominated this project was
-wrong (`## STATE after M129`), and **the "VIC captures one frame" model is wrong
-too (M147)**. The frame the host receives is raw I420 delivered by the SDK's own
-path - `img_handler` -> SSM -> `encode_handler` -> MMA -> `vpl_dmac` - and
-reaching that path at all requires `img_handler` to have been called twice. So
-**the pipeline completes at least one full pass and then stops.** The host-side
-command sequence is exhausted (M141-M146). The live question is
-**why `encode_handler` does not complete a second iteration**, and it is static. The card's encoder
-has never reported a frame at all, and the one frame that reaches the host does
-not come from the SDK's frame path.
+**If you read one thing: `VICFW=7` broke the one-frame bound (M159/M161), and
+everything in this file written before it about "the cadence" was measuring the
+wrong binary.**
+
+SET_VIC byte 6 (`fw`) does not select an encoder *mode* - it selects which
+program `video_capture_mgr` spawns: `fw == 7` runs `./tinyvenc7`, anything else
+runs `./tinyvenc5` (vcm 0x9250). They are different architectures, and
+**tinyvenc5's build is defective**: it reads the `mma_already_start` in-flight
+latch nine times and never writes it, so `TK_MMA_WaitOneFrameComplete` is
+unreachable, so the DMAC profile from the first push is never returned to the
+free pool, so the *second* `TK_MMA_StartOneFrame` spins forever in
+`sched_yield` (M158). One frame per process was structural. tinyvenc7 sets and
+clears that latch correctly.
+
+Measured on hardware:
+
+| | `fw=5` | `fw=7` |
+|---|---|---|
+| frames per stream | 1, then nothing ever | continuous |
+| `frame_events` | **0 in every run ever** | **1621** in 57 s, `fifo_drops=0` |
+| delivery path | poll-drain scan | **real completion interrupts** |
+| frame-token register | never moves | 1558 transitions, `0->1->2->3` |
+| bytes per frame | 3110400 | **16** |
+
+The producer, the interrupt path and the cadence all work. **The one remaining
+defect is that the card transfers 16 bytes per frame instead of 3110400**, and
+it is the card's doing, not ours - M161 left every short buffer un-poisoned for
+a whole 57-second stream and none ever grew.
+
+The live question is **what sets the MMA/DMAC transfer size under tinyvenc7**.
+The lead: `TK_MMA_StartOneFrame`'s fourth argument is a literal `16` in
+tinyvenc5 and `value * 3 / 2` - the 4:2:0 size formula - in tinyvenc7. But its
+units are **not** established, and the descriptor's size fields look like they
+come from `MassMemAccess_Initial`/`SetOptions` instead. Read the descriptor
+layout before spending a spawn on it. See M161.
+
+**Everything below this point predates M159.** The "one frame per stream"
+framing throughout is true of `fw=5` only, and the sections on cadence,
+respawn-per-frame and the host-side levers describe a defect that `fw=7` does
+not have.
 
 ---
 
