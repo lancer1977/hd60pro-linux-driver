@@ -11,10 +11,10 @@
 
 #include "mz0380.h"
 
-#define MZ0380_DEFAULT_GOP          30
-#define MZ0380_MAX_GOP              300
 #define MZ0380_DEFAULT_COLOR        128
 #define MZ0380_MAX_COLOR            255
+/* M171: buffers vb2's read() fileio path uses; reported by G/S_PARM. */
+#define MZ0380_READ_BUFFERS         2
 #define MZ0380_SIZEIMAGE_MIN        (256 * 1024)
 #define MZ0380_SIZEIMAGE_MAX        (4 * 1024 * 1024)
 #define MZ0380_CID_SC540_RECORD_MODE (V4L2_CID_USER_BASE + 0x10f0)
@@ -293,29 +293,57 @@ static u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
 	return mz0380_sizeimage(&dev->capture);
 }
 
+/*
+ * M168: ONE place decides the advertised fourcc, because three places used to
+ * and they had drifted apart - ENUM_FMT said NV12 while ENUM_FRAMESIZES and
+ * ENUM_FRAMEINTERVALS still tested for H.264 and so returned -EINVAL for the
+ * very format the node had just enumerated. Every caller now asks here.
+ *
+ * The poll-drain payload is planar I420 - Y, then a 960x540 U plane, then a
+ * 960x540 V plane (M130, confirmed visually AND by correlation: the U/V-swapped
+ * rendering gives the textbook red/blue swap, plain yuv420p does not). It was
+ * advertised as NV12, which is the same byte count with the chroma
+ * INTERLEAVED, so every V4L2 application - ffmpeg, GStreamer, OBS - rendered
+ * the magenta/green interleave banding RE_FINDINGS describes. The frame was
+ * always right; the label was wrong. V4L2_PIX_FMT_YUV420 is I420.
+ *
+ * The nosg fake-frame path keeps NV12: its layout was never confirmed either
+ * way (different producer, different 1920x1107 geometry, flat logo content
+ * where interleave banding would not show), so correcting it would be a guess
+ * rather than a measurement. It is a diagnostic path and defaults off.
+ */
+static u32 mz0380_current_pixelformat(void)
+{
+	if (mz0380_stream_nosg)
+		return V4L2_PIX_FMT_NV12;
+	if (mz0380_poll_drain_ms)
+		return V4L2_PIX_FMT_YUV420;
+	return V4L2_PIX_FMT_H264;
+}
+
 static void mz0380_fill_pix_format(struct mz0380_dev *dev,
 				   struct v4l2_pix_format *pix)
 {
 	memset(pix, 0, sizeof(*pix));
 
+	pix->pixelformat = mz0380_current_pixelformat();
+
 	if (mz0380_stream_nosg) {
 		pix->width = MZ0380_NOSG_NV12_WIDTH;
 		pix->height = MZ0380_NOSG_NV12_HEIGHT;
-		pix->pixelformat = V4L2_PIX_FMT_NV12;
 		pix->bytesperline = MZ0380_NOSG_NV12_WIDTH;
 	} else if (mz0380_poll_drain_ms) {
 		/* M111: real geometry, raw payload. */
 		pix->width = dev->capture.width;
 		pix->height = dev->capture.height;
-		pix->pixelformat = V4L2_PIX_FMT_NV12;
 		pix->bytesperline = dev->capture.width;
 	} else {
 		pix->width = dev->capture.width;
 		pix->height = dev->capture.height;
-		pix->pixelformat = V4L2_PIX_FMT_H264;
 		pix->bytesperline = 0;
 	}
-	pix->field = V4L2_FIELD_NONE;
+
+	pix->field = mz0380_current_field(dev);
 	pix->sizeimage = mz0380_current_sizeimage(dev);
 	pix->colorspace = V4L2_COLORSPACE_REC709;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
@@ -360,18 +388,17 @@ static int mz0380_enum_fmt_vid_cap(struct file *file, void *priv,
 	if (f->index != 0)
 		return -EINVAL;
 
+	f->pixelformat = mz0380_current_pixelformat();
+
 	if (mz0380_stream_nosg) {
-		f->pixelformat = V4L2_PIX_FMT_NV12;
 		f->flags = 0;
 		strscpy(f->description, "NV12 raw (fake-frame path)",
 			sizeof(f->description));
 	} else if (mz0380_poll_drain_ms) {
-		f->pixelformat = V4L2_PIX_FMT_NV12;
 		f->flags = 0;
-		strscpy(f->description, "NV12 raw (poll-drain path)",
+		strscpy(f->description, "I420 raw (poll-drain path)",
 			sizeof(f->description));
 	} else {
-		f->pixelformat = V4L2_PIX_FMT_H264;
 		f->flags = V4L2_FMT_FLAG_COMPRESSED;
 		strscpy(f->description, "H.264 bytestream",
 			sizeof(f->description));
@@ -407,11 +434,7 @@ static int mz0380_try_fmt_vid_cap(struct file *file, void *priv,
 		return 0;
 	}
 
-	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
-		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
-	if (mz0380_poll_drain_ms)
-		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-
+	/* the format is not negotiable; mz0380_fill_pix_format() sets it */
 	mz0380_apply_try_fmt(dev, f);
 	dev->capture = saved;
 
@@ -434,11 +457,7 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 		return 0;
 	}
 
-	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_H264)
-		f->fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
-	if (mz0380_poll_drain_ms)
-		f->fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-
+	/* the format is not negotiable; mz0380_fill_pix_format() sets it */
 	mode = mz0380_find_mode(f->fmt.pix.width, f->fmt.pix.height);
 	interval = mz0380_find_interval(mode->width, mode->height,
 					&dev->capture.timeperframe);
@@ -454,18 +473,17 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 static int mz0380_enum_framesizes(struct file *file, void *priv,
 				  struct v4l2_frmsizeenum *fsize)
 {
+	if (fsize->pixel_format != mz0380_current_pixelformat())
+		return -EINVAL;
+
 	if (mz0380_stream_nosg) {
-		if (fsize->pixel_format != V4L2_PIX_FMT_NV12 ||
-		    fsize->index != 0)
+		if (fsize->index != 0)
 			return -EINVAL;
 		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
 		fsize->discrete.width = MZ0380_NOSG_NV12_WIDTH;
 		fsize->discrete.height = MZ0380_NOSG_NV12_HEIGHT;
 		return 0;
 	}
-
-	if (fsize->pixel_format != V4L2_PIX_FMT_H264)
-		return -EINVAL;
 
 	if (fsize->index >= ARRAY_SIZE(mz0380_modes))
 		return -EINVAL;
@@ -484,7 +502,7 @@ static int mz0380_enum_frameintervals(struct file *file, void *priv,
 	const struct v4l2_fract *interval;
 	struct mz0380_capture_state capture = { 0 };
 
-	if (fival->pixel_format != V4L2_PIX_FMT_H264)
+	if (fival->pixel_format != mz0380_current_pixelformat())
 		return -EINVAL;
 
 	mode = mz0380_find_mode(fival->width, fival->height);
@@ -503,18 +521,57 @@ static int mz0380_enum_frameintervals(struct file *file, void *priv,
 	return 0;
 }
 
+/*
+ * M170: an HDMI capture input that could not say whether anything was plugged
+ * into it.
+ *
+ * `capabilities` was left at 0 even though this driver implements the whole
+ * DV-timings ioctl set. V4L2_IN_CAP_DV_TIMINGS is how an application learns
+ * that QUERY_DV_TIMINGS is worth calling at all, so without it a well-behaved
+ * client never asks - and asking is the only way to get the geometry off this
+ * card, since the card never pushes format to the host (M6).
+ *
+ * `status` was left at 0, which in V4L2 means "no problems". So the node
+ * asserted a healthy source unconditionally, including with the cable out. The
+ * standard bit for this is V4L2_IN_ST_NO_SIGNAL and it is precisely the thing
+ * this project has spent whole sessions determining by hand.
+ *
+ * The live query is skipped while streaming: it reads the MST3367 over the
+ * mailbox I2C proxy, and M74 is the reminder that a watch running alongside a
+ * capture can perturb the capture. Streaming already knows what it locked, so
+ * the cached flag is both cheaper and correct there.
+ *
+ * Only the selected input can be measured - the receiver serves one at a time -
+ * so the others report NO_SIGNAL rather than claiming a clean bill of health
+ * for a path nothing has looked at.
+ */
 static int mz0380_enum_input(struct file *file, void *priv,
 			     struct v4l2_input *inp)
 {
+	struct mz0380_dev *dev = video_drvdata(file);
 	unsigned int index = inp->index;
+	bool locked = false;
 
 	if (index >= ARRAY_SIZE(mz0380_input_names))
 		return -EINVAL;
+
+	if (index == dev->capture.input) {
+		if (READ_ONCE(dev->streaming)) {
+			locked = dev->signal_locked;
+		} else {
+			struct v4l2_dv_timings live;
+
+			locked = !mz0380_query_signal(dev, &live);
+		}
+	}
 
 	memset(inp, 0, sizeof(*inp));
 	inp->index = index;
 	strscpy(inp->name, mz0380_input_names[index], sizeof(inp->name));
 	inp->type = V4L2_INPUT_TYPE_CAMERA;
+	inp->capabilities = V4L2_IN_CAP_DV_TIMINGS;
+	if (!locked)
+		inp->status = V4L2_IN_ST_NO_SIGNAL;
 
 	return 0;
 }
@@ -545,6 +602,14 @@ static int mz0380_g_parm(struct file *file, void *priv,
 	memset(&a->parm, 0, sizeof(a->parm));
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.timeperframe = dev->capture.timeperframe;
+	/*
+	 * M171: the node advertises V4L2_CAP_READWRITE, so read() is a
+	 * supported I/O method and V4L2 requires this field to say how many
+	 * buffers it uses. The memset left it 0, which v4l2-compliance reports
+	 * as "!cap->readbuffers" - a device claiming read() support while
+	 * declaring it has no buffers to read into.
+	 */
+	a->parm.capture.readbuffers = MZ0380_READ_BUFFERS;
 
 	return 0;
 }
@@ -565,8 +630,32 @@ static int mz0380_s_parm(struct file *file, void *priv,
 	memset(&a->parm, 0, sizeof(a->parm));
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.timeperframe = dev->capture.timeperframe;
+	a->parm.capture.readbuffers = MZ0380_READ_BUFFERS;
 
 	return 0;
+}
+
+/*
+ * M170: V4L2_EVENT_SOURCE_CHANGE was unreachable from both ends.
+ *
+ * mz0380_signal_event() builds and queues one, and the ops table pointed
+ * vidioc_subscribe_event straight at v4l2_ctrl_subscribe_event, which accepts
+ * V4L2_EVENT_CTRL and nothing else. So SUBSCRIBE_EVENT(SOURCE_CHANGE) returned
+ * -EINVAL to every application, and the event - had anything emitted one - had
+ * no subscriber it could reach. The feature was listed as implemented in
+ * PLAN.md and was not reachable by any client.
+ */
+static int mz0380_subscribe_event(struct v4l2_fh *fh,
+				  const struct v4l2_event_subscription *sub)
+{
+	switch (sub->type) {
+	case V4L2_EVENT_SOURCE_CHANGE:
+		return v4l2_src_change_event_subscribe(fh, sub);
+	case V4L2_EVENT_CTRL:
+		return v4l2_ctrl_subscribe_event(fh, sub);
+	default:
+		return -EINVAL;
+	}
 }
 
 static int mz0380_log_status(struct file *file, void *priv)
@@ -927,6 +1016,22 @@ static u32 mz0380_source_fps(const struct v4l2_dv_timings *timings)
 int mz0380_query_signal(struct mz0380_dev *dev,
 			struct v4l2_dv_timings *out)
 {
+	/*
+	 * M170: remember what we last told userspace, so a change can be
+	 * reported as one. mz0380_signal_event() has existed since bring-up
+	 * and NOTHING HAS EVER CALLED IT - the source-change event was
+	 * generated by dead code, to a subscription the ops table refused to
+	 * accept. Both halves are fixed together or neither is worth fixing.
+	 *
+	 * There is no background signal poller in this driver, so the event
+	 * fires when something asks - QUERY_DV_TIMINGS, ENUM_INPUT, or arming
+	 * a stream. That is honest and useful for a client that polls; a
+	 * client that only sleeps on the event still needs a poller, which is
+	 * deliberately not added here because it would drive receiver I2C on a
+	 * timer and M74 is what that costs during a capture.
+	 */
+	bool was_locked = dev->signal_locked;
+	struct v4l2_dv_timings prev = dev->detected_timings;
 	int ret = mz0380_mst3367_read_signal(dev, out);
 
 	if (ret) {
@@ -937,11 +1042,18 @@ int mz0380_query_signal(struct mz0380_dev *dev,
 		dev->capture.source_fps = 0;
 		dev->capture.source_interlaced = false;
 		*out = mz0380_no_signal;
+		if (was_locked && dev->video_registered)
+			mz0380_signal_event(dev);
 		return ret == -ENODEV ? -ENOLCK : ret;
 	}
 
+	if (dev->video_registered &&
+	    (!was_locked || !v4l2_match_dv_timings(&prev, out, 250000, false)))
+		mz0380_signal_event(dev);
+
 	dev->signal_locked = true;
 	dev->detected_timings = *out;
+	dev->set_timings = *out;	/* M171: G tracks reality absent an S */
 	dev->last_good_timings = *out;      /* M65: survives later failures */
 	dev->last_good_stamp = jiffies;
 	dev->have_last_good = true;
@@ -977,18 +1089,76 @@ static int mz0380_query_dv_timings(struct file *file, void *fh,
 	return mz0380_query_signal(dev, t);
 }
 
+/*
+ * M171: G returns what was SET, QUERY returns what is DETECTED.
+ *
+ * Both used to answer with the live detection, and S_DV_TIMINGS was a comment
+ * saying "no-op-but-validate" that neither noted nor validated. So
+ * S_DV_TIMINGS(x) followed by G_DV_TIMINGS returned something else entirely,
+ * which is what v4l2-compliance reported as
+ * "g_timings.bt.width != enumtimings.timings.bt.width".
+ *
+ * The card does auto-detect and nothing host-side changes what it receives, so
+ * the set value does not steer the hardware - stream start uses the detection.
+ * But the ioctl contract is still a contract, and a successful detection
+ * updates the set value too, so G tracks reality for anyone who never calls S.
+ */
 static int mz0380_g_dv_timings(struct file *file, void *fh,
 			       struct v4l2_dv_timings *t)
 {
 	struct mz0380_dev *dev = video_drvdata(file);
-	*t = dev->detected_timings;
+
+	*t = dev->set_timings;
 	return 0;
 }
 
 static int mz0380_s_dv_timings(struct file *file, void *fh,
 			       struct v4l2_dv_timings *t)
 {
-	/* card auto-detects; setting is a no-op-but-validate */
+	struct mz0380_dev *dev = video_drvdata(file);
+	const struct mz0380_mode *mode;
+	const struct v4l2_fract *interval;
+
+	if (!v4l2_valid_dv_timings(t, &mz0380_timings_cap, NULL, NULL))
+		return -EINVAL;
+
+	/*
+	 * M172: busy only blocks a CHANGE.
+	 *
+	 * A bare vb2_is_busy() test failed v4l2-compliance's
+	 * testCanSetSameTimings: it allocates buffers and then sets the timings
+	 * it already has, which must succeed because nothing about the buffers
+	 * is invalidated by setting a value to itself. -EBUSY is for the case
+	 * where the new timings would resize the format out from under
+	 * allocated buffers.
+	 */
+	if (vb2_is_busy(&dev->vb_queue) &&
+	    !v4l2_match_dv_timings(&dev->set_timings, t, 0, false))
+		return -EBUSY;
+
+	dev->set_timings = *t;
+
+	/*
+	 * M172: and the format follows the timings.
+	 *
+	 * v4l2-compliance caught this as
+	 * "fmt.fmt.pix.width >= enumtimings.timings.bt.width * 1.5" - it set a
+	 * small timing, asked for the format, and was still told 1920x1080,
+	 * because S_DV_TIMINGS touched nothing but its own stored copy.
+	 *
+	 * For an HDMI receiver the capture format IS the source geometry; there
+	 * is no scaler on this path, and the delivered frame is exactly
+	 * width*height*3/2 of I420. So a client that declares the incoming
+	 * timings must get a format that matches them, snapped to a mode this
+	 * driver supports.
+	 */
+	mode = mz0380_find_mode(t->bt.width, t->bt.height);
+	interval = mz0380_find_interval(mode->width, mode->height,
+					&dev->capture.timeperframe);
+	dev->capture.width = mode->width;
+	dev->capture.height = mode->height;
+	dev->capture.timeperframe = *interval;
+
 	return 0;
 }
 
@@ -1021,7 +1191,7 @@ static const struct v4l2_ioctl_ops mz0380_video_ioctl_ops = {
 	.vidioc_g_parm = mz0380_g_parm,
 	.vidioc_s_parm = mz0380_s_parm,
 	.vidioc_log_status = mz0380_log_status,
-	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_subscribe_event = mz0380_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 
 	/* streaming */
@@ -1085,7 +1255,8 @@ static int mz0380_ctrls_init(struct mz0380_dev *dev)
 	dev->gop_ctrl =
 		v4l2_ctrl_new_std(&dev->ctrl_handler, &mz0380_ctrl_ops,
 				  V4L2_CID_MPEG_VIDEO_GOP_SIZE,
-				  1, MZ0380_MAX_GOP, 1, MZ0380_DEFAULT_GOP);
+				  MZ0380_MIN_GOP, MZ0380_MAX_GOP, 1,
+				  MZ0380_DEFAULT_GOP);
 	if (dev->gop_ctrl)
 		dev->gop_ctrl->flags |= V4L2_CTRL_FLAG_VOLATILE;
 	dev->b_frames_ctrl =
@@ -1137,7 +1308,13 @@ static int mz0380_ctrls_init(struct mz0380_dev *dev)
 
 void mz0380_capture_state_init(struct mz0380_dev *dev)
 {
-	dev->capture.pixelformat = V4L2_PIX_FMT_H264;
+	/*
+	 * M171: give G_DV_TIMINGS a valid answer before anything has been
+	 * detected or set. A zeroed struct has type 0, which is not a valid
+	 * v4l2_dv_timings type; mz0380_no_signal carries the right type with
+	 * empty timings, which is the honest "nothing here yet".
+	 */
+	dev->set_timings = mz0380_no_signal;
 	dev->capture.width = 1920;
 	dev->capture.height = 1080;
 	dev->capture.timeperframe = mz0380_ntsc_frame_intervals[0];
@@ -1315,6 +1492,7 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 	u32 hw_bitrate_reg;
 	u32 hw_bitrate_mask;
 	u32 hw_bitrate_shift;
+	u32 fourcc = mz0380_current_pixelformat();
 
 	fps_milli = DIV_ROUND_CLOSEST(dev->capture.timeperframe.denominator * 1000,
 				      max_t(u32, dev->capture.timeperframe.numerator, 1));
@@ -1329,8 +1507,15 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 	if (dev->video_registered)
 		seq_printf(m, "  video node : /dev/%s\n",
 			   video_device_node_name(&dev->vdev));
-	seq_printf(m, "  pixelformat: %4.4s\n",
-		   (char *)&dev->capture.pixelformat);
+	seq_printf(m, "  pixelformat: %4.4s\n", (char *)&fourcc);
+	/*
+	 * M169: the spawn budget, which is the number that decides whether the
+	 * next hardware run is safe. Per insmod here - the driver cannot see
+	 * across a module reload - so ./mz0380-spawns.sh accumulates it per
+	 * boot, which is the granularity the card's wedge actually has.
+	 */
+	seq_printf(m, "  enc spawns : %u since insmod (card wedges somewhere in 8-18 per POWER CYCLE)\n",
+		   dev->encoder_spawns);
 	seq_printf(m, "  frame size : %ux%u\n",
 		   dev->capture.width, dev->capture.height);
 	seq_printf(m, "  frame rate : %u.%03u fps\n",

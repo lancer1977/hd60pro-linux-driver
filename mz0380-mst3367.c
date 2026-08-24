@@ -1071,11 +1071,20 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_ramtest);
  *
  * Watch the detect block live so a plug/unplug or camera power-cycle can be
  * correlated with what the chip sees. reg 0x55 is the status byte: bit2..5
- * (mask 0x3c) are the lock bits the GPL driver gates on, and we consistently
- * read 0x03 - bits the driver does not use, most plausibly 5V/clock presence.
- * If those low bits track the cable while the timing counters stay idle, the
- * source is attached but not transmitting; if the counters come alive, the
- * receiver is seeing TMDS and the fault is in its configuration.
+ * (mask 0x3c) are the lock bits the GPL driver gates on.
+ *
+ * M173 settled what the other bits are, by watching R55 across a live
+ * unplug/replug. This comment used to say bits 0..1 were "most plausibly
+ * 5V/clock presence" and that guess stood unexamined for the life of the
+ * project. It is WRONG: bits 0..1 read 3 with the cable in AND with it out,
+ * while the lock bits went 0x3c -> 0x00 -> 0x3c. They are stuck high and carry
+ * no status. This card has no +5V detect, which is why
+ * V4L2_CID_DV_RX_POWER_PRESENT is not implemented.
+ *
+ * What does track the cable is mask 0x7c - so bit 6 moves with the signal
+ * exactly as the 0x3c lock bits do, and neither we nor hdcapm gate on it.
+ * Leave the mask alone: 0x3c has reported LOCKED correctly in every capture
+ * this project has made.
  */
 int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs)
 {

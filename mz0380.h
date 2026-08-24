@@ -82,6 +82,15 @@
 #define MZ0380_DEFAULT_BITRATE          (12 * 1024 * 1024)
 #define MZ0380_MIN_BITRATE              (256 * 1024)
 #define MZ0380_MAX_BITRATE              (12 * 1024 * 1024)
+/*
+ * M171: the GOP range lived in mz0380-video.c, so mz0380-core.c - which does
+ * the hardware readbacks that feed this control - could not see it and did not
+ * range-check against it. That is exactly how a 0 got into a control declared
+ * min=1.
+ */
+#define MZ0380_MIN_GOP                  1
+#define MZ0380_DEFAULT_GOP              30
+#define MZ0380_MAX_GOP                  300
 #define MZ0380_MIN_QUALITY              0
 #define MZ0380_DEFAULT_QUALITY          80
 #define MZ0380_MAX_QUALITY              100
@@ -176,7 +185,12 @@ struct mz0380_subid {
 };
 
 struct mz0380_capture_state {
-	u32 pixelformat;
+	/*
+	 * M168: no cached pixelformat. poll_drain_ms and stream_nosg are both
+	 * 0644 module params, so the advertised fourcc can change under a
+	 * running driver; a copy here would go stale the moment it did.
+	 * mz0380_current_pixelformat() is the only answer.
+	 */
 	u32 width;
 	u32 height;
 	struct v4l2_fract timeperframe;
@@ -322,6 +336,16 @@ struct mz0380_dev {
 		void *va;
 		dma_addr_t dma;
 		struct page *pages;
+		/*
+		 * M168: frames delivered out of this buffer this stream. The
+		 * drain re-poisons immediately after copying, so the extent
+		 * report at stream stop scans a buffer that is poison again and
+		 * says "0/1024 sampled pages touched" - identical to the card
+		 * having written nothing. That reading is the whole diagnosis
+		 * in several places in RE_FINDINGS, so the successful case must
+		 * not be able to imitate the empty one.
+		 */
+		u32 delivered;
 	} stream_bufs[MZ0380_STREAM_NR_BUFS];
 	u32 stream_head;	/* next buffer index we expect from the card */
 
@@ -356,6 +380,18 @@ struct mz0380_dev {
 	u32 video_sequence;
 	/* M155: stream cycles since insmod, for stream_setvic_once. */
 	u32 stream_cycles;
+
+	/*
+	 * M169: encoder spawns since insmod - every SET_VIC this driver has
+	 * fired, which is the ONLY thing that forks a fresh tinyvenc5.
+	 *
+	 * Distinct from stream_cycles, which counts cycles whether or not
+	 * SET_VIC was actually sent (setvic_once skips it) and so is not a
+	 * spawn count. The card wedges for good somewhere in the 8-18 spawn
+	 * range and only removing slot power brings it back, so this is the
+	 * number that says how close the card is to the cliff.
+	 */
+	u32 encoder_spawns;
 	u8 frame_poison_byte;
 	bool frame_poison_active;
 	bool streaming;
@@ -376,6 +412,14 @@ struct mz0380_dev {
 	/* HDMI signal */
 	// pattern-check: skip adding one bool state flag to existing struct
 	struct v4l2_dv_timings detected_timings;
+	/*
+	 * M171: what S_DV_TIMINGS was last told, which V4L2 keeps distinct from
+	 * what is actually on the wire. G_DV_TIMINGS returns this;
+	 * QUERY_DV_TIMINGS returns detected_timings. Conflating them failed
+	 * v4l2-compliance - it sets a timing from ENUM_DV_TIMINGS and requires
+	 * G to return it, and G was answering with the live detection instead.
+	 */
+	struct v4l2_dv_timings set_timings;
 	/*
 	 * M65: the last detection that actually succeeded, kept across later
 	 * failures. A source that transmits in short bursts cannot be locked
@@ -653,6 +697,7 @@ extern unsigned int mz0380_kick_opcode;
 extern bool mz0380_kick_repeat;
 extern bool mz0380_poll_drain_credit;
 extern unsigned int mz0380_poll_drain_ms;
+extern unsigned int mz0380_stall_eos_ms;
 void mz0380_credit_rearm(struct mz0380_dev *dev);
 extern unsigned int mz0380_rx_strap;
 extern bool mz0380_enable_dma;
@@ -741,5 +786,34 @@ extern unsigned int mz0380_video_ring_entries;
 extern unsigned int mz0380_video_ring_entry_size;
 extern unsigned int mz0380_audio_ring_entries;
 extern unsigned int mz0380_audio_ring_entry_size;
+
+/*
+ * M172: the reported field follows the negotiated timings.
+ *
+ * v4l2-compliance's last failure was "field == V4L2_FIELD_NONE" in the
+ * DV-timings test: it sets one of the two interlaced modes this driver
+ * enumerates (1080i50 and 1080i60), asks for the format, and is told
+ * V4L2_FIELD_NONE - a progressive format for an interlaced signal. The field
+ * was a hardcoded constant in mz0380_fill_pix_format().
+ *
+ * V4L2_FIELD_INTERLACED rather than ALTERNATE because this path delivers whole
+ * frames in one buffer, and for interlaced BT timings bt.height is already the
+ * frame height (1080 for 1080i), so the geometry stays consistent.
+ *
+ * The buffer metadata uses the same answer, so a delivered frame never claims a
+ * different field from the format that was negotiated for it.
+ */
+static inline u32 mz0380_current_field(const struct mz0380_dev *dev)
+{
+	/*
+	 * The nosg fake-frame generator produces a fixed progressive pattern
+	 * whatever timings were set, and its delivery path says so, so the
+	 * format must agree rather than inheriting an interlaced answer.
+	 */
+	if (mz0380_stream_nosg)
+		return V4L2_FIELD_NONE;
+	return dev->set_timings.bt.interlaced ? V4L2_FIELD_INTERLACED
+					      : V4L2_FIELD_NONE;
+}
 
 #endif

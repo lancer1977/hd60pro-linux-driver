@@ -773,10 +773,13 @@ static void mz0380_frame_buffers_poison_start(struct mz0380_dev *dev)
 			       dev->frame_poison_byte,
 			       MZ0380_STREAM_BUF_SIZE);
 		dev->extent_last[i] = 0;
+		/* M168: per-stream, to match the extent report's "at stop". */
+		dev->stream_bufs[i].delivered = 0;
 	}
 	dma_wmb();
 	smp_store_release(&dev->frame_poison_active, true);
-	pr_info("%s: real-frame buffers primed with 0x%02x poison; H.264 payload size will be inferred from the bounded changed prefix because firmware does not expose its byte count\n",
+	/* M168: "H.264 payload size" - it is a raw I420 frame on this path. */
+	pr_info("%s: real-frame buffers primed with 0x%02x poison; the payload size will be inferred from the bounded changed prefix because firmware does not expose its byte count\n",
 		dev->name, dev->frame_poison_byte);
 }
 
@@ -920,6 +923,8 @@ static void mz0380_extent_watch_start(struct mz0380_dev *dev)
 	mz0380_extent_watch_stop(dev);
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
 		dev->extent_last[i] = 0;
+		/* M168: per-stream, to match the extent report's "at stop". */
+		dev->stream_bufs[i].delivered = 0;
 		if (dev->stream_bufs[i].va)
 			memset(dev->stream_bufs[i].va, mz0380_poison_b(),
 			       MZ0380_STREAM_BUF_SIZE);
@@ -959,11 +964,21 @@ static void mz0380_stream_bufs_dump(struct mz0380_dev *dev, const char *tag)
 			}
 		}
 
-		pr_info("%s: %s buf[%u] @%pad head=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | %zu/%u sampled pages touched, last @0x%zx\n",
+		/*
+		 * M168: say how many frames came OUT of this buffer. Without
+		 * it a buffer that delivered a whole frame and was re-poisoned
+		 * reads exactly like one the card never wrote to - the M168
+		 * run printed "0/1024 sampled pages touched" on the buffer that
+		 * had just produced a correct 1080p frame.
+		 */
+		pr_info("%s: %s buf[%u] @%pad head=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x | %zu/%u sampled pages touched, last @0x%zx | %u frame(s) delivered from it%s\n",
 			dev->name, tag, i, &dev->stream_bufs[i].dma,
 			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
 			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15],
-			nonzero, MZ0380_STREAM_BUF_SIZE / 4096, last);
+			nonzero, MZ0380_STREAM_BUF_SIZE / 4096, last,
+			dev->stream_bufs[i].delivered,
+			dev->stream_bufs[i].delivered ?
+				" (so it is poison again by design, not untouched)" : "");
 	}
 }
 
@@ -1325,6 +1340,20 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 
 	/* Even a timed-out transaction may already have spawned tinyvenc5. */
 	vic_fired = true;
+	/*
+	 * M169: count it here, on the fire rather than on the result, for
+	 * exactly the reason the line above gives - a SET_VIC that times out
+	 * may still have forked an encoder, and a spawn budget that only counts
+	 * successes would under-report precisely when the card is in trouble.
+	 *
+	 * This is the single SET_VIC site in the driver, so this counter sees
+	 * every spawn including the nosg loop's per-frame respawns, which reach
+	 * it through mz0380_dma_start().
+	 */
+	dev->encoder_spawns++;
+	if (dev->encoder_spawns == 8)
+		pr_warn("%s: 8 encoder spawns since insmod - entering the 8-18 range where the card has wedged before (recovery is a mains-off cold boot, or mz0380-m52-card-recovery.sh). The budget is per POWER CYCLE, not per insmod: ./mz0380-spawns.sh has the running total\n",
+			dev->name);
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_VIC_PARAMS, params,
 				  ARRAY_SIZE(params), NULL, 2000);
 	if (mz0380_stream_nosg)
@@ -1829,7 +1858,12 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 		}
 	}
 
-	pr_info_ratelimited("%s: frame token %u inferred H.264 length=%zu from 4-byte poison boundary (tail collision risk 2^-32; payload counters %08x/%08x/%08x were not used)\n",
+	/*
+	 * M168: "H.264 length" was wrong on the path that actually runs. The
+	 * poison-boundary inference is format-agnostic and what it measured
+	 * here, on every capture this project has, is a raw I420 frame.
+	 */
+	pr_info_ratelimited("%s: frame token %u inferred payload length=%zu from the 4-byte poison boundary (tail collision risk 2^-32; payload counters %08x/%08x/%08x were not used)\n",
 				    dev->name, idx, len, snapshot->payload[0],
 				    snapshot->payload[1], snapshot->payload[2]);
 
@@ -1863,8 +1897,9 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 	}
 
 	vbuf->vb.vb2_buf.timestamp = snapshot->timestamp_ns;
-	vbuf->vb.field = V4L2_FIELD_NONE;
+	vbuf->vb.field = mz0380_current_field(dev);	/* M172 */
 	vbuf->vb.sequence = dev->video_sequence++;
+	dev->stream_bufs[idx].delivered++;	/* M168: see the extent report */
 	vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 
 repoison:
@@ -1893,6 +1928,8 @@ static int mz0380_poll_drain_thread(void *data)
 {
 	struct mz0380_dev *dev = data;
 	unsigned long next_kick = jiffies;
+	unsigned long last_delivery = 0;
+	bool stall_reported = false;
 	unsigned int delivered = 0;
 	unsigned int kicks = 0;
 	u32 tok[3] = {};
@@ -1980,6 +2017,7 @@ static int mz0380_poll_drain_thread(void *data)
 					    dev->name, idx, len);
 			mz0380_drain_frame_snapshot(dev, &snapshot);
 			delivered++;
+			last_delivery = jiffies;
 			handled = true;
 		}
 
@@ -2064,6 +2102,23 @@ static int mz0380_poll_drain_thread(void *data)
 			kicks++;
 			next_kick = jiffies +
 				msecs_to_jiffies(mz0380_op6_kick_ms);
+		}
+
+		/*
+		 * M168: the stream is over, so say so rather than blocking the
+		 * reader forever. See the mz0380_stall_eos_ms comment in
+		 * mz0380-core.c for why one frame is the hardware's bound.
+		 */
+		if (delivered && !stall_reported && mz0380_stall_eos_ms &&
+		    READ_ONCE(dev->streaming) &&
+		    time_after(jiffies,
+			       last_delivery +
+			       msecs_to_jiffies(mz0380_stall_eos_ms))) {
+			stall_reported = true;
+			pr_info("%s: poll-drain: %u frame(s) delivered and nothing for %u ms - signalling end of stream (DQBUF will return -EIO). fw=%u is a single-shot grabber (M166); stop and restart the stream for another frame, or set stall_eos_ms=0 to block instead\n",
+				dev->name, delivered, mz0380_stall_eos_ms,
+				mz0380_vic_fw);
+			vb2_queue_error(&dev->vb_queue);
 		}
 
 		msleep_interruptible(max_t(unsigned int, 1,

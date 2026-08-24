@@ -234,7 +234,7 @@ MODULE_PARM_DESC(record_mode_shift,
 bool mz0380_enable_video = true;
 module_param_named(enable_video, mz0380_enable_video, bool, 0444);
 MODULE_PARM_DESC(enable_video,
-		 "register the probe-safe V4L2 node; disabled by default to keep unloads simple during bring-up");
+		 "register the V4L2 node (def:1 since M166 - the shipping default is the known-good capture configuration; 0 restores the bring-up behaviour, no /dev/video*)");
 
 static unsigned int card[] = { [0 ... (MZ0380_MAXBOARDS - 1)] = UNSET };
 module_param_array(card, int, NULL, 0444);
@@ -527,6 +527,41 @@ module_param_named(poll_drain_ms, mz0380_poll_drain_ms, uint, 0644);
 MODULE_PARM_DESC(poll_drain_ms,
 		 "M111: poll the stream buffers every N ms and deliver any frame the card has already written, instead of waiting for a completion event that never arrives (def:20; 0 = off, which under fw=5 means nothing is ever delivered - M166)");
 
+/*
+ * M168: end the stream instead of hanging on it.
+ *
+ * Under the shipping fw=5 the card is a single-shot grabber and that is a
+ * proven bound, not a missing trick (M166): tinyvenc5 pushes one frame from
+ * TK_MMA_StartOneFrame, then MassMemAccess_StartDMAC spins forever in an
+ * unbounded sched_yield loop because the only call that would return the
+ * profile - TK_MMA_WaitOneFrameComplete - is unreachable in this build (M153).
+ * No host-side write reaches any link in that chain.
+ *
+ * Until now the driver did nothing about it, so an application that kept
+ * reading - ffmpeg, OBS, anything that streams rather than grabs - blocked in
+ * DQBUF forever after receiving its one correct frame. A hang is the worst way
+ * to report a bound: it looks like broken hardware or a broken driver, and it
+ * is neither.
+ *
+ * So once a frame HAS been delivered and the requested interval has passed with
+ * nothing following it, mark the queue errored. DQBUF then returns -EIO and
+ * poll() reports EPOLLERR, which is how V4L2 says "this source has stopped" -
+ * applications finish their file and exit with the frame they got. The gate is
+ * deliberately after the first delivery: the first frame lands ~1.2 s after
+ * stream start behind start_delay_ms, and erroring before it would break every
+ * normal capture.
+ *
+ * Nothing here respawns the encoder. A respawn does yield one more frame (M39),
+ * but each one costs part of the 8-18 spawn budget, so faking a video stream
+ * that way would wedge the card within seconds of an OBS session.
+ *
+ * 0 restores the old behaviour: block in DQBUF indefinitely.
+ */
+unsigned int mz0380_stall_eos_ms = 2000;
+module_param_named(stall_eos_ms, mz0380_stall_eos_ms, uint, 0644);
+MODULE_PARM_DESC(stall_eos_ms,
+		 "M168: after a frame has been delivered, if this many ms pass with no further frame, error the vb2 queue so DQBUF returns -EIO instead of blocking forever - fw=5 is a single-shot grabber (def:2000; 0 = block forever, the pre-M168 behaviour)");
+
 unsigned int mz0380_rx_strap;
 module_param_named(rx_strap, mz0380_rx_strap, uint, 0644);
 MODULE_PARM_DESC(rx_strap,
@@ -546,7 +581,7 @@ MODULE_PARM_DESC(rx_strap,
 bool mz0380_enable_dma = true;
 module_param_named(enable_dma, mz0380_enable_dma, bool, 0444);
 MODULE_PARM_DESC(enable_dma,
-		 "allocate ring buffers, request MSI, enable bus mastering; off by default");
+		 "allocate ring buffers, request MSI, enable bus mastering (def:1 since M166; 0 restores the bring-up behaviour, which cannot capture)");
 
 /*
  * Gap between SET_VIC(0x29) and START_STREAMING(op 0x06). SET_VIC makes the
@@ -1558,7 +1593,7 @@ MODULE_PARM_DESC(irq_intx,
 bool mz0380_dma_handshake = true;
 module_param_named(dma_handshake, mz0380_dma_handshake, bool, 0444);
 MODULE_PARM_DESC(dma_handshake,
-		 "enable bus master + MSI (no ring programming) before firmware handshake; M4 diagnostic");
+		 "enable bus master + MSI (no ring programming) before the firmware handshake; M4 diagnostic (def:1 since M166)");
 
 bool mz0380_enable_audio;
 module_param_named(enable_audio, mz0380_enable_audio, bool, 0444);
@@ -2638,6 +2673,40 @@ bool mz0380_read_candidate_qp_step(struct mz0380_dev *dev, u32 *qp_step,
 	return true;
 }
 
+/*
+ * M171: a readback outside the control's declared range is NOT a value.
+ *
+ * v4l2-compliance failed VIDIOC_G/S_CTRL and G/S/TRY_EXT_CTRLS with
+ * "returned control value out of range" on V4L2_CID_MPEG_VIDEO_GOP_SIZE, which
+ * is declared min=1 and was reporting 0. The 0 came from here: these sync
+ * helpers read a BAR5 field and adopt whatever it holds. Those registers are
+ * only ever written by the H.264 path, this driver's capture path is raw I420,
+ * so they have never been written and read back as zero. Zero means UNSET, not
+ * "a GOP of zero" - and bitrate 0 (declared min 262144) is the same story.
+ *
+ * The bitrate sync already noticed: it printed "outside current V4L2 range" and
+ * then stored the value anyway. mz0380_sync_candidate_b_frames() and
+ * mz0380_sync_candidate_record_mode() got it right from the start - they reject
+ * and return false. This makes the other four agree with those two.
+ *
+ * Rejecting leaves the cached value in place, which is the declared default
+ * until userspace sets something, so the control always reports a legal value.
+ */
+static bool mz0380_sync_in_range(struct mz0380_dev *dev, const char *what,
+				 u32 val, u32 min, u32 max, u32 raw_word,
+				 const char *reason)
+{
+	if (val >= min && val <= max)
+		return true;
+
+	printk(KERN_WARNING
+	       "%s: %s field returned %u (raw=%08x), outside the V4L2 range [%u..%u] - keeping the cached value; the register is unwritten, not zero%s%s\n",
+	       dev->name, what, val, raw_word, min, max,
+	       reason && *reason ? " during " : "",
+	       reason && *reason ? reason : "");
+	return false;
+}
+
 bool mz0380_sync_candidate_bitrate(struct mz0380_dev *dev,
 				   const char *reason)
 {
@@ -2646,6 +2715,10 @@ bool mz0380_sync_candidate_bitrate(struct mz0380_dev *dev,
 
 	if (!mz0380_read_candidate_bitrate(dev, &bitrate, &raw_word, NULL,
 					   NULL, NULL))
+		return false;
+
+	if (!mz0380_sync_in_range(dev, "candidate bitrate", bitrate, MZ0380_MIN_BITRATE, MZ0380_MAX_BITRATE,
+				  raw_word, reason))
 		return false;
 
 	dev->capture.bitrate = bitrate;
@@ -2670,6 +2743,10 @@ bool mz0380_sync_hw_bitrate(struct mz0380_dev *dev, const char *reason)
 
 	if (!mz0380_read_hw_bitrate(dev, &bitrate, &raw_word, NULL,
 				    NULL, NULL))
+		return false;
+
+	if (!mz0380_sync_in_range(dev, "BAR5 bitrate", bitrate, MZ0380_MIN_BITRATE, MZ0380_MAX_BITRATE,
+				  raw_word, reason))
 		return false;
 
 	dev->capture.bitrate = bitrate;
@@ -2697,6 +2774,10 @@ bool mz0380_sync_candidate_quality(struct mz0380_dev *dev,
 					   NULL, NULL))
 		return false;
 
+	if (!mz0380_sync_in_range(dev, "candidate quality", quality, MZ0380_MIN_QUALITY, MZ0380_MAX_QUALITY,
+				  raw_word, reason))
+		return false;
+
 	dev->capture.quality = quality;
 	printk(KERN_INFO
 	       "%s: synced cached quality from candidate BAR5 field = %u (raw=%08x)%s%s\n",
@@ -2714,6 +2795,10 @@ bool mz0380_sync_hw_quality(struct mz0380_dev *dev, const char *reason)
 
 	if (!mz0380_read_hw_quality(dev, &quality, &raw_word, NULL,
 				    NULL, NULL))
+		return false;
+
+	if (!mz0380_sync_in_range(dev, "BAR5 quality", quality, MZ0380_MIN_QUALITY, MZ0380_MAX_QUALITY,
+				  raw_word, reason))
 		return false;
 
 	dev->capture.quality = quality;
@@ -2739,6 +2824,10 @@ bool mz0380_sync_candidate_gop(struct mz0380_dev *dev,
 
 	if (!mz0380_read_candidate_gop(dev, &gop, &raw_word, NULL,
 				       NULL, NULL))
+		return false;
+
+	if (!mz0380_sync_in_range(dev, "candidate GOP", gop, MZ0380_MIN_GOP, MZ0380_MAX_GOP,
+				  raw_word, reason))
 		return false;
 
 	dev->capture.gop_size = gop;
@@ -2855,6 +2944,10 @@ bool mz0380_sync_hw_gop(struct mz0380_dev *dev, const char *reason)
 
 	if (!mz0380_read_hw_gop(dev, &gop, &raw_word, NULL,
 				NULL, NULL))
+		return false;
+
+	if (!mz0380_sync_in_range(dev, "BAR5 GOP", gop, MZ0380_MIN_GOP, MZ0380_MAX_GOP,
+				  raw_word, reason))
 		return false;
 
 	dev->capture.gop_size = gop;
