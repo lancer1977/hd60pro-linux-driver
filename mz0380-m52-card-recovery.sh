@@ -1,11 +1,12 @@
 #!/bin/bash
 # M52: can a wedged card be recovered WITHOUT a mains-off cold boot?
 #
-# The wedge (hit after ~8-18 encoder spawns): the card's mailbox stops
-# ACKing everything - CMD_INIT and even BEGIN_FW_DL time out (-110), so a
-# firmware re-upload cannot even start. rmmod/insmod does not help. This
-# script walks the escalating PCI-level resets the kernel offers for the
-# device and tests the mailbox after each:
+# The wedge (hit after ~8-18 encoder spawns): the card's mailbox stops ACKing
+# everything - CMD_INIT times out (-110) and the driver reports "the mailbox is
+# deaf". rmmod/insmod does not help. M157 named the likely cause (SIGKILLed
+# encoders never run their cleanup) but that is a way to stop reaching the
+# wedge, not a way out of one. This script walks the escalating PCI-level
+# resets the kernel offers for the device and tests the mailbox after each:
 #
 #   1. pm  reset  - D3hot -> D0 power-state bounce
 #   2. bus reset  - secondary-bus (hot) reset on the upstream bridge;
@@ -20,17 +21,25 @@
 #   - "RECOVERED after <stage>"  -> cold boot NOT needed; use this stage
 #     as the standard recovery (and consider automating it in the driver).
 #   - all three fail             -> the SoC really does keep running through
-#     PCIe resets; mains-off cold boot is the only recovery. (Then finding
-#     a card-side reboot opcode is worth RE time - op 0xFF candidate.)
+#     PCIe resets; mains-off cold boot is the only recovery.
+#
+# Only meaningful ON A WEDGED CARD. Run the 2 s check first (M149) - if
+# CMD_INIT answers, there is nothing here to recover.
 set -u
 cd "$(dirname "$0")"
+
+. ./mz0380-build.sh
+KO=$(mz0380_resolve_module) || exit 1
 
 PCI=${PCI_ADDR:-0000:04:00.0}
 SYS=/sys/bus/pci/devices/$PCI
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 [ -e "$SYS" ] || { echo "no device at $PCI"; exit 1; }
-make >/dev/null || { echo "build failed"; exit 1; }
+
+# Without these, insmod fails with "Unknown symbol in module" - a missing
+# dependency, which says nothing about the card. M149.
+modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
 
 unload() {
 	fuser -k /dev/video0 2>/dev/null
@@ -39,16 +48,21 @@ unload() {
 }
 
 # Load the module and report whether the card's mailbox answered.
+#
+# The markers are the ones mz0380_card_init() actually prints (M149):
+#   healthy: CMD_INIT answered on attempt 1 (status=0xdddddddd)
+#   wedged:  CMD_INIT got no answer (-110) ... the mailbox is deaf
+# The handshake resolves in ~2 s either way - the card boots its own flash and
+# we never upload anything, so there is no 25 s upload to wait out.
 mailbox_alive() {
 	dmesg -C
-	insmod ./mz0380.ko dma_handshake=1 enable_dma=1 \
+	insmod "$KO" dma_handshake=1 enable_dma=1 \
 		enable_video=1 procfs_verbosity=2 dma_iova_remap=1 || return 1
-	# upload+boot can take ~25 s; the failure path (-110) shows in ~10 s
-	for i in $(seq 30); do
-		if dmesg | grep -qE "already runs firmware|firmware.*READY|fw .*ready"; then
+	for i in $(seq 15); do
+		if dmesg | grep -qaE "CMD_INIT answered on attempt"; then
 			return 0
 		fi
-		if dmesg | grep -qE "CMD_INIT got no answer|BEGIN_FW_DL command failed"; then
+		if dmesg | grep -qaE "CMD_INIT got no answer|mailbox is deaf|card handshake failed"; then
 			return 1
 		fi
 		sleep 1
