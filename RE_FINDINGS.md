@@ -9901,3 +9901,91 @@ function the variable is read in.
 
 Four spawns into this power cycle, `vic_fast_kill=0` throughout, no wedge, and
 the card sustained a 57-second stream with 1628 interrupts and zero FIFO drops.
+
+
+---
+
+## M162 (static, 2026-08-24): the MMA "length" argument is not a length, and neither binary ever asks for a frame-sized transfer
+
+Chasing M161's lead. It does not survive, and what replaces it is more useful.
+
+### `a3` is a control-word field, proven three ways
+
+`TK_MMA_StartOneFrame(ctx, 0x90000000, phys, a3)` - M161 flagged `a3` as
+"probably the length, units unresolved". It is not a length:
+
+1. **Where it goes.** The wrapper (0xc64) stores it at `ctx[0x18]`, which is
+   `MassMemAccess_StartDMAC`'s `[base+0x14]`, which is `orr`'d into the DMAC
+   control word at `<< 10` (0x1d6c/0x1e40) and written to the mapped MMR at
+   `[block+8]`. The preceding `bic #0xFF0` only clears to bit 11, so a value of
+   16 lands at bit 14 - incoherent as an integer field, ordinary as a flag.
+2. **Who else writes that slot.** `MassMemAccess_SetOptions` option **78**
+   writes `handle[0x14]` (0x10ec) - the same slot, through a config call.
+3. **The measurement.** tinyvenc7's `vcap_handler` pushes with `a3 = 16` at
+   0x129a4 and `a3 = height*3/2` at 0x125b4. **Both deliver exactly 16 bytes.**
+
+### No call site in either binary asks for a frame
+
+| | `a3` values | `MemBroker_CacheCopyBack` size |
+|---|---|---|
+| tinyvenc5, 12 aperture sites | 4096 x4, 16 x2, r9 x1 | 4096 |
+| tinyvenc7, 9 aperture sites | 16, height*3/2 | 16 (Start), 4096 (Process) |
+
+There is **no `3110400` constant anywhere in tinyvenc5**, and no literal-pool
+`0x90000000` either - every reference is the `mov #imm` form, all twelve of them
+MMA calls. Only `tinyvenc5` and `tinyvenc7` reference the outbound aperture at
+all; `libvideocap`, `libtk_video_capture`, `libtkmf_video_source`, the IBPE
+library, `libmemmgr` and both MMA libraries reference it **zero** times. So the
+push to the host lives in the tinyvenc binaries and nowhere else.
+
+### tinyvenc7 uses two handles, and both are small
+
+In `vcap_handler`:
+
+    [r4+0xb4]  -> 3x TK_MMA_StartOneFrame,   CacheCopyBack(buf, 16)
+    [r4+0xb8]  -> 2x TK_MMA_ProcessOneFrame, CacheCopyBack(buf, 4096)
+
+`TK_MMA_ProcessOneFrame` is the API M153 proved unreachable in tinyvenc5; in
+tinyvenc7 it is on the frame path. But it moves 4096 bytes, not 3110400.
+
+### The chain that pins the transfer length
+
+The cache flush is *maintenance*, not a length - a DMA can move more than was
+flushed. But that asymmetry is exactly what makes it decisive here: if the
+engine moved a frame while only 16 bytes were flushed back, the host would
+receive **3110400 bytes of mostly-stale DRAM**, not 16 bytes. M161 measured
+exactly 16 bytes arriving, with the rest of the buffer still poisoned, over a
+57-second stream with the buffers left un-poisoned. **So the configured transfer
+length really is 16 bytes**, and it is configured, not passed per-call.
+
+### Where the geometry comes from - and the next read
+
+Both binaries configure MMA with **option 80 only** (`mov #80` before every
+`TK_MMA_SetOptions` in both; option 80 writes four flag bytes to
+`handle[0x60..0x63]`, and `MassMemAccess_WaitDMAC` clears `[0x63]` - another
+in-flight latch, in the library this time). **Neither ever calls option 23**,
+the branch that does the `MemMgr_GetPhysAddr` and stride arithmetic. So the
+transfer geometry is established in `TK_MMA_Init` / `MassMemAccess_Initial`.
+
+`TK_MMA_Init(a, b, c, d)` -> `ctx[0x14]=a`, `ctx[0x10]=b`, `ctx[0x30]=c`,
+`ctx[0x0c]=(d!=0)`, and `MassMemAccess_Initial(ctx, {name, 2560, 1920, 0,0,0})`
+- 2560x1920 being a max-allocation bound, not the transfer size. The one
+structural difference found so far in the init arguments:
+
+    tinyvenc5 (0x12b7c):  a = r6,  b = 2,   c = 32,  d = 1
+    tinyvenc7 (0xdbec):   a = r4,  b = r4,  c = 32,  d = 1
+
+**Next read (static, free): map the rest of `TK_MMA_Init` and
+`MassMemAccess_Initial` onto the 60-byte descriptor** - `StartDMAC` writes
+`[block+0x14/0x18/0x1c/0x20/0x24/0x28/0x2c/0x34/0x38]` from descriptor fields
+`[0x5c/0x28/0x30/0x34/0x38/0x3c/0x40/0x44/0x60]`, and one of those is the byte
+count. Then compare what each binary puts there.
+
+### The CFG could not help here, and that is worth knowing
+
+`mz0380-cfg.py` on `vcap_handler` (0x122d4..0x13260, 966 instructions) reports
+**everything reachable**, including both `ProcessOneFrame` sites. That is not a
+result - the tool over-approximates, and it only produced M153's answer because
+`mma_already_start` was provably constant and let two edges be cut. tinyvenc7
+has no such constant. Reachability questions here need a proven-constant flag;
+without one the tool says nothing.
