@@ -285,12 +285,36 @@ static u32 mz0380_raw_frame_size(const struct mz0380_capture_state *capture)
 
 static u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
 {
+	u32 size;
+
 	if (mz0380_stream_nosg)
 		return MZ0380_NOSG_NV12_SIZEIMAGE;
 	if (mz0380_poll_drain_ms)
-		return max(mz0380_raw_frame_size(&dev->capture),
+		size = max(mz0380_raw_frame_size(&dev->capture),
 			   mz0380_sizeimage(&dev->capture));
-	return mz0380_sizeimage(&dev->capture);
+	else
+		size = mz0380_sizeimage(&dev->capture);
+
+	/*
+	 * M175: a declared frame expectation is also a plane requirement.
+	 *
+	 * expect_frame_bytes exists because the card does not always write
+	 * source-sized frames - tinyvenc8 writes 960x540, and fw=6 is
+	 * documented to switch the card's output format to YUY2, which at
+	 * 1080p is 4147200 bytes against this plane's 3110400. Without this
+	 * the drain would measure a complete frame and then reject it with
+	 * "does not fit vb2 plane", which is a different way to lose the same
+	 * frame - and a harder one to read, because it looks like a driver bug
+	 * rather than an expectation mismatch.
+	 *
+	 * Bounded by the DMA buffer, since nothing larger can arrive anyway.
+	 */
+	if (mz0380_expect_frame_bytes)
+		size = max_t(u32, size,
+			     min_t(u32, mz0380_expect_frame_bytes,
+				   MZ0380_STREAM_BUF_SIZE));
+
+	return size;
 }
 
 /*
