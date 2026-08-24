@@ -1848,7 +1848,8 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 	 * a later event or the poll-drain then sees a complete frame.
 	 */
 	if (mz0380_event_require_complete) {
-		size_t want = (size_t)dev->capture.source_width *
+		size_t want = mz0380_expect_frame_bytes ?:
+			      (size_t)dev->capture.source_width *
 			      dev->capture.source_height * 3 / 2;
 
 		if (want && len < want) {
@@ -2003,7 +2004,8 @@ static int mz0380_poll_drain_thread(void *data)
 			 * a burst still in progress - leave it alone and it
 			 * will be complete on a later pass.
 			 */
-			want = (size_t)dev->capture.source_width *
+			want = mz0380_expect_frame_bytes ?:
+			       (size_t)dev->capture.source_width *
 			       dev->capture.source_height * 3 / 2;
 			if (want && len < want) {
 				pr_info_ratelimited("%s: poll-drain: buf %u holds %zu of %zu bytes - DMA still in flight, waiting\n",

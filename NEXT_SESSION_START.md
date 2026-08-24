@@ -27,7 +27,27 @@ That single chain explains the one frame, the OBS freeze, `frame_events=0`,
 `0x2d` going unanswered afterwards, and why the respawn was the only thing that
 ever helped. **Stop looking for a knob. There isn't one.**
 
-### The other route, also closed
+### The other TWO routes, also closed - M175 measured the third binary
+
+**There were three encoder binaries, not two.** `tinyvenc8` sat in the card
+image, named once in RE_FINDINGS in passing, spawnable by the existing `vic_fw=8`
+with no upload - and had never been run. It has now been:
+
+| | pixels | cadence | `frame_events` |
+|---|---|---|---|
+| `fw=5` tinyvenc5 | 1920x1080 whole frames | one per process, then livelock | 0 |
+| `fw=7` tinyvenc7 | **16 bytes** | continuous 60 Hz, real IRQs | 1621 in 57 s |
+| `fw=8` tinyvenc8 | **960x540** whole frames | one per process, then livelock | 0 |
+
+tinyvenc8 produces real quarter-resolution video (NOT SPLASH, 213 distinct Y
+values) and shares tinyvenc5's exact bound. So continuous streaming is closed on
+this firmware **by measurement of every binary the card ships**, rather than by
+having tested two of three - which is what this file used to claim.
+
+Do not re-derive this from the prose below. If you want to re-check it,
+`sudo ./mz0380-m175-fw8-test.sh` costs one spawn.
+
+### The fw=7 route, in detail
 
 `fw` selects which binary the card spawns - `7` runs `./tinyvenc7`, anything
 else `./tinyvenc5` (M158). tinyvenc7 does **not** have the livelock and streams
@@ -155,6 +175,15 @@ both settled states, which is 5 samples and therefore an observation, not a
 finding.
 
 ### If you want to keep going, the honest options
+
+0. **Get a non-1080p source and test with it.** M174 found by reading that the
+   vb2 plane is sized from the negotiated geometry while the drain delivers the
+   detected one, and nothing compared them - so a 720p source would have handed
+   applications a 720p frame in a buffer labelled 1920x1080, silently. The guard
+   (`strict_geometry`, def 1) now refuses that instead, but **the non-1080p path
+   is correct by construction, not verified**. Any source that can output 720p
+   settles it. The 1080p regression check is `sudo ./mz0380-m168-v4l2-abi.sh` -
+   the guard sits on the working path.
 
 1. **Widen the spawn budget** so single-shot capture is at least repeatable.
    M157's `vic_fast_kill=0` is already the default and is the only candidate;

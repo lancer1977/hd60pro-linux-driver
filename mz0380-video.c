@@ -889,6 +889,56 @@ static int mz0380_start_streaming(struct vb2_queue *vq, unsigned int count)
 			 dev->capture.height,
 			 dev->capture.timeperframe.denominator /
 			 max_t(u32, dev->capture.timeperframe.numerator, 1));
+
+		/*
+		 * M174: the buffers and the card must agree on the frame size.
+		 *
+		 * Two geometries have always existed side by side and nothing
+		 * checked they matched. mz0380_queue_setup() sizes the vb2
+		 * plane from capture.width/height - what the application
+		 * negotiated, 1920x1080 unless it said otherwise - while the
+		 * drain measures and delivers
+		 * source_width * source_height * 3/2, what the card actually
+		 * wrote. On the only source this project has ever tested those
+		 * are the same number, so the gap has never shown.
+		 *
+		 * With a 720p source they differ: the card writes 1382400
+		 * bytes, the drain delivers them, and the application is
+		 * holding a buffer it was told is 1920x1080 with 1382400 bytes
+		 * of payload in it. Nothing errors. It just renders garbage,
+		 * which is the worst available outcome and precisely the class
+		 * of defect M168 was about.
+		 *
+		 * Refusing is the honest answer, and it is also the useful one:
+		 * the source-change event queued below tells a well-behaved
+		 * client to re-negotiate, S_FMT to the detected geometry then
+		 * resizes the buffers, and the capture works. Delivering the
+		 * mislabelled frame would leave the client no way to find out.
+		 *
+		 * NOTE: the non-1080p path is CORRECT BY CONSTRUCTION here, not
+		 * verified - this project has never had a non-1080p source. All
+		 * that is proven is that the old behaviour was wrong.
+		 */
+		if (mz0380_strict_geometry && dev->signal_locked &&
+		    dev->capture.source_width &&
+		    dev->capture.source_height &&
+		    (dev->capture.source_width != dev->capture.width ||
+		     dev->capture.source_height != dev->capture.height)) {
+			dev_err(&dev->pci->dev,
+				"refusing to stream: the source is %ux%u but the buffers were allocated for %ux%u, and this path has no scaler - the card would write %u bytes into a buffer described as %u. S_FMT to %ux%u (or VIDIOC_SUBSCRIBE_EVENT the source change) and try again\n",
+				dev->capture.source_width,
+				dev->capture.source_height,
+				dev->capture.width, dev->capture.height,
+				dev->capture.source_width *
+				dev->capture.source_height * 3 / 2,
+				dev->capture.width * dev->capture.height * 3 / 2,
+				dev->capture.source_width,
+				dev->capture.source_height);
+			if (dev->video_registered)
+				mz0380_signal_event(dev);
+			ret = -EPIPE;
+			goto error;
+		}
 	}
 
 	/*

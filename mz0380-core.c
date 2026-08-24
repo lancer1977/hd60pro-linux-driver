@@ -562,6 +562,53 @@ module_param_named(stall_eos_ms, mz0380_stall_eos_ms, uint, 0644);
 MODULE_PARM_DESC(stall_eos_ms,
 		 "M168: after a frame has been delivered, if this many ms pass with no further frame, error the vb2 queue so DQBUF returns -EIO instead of blocking forever - fw=5 is a single-shot grabber (def:2000; 0 = block forever, the pre-M168 behaviour)");
 
+/*
+ * M174: refuse to stream when the detected source geometry and the negotiated
+ * buffer geometry disagree.
+ *
+ * They have always been two separate numbers - mz0380_queue_setup() sizes the
+ * vb2 plane from capture.width/height, the drain measures and delivers
+ * source_width*source_height*3/2 - and nothing checked they matched. On a 1080p
+ * source they are the same value, which is every source this project has had.
+ * On a 720p source the card writes 1382400 bytes into a buffer the application
+ * was told is 1920x1080, nothing errors, and it renders garbage.
+ *
+ * With this on, that becomes -EPIPE plus a log line naming both geometries and
+ * the S_FMT that fixes it, and a source-change event so a client that
+ * subscribed can re-negotiate by itself.
+ *
+ * Set to 0 if a detection wobble ever refuses a capture that would have
+ * worked - the old behaviour is to stream anyway and let the frame be
+ * mislabelled.
+ */
+bool mz0380_strict_geometry = true;
+module_param_named(strict_geometry, mz0380_strict_geometry, bool, 0644);
+MODULE_PARM_DESC(strict_geometry,
+		 "M174: refuse STREAMON when the detected source geometry differs from the negotiated format, instead of delivering a frame that does not match the format the application was given (def:1; 0 = the pre-M174 behaviour)");
+
+/*
+ * M175: what a COMPLETE frame is, when the card is not writing source-sized
+ * frames.
+ *
+ * The completeness rule (M115, and M160 on the event path) is "a frame is done
+ * when the buffer holds source_width * source_height * 3/2 bytes". That is
+ * right for tinyvenc5, which writes a 1080p frame for a 1080p source, and it
+ * was written when tinyvenc5 was the only producer anyone had run.
+ *
+ * tinyvenc8 writes 777600 bytes - a complete 960x540 I420 frame, exactly a
+ * quarter of the source. The rule cannot tell that from a 1080p frame that is
+ * three-quarters written, so it waited forever and the first fw=8 run scored
+ * as "nothing delivered" while the driver's own log said, sixty times a second,
+ * that buf 0 held 777600 of 3110400 bytes.
+ *
+ * This says what to expect instead. 0 keeps deriving it from the source, which
+ * is every result before M175.
+ */
+unsigned int mz0380_expect_frame_bytes;
+module_param_named(expect_frame_bytes, mz0380_expect_frame_bytes, uint, 0644);
+MODULE_PARM_DESC(expect_frame_bytes,
+		 "M175: bytes that constitute a COMPLETE frame, when the card writes a geometry other than the source's (tinyvenc8 writes 777600 = 960x540 I420). 0 = derive it from the detected source, which is correct for fw=5 (def:0)");
+
 unsigned int mz0380_rx_strap;
 module_param_named(rx_strap, mz0380_rx_strap, uint, 0644);
 MODULE_PARM_DESC(rx_strap,

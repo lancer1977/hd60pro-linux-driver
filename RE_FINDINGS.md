@@ -11019,3 +11019,150 @@ conclusion just as convincingly. The script prints changes as they happen and
 reports "nothing moved - not even the lock bits" as a **failed experiment**
 rather than a negative result, and that distinction is what made the second run
 mean anything.
+
+---
+
+## M174 (source, 2026-08-24): the buffers and the card have always had separate ideas about the frame size
+
+Found by reading, not by running - no non-1080p source exists in this project,
+which is exactly why it survived.
+
+Two geometries have coexisted since the raw path was added:
+
+- `mz0380_queue_setup()` sizes the vb2 plane from `mz0380_current_sizeimage()`,
+  which is `capture.width * capture.height * 3/2` - **what the application
+  negotiated**, 1920x1080 unless it called S_FMT.
+- the drain measures completeness and delivers against
+  `capture.source_width * source_height * 3/2` - **what the card actually
+  wrote**, taken from the receiver's detection.
+
+Nothing has ever compared them, and nothing makes one follow the other. On a
+1080p source they are the same 3110400, which is every source this project has
+ever had, so the gap has never once shown.
+
+With a 720p source they differ and the failure is silent. The card writes
+1382400 bytes; the drain's `len < want` check passes because `want` is also
+1382400; `vb2_set_plane_payload()` records 1382400 into a plane of 3110400; and
+the application is handed a buffer it was told is 1920x1080 YU12 with a 720p
+frame inside it. No ioctl fails. It renders garbage.
+
+That is the same shape as M168's fourcc: **a correct payload with a wrong label,
+which nothing in the stack can detect and every consumer gets wrong.**
+
+### The fix, and what it deliberately does not do
+
+`strict_geometry` (def 1) makes stream start refuse when the detected source and
+the negotiated format disagree, with a message naming both geometries, both byte
+counts and the `S_FMT` that resolves it - and queues the source-change event
+M170 made subscribable, so a client that subscribed can re-negotiate without
+being told.
+
+It does **not** make the format follow the detection. That is the tempting fix
+and it is a trap here: `mz0380_query_signal()` now runs from `ENUM_INPUT` as
+well as `QUERY_DV_TIMINGS`, so a format that follows detection would resize
+itself underneath v4l2-compliance's format tests, which enumerate and set
+formats without any expectation that reading an input changes one. The M171/M172
+work is one re-run away from being undone that way. Refusing keeps
+negotiation entirely in the application's hands, where V4L2 puts it.
+
+`strict_geometry=0` restores the old behaviour, for the case where a detection
+wobble refuses a capture that would have worked.
+
+### Status
+
+**The non-1080p path is now correct by construction, not verified.** What is
+proven is that the previous behaviour was wrong. Verifying it needs a source
+this project does not have; the 1080p path must be regression-checked either
+way, since the guard sits directly on it.
+
+---
+
+## M175 (hardware, 2026-08-24): there was a THIRD encoder binary, nobody had run it, and it is now measured
+
+`NEXT_SESSION_START` has said for several sessions that continuous streaming is
+closed because both routes are blocked. There were three routes.
+
+`re-dump/fw/yuan_demo_sdi/tinyvenc8` is 447 KB of ARM dated March 2020. This
+file mentions it **once**, inside a sentence about SET_VIC byte 6. It had never
+been disassembled and never been spawned - and `vic_fw=8` reaches it with no
+upload and no rule broken, because the driver does
+`u32 fw = mz0380_vic_fw ?: ...` with no clamping.
+
+### Why it looked worth a spawn
+
+| | tinyvenc5 | tinyvenc8 |
+|---|---|---|
+| `EncodingGroup::mma_already_start` | **1 byte** | **8 bytes** |
+| `TK_MMA_*` calls in `encode_handler` | 2 start / 2 wait | 2 start / 2 wait |
+| `TK_MMA_*` calls in `fake_frame_process` | 2 start / 2 wait | **none** |
+| `fake_frame` strings | 4 | 1 |
+
+That first row is the livelock itself. M153 found `mma_already_start` read and
+never written in tinyvenc5, which makes `TK_MMA_WaitOneFrameComplete`
+unreachable, which is why the DMAC profile is never returned. A different SIZE
+is a different type - one flag versus eight - which is what per-profile state
+would look like.
+
+### Run 1 read as "nothing delivered". It was not.
+
+    poll-drain: buf 0 holds 777600 of 3110400 bytes - DMA still in flight, waiting
+
+sixty times a second, for twenty-five seconds. **777600 = 960 x 540 x 3/2**, a
+complete quarter-resolution I420 frame, exactly. The card was writing whole
+frames and the driver was discarding every one of them.
+
+The completeness rule (M115, M160) is "a frame is done at
+`source_width * source_height * 3/2`". That is right for tinyvenc5, which writes
+a 1080p frame for a 1080p source, and it was written when tinyvenc5 was the only
+producer anyone had run. It cannot tell a **whole 960x540 frame** from a
+**three-quarters-written 1080p one**, so it waited forever.
+
+`expect_frame_bytes` now says what a frame is; 0 keeps deriving it from the
+source, which is every result before this one.
+
+### Run 2, with the driver told what a frame is
+
+    10s, 777600 bytes = 1 whole 777600-byte frame
+    poll-drain: buf 0 holds 130816 of 777600 bytes - DMA still in flight, waiting
+    poll-drain: buf 0 holds 777600 bytes with no completion event; delivering
+    poll-drain: 1 frame(s) delivered and nothing for 5000 ms - end of stream
+
+    VERDICT: NOT SPLASH   Y 213 distinct values, UV 213
+
+**tinyvenc8 works and produces real 960x540 video - one frame per process, then
+the same freeze as tinyvenc5.** `frame_events=0`, producer watch saw no change.
+The 8-byte `mma_already_start` did not buy a second frame.
+
+### All three binaries, now measured rather than assumed
+
+| | pixels | cadence | `frame_events` |
+|---|---|---|---|
+| `fw=5` tinyvenc5 | 1920x1080 whole frames | one per process, then livelock | 0 |
+| `fw=7` tinyvenc7 | **16 bytes** | continuous 60 Hz, real IRQs | 1621 in 57 s |
+| `fw=8` tinyvenc8 | **960x540** whole frames | one per process, then livelock | 0 |
+
+Two of the three have pixels and no cadence; one has cadence and no pixels.
+**Continuous streaming is closed on this firmware** - and it is now closed by
+measurement of every binary the card ships, rather than by having tested two of
+three.
+
+fw=8 is not useless: 960x540 is a quarter of the data for the same single-shot
+cost, which is the cheaper option if a smaller still is wanted. It is not a
+better one - fw=5 gives full resolution for the same spawn.
+
+### Method note
+
+Two mistakes in one milestone, both mine, both the same shape.
+
+**"Both routes are closed" was in the handoff, and I repeated it for several
+turns before checking.** It was written when two binaries were known. The third
+was named in the tree, spawnable by an existing parameter, and never tried.
+A closure inherited from a document is not a measurement, and the cost of
+checking was one spawn.
+
+**Run 1's verdict said "NOTHING delivered" while printing the disproof
+underneath it.** The script tested for a fixed expected size and reported the
+mismatch as absence. That is M173's failed-experiment-versus-negative-result
+trap exactly, one milestone later, in a script written by the same person who
+had just written that note. The verdict now says: if `holds N of` shows a stable
+N, that N is the card's real frame size - re-run with `EXPECT=N`.

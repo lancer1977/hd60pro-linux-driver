@@ -698,6 +698,8 @@ extern bool mz0380_kick_repeat;
 extern bool mz0380_poll_drain_credit;
 extern unsigned int mz0380_poll_drain_ms;
 extern unsigned int mz0380_stall_eos_ms;
+extern bool mz0380_strict_geometry;
+extern unsigned int mz0380_expect_frame_bytes;
 void mz0380_credit_rearm(struct mz0380_dev *dev);
 extern unsigned int mz0380_rx_strap;
 extern bool mz0380_enable_dma;
