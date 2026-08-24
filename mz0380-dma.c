@@ -1802,6 +1802,33 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 		goto repoison;
 	}
 
+	/*
+	 * M160: the same completeness rule the poll-drain has had since M115,
+	 * on the path that actually fires now.
+	 *
+	 * The poison boundary marks how far the DMA has GOT, not that it has
+	 * finished. M115 learned that on the poll path and guarded it there;
+	 * this path was left unguarded because `frame_events` was 0 in every
+	 * run until fw=7 (M159), so it had never once executed against a live
+	 * producer. It then did the exact thing M115 warns about: delivered a
+	 * torn 16-byte prefix at ~60 Hz and re-poisoned the buffer underneath
+	 * an in-flight transfer, which also destroys the rest of the frame.
+	 *
+	 * `return` rather than `goto repoison` is the whole point. Leave the
+	 * partial buffer exactly as it is and the card finishes writing it;
+	 * a later event or the poll-drain then sees a complete frame.
+	 */
+	if (mz0380_event_require_complete) {
+		size_t want = (size_t)dev->capture.source_width *
+			      dev->capture.source_height * 3 / 2;
+
+		if (want && len < want) {
+			pr_info_ratelimited("%s: frame token %u holds %zu of %zu bytes on the completion event - DMA still in flight, left un-poisoned (M160; event_require_complete=0 to deliver torn prefixes)\n",
+					    dev->name, idx, len, want);
+			return;
+		}
+	}
+
 	pr_info_ratelimited("%s: frame token %u inferred H.264 length=%zu from 4-byte poison boundary (tail collision risk 2^-32; payload counters %08x/%08x/%08x were not used)\n",
 				    dev->name, idx, len, snapshot->payload[0],
 				    snapshot->payload[1], snapshot->payload[2]);

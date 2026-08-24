@@ -673,6 +673,7 @@ extern unsigned int mz0380_edidhunt_max_regs;
 extern unsigned int mz0380_edid_opcode;
 extern unsigned int mz0380_edid_timeout_ms;
 extern bool mz0380_buf_poison;
+extern bool mz0380_event_require_complete;
 extern unsigned int mz0380_poison_byte;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;

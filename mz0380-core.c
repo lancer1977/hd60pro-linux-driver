@@ -778,6 +778,29 @@ module_param_named(edid_timeout_ms, mz0380_edid_timeout_ms, uint, 0644);
 MODULE_PARM_DESC(edid_timeout_ms,
 		 "ms to wait for each synchronous EDID chunk (def:100; 0 is unsafe fire-and-forget)");
 
+/*
+ * M160: the M115 completeness check, on the completion-event path.
+ *
+ * M115 added it to the poll-drain only, because `frame_events` was 0 in every
+ * run this project had ever done - the event path was dead code and nobody
+ * could tell. `fw=7` (M159) makes real completion events fire at ~60 Hz, and
+ * the event path delivered a 16-byte torn prefix and then re-poisoned the
+ * buffer *while the DMA was still writing it*, which is precisely the failure
+ * M115's own comment describes.
+ *
+ * With this set, an event that arrives before the card has written
+ * width*height*3/2 bytes is left completely alone - not delivered, and
+ * crucially NOT re-poisoned - so the transfer can finish and a later pass
+ * picks it up whole.
+ *
+ * Set to 0 to reproduce the pre-M160 behaviour, which is the only way to see
+ * the torn prefixes again if they turn out to be the real transfer size.
+ */
+bool mz0380_event_require_complete = true;
+module_param_named(event_require_complete, mz0380_event_require_complete, bool, 0644);
+MODULE_PARM_DESC(event_require_complete,
+		 "M160: on a completion event, deliver only a complete w*h*3/2 frame; short ones are left un-poisoned so the DMA can finish (def:1)");
+
 bool mz0380_buf_poison = true;
 module_param_named(buf_poison, mz0380_buf_poison, bool, 0644);
 MODULE_PARM_DESC(buf_poison,

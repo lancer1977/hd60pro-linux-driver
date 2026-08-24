@@ -9732,3 +9732,98 @@ look instead of 20 ms:
 A length that grows means we were truncating it ourselves and the fix is
 host-side. A length still exactly 16 means the transfer really is one burst,
 and the target moves to the DMAC control word.
+
+
+---
+
+## M160 (hardware + fix, 2026-08-24): the completion events are REAL, the poll-drain never fired, and the 16 bytes are OUR bug
+
+The recovered summary from M159's run, and the `POLLDRAIN=2000` control:
+
+    (M159, POLLDRAIN=20)
+    poll-drain stopped after 0 deliveries, 0 kicks; producer watch saw 0 change(s)
+    stream stop: ... irq_total=41 frame_events=34 fifo_drops=0
+
+    (control, POLLDRAIN=2000)
+    poll-drain stopped after 0 deliveries, 0 kicks
+    stream stop: ... irq_total=30 frame_events=23 fifo_drops=0
+    26 'frame token' lines, every one length=16
+
+### `frame_events` is not zero any more
+
+**`frame_events=34` and `frame_events=23`.** That field has been **0 in every
+run in this file's history.** The completion path - the interrupt the card is
+supposed to raise when a frame lands - has never once fired under `fw=5`, and
+under `fw=7` it fires 34 times in a 700 ms stream, with `fifo_drops=0`.
+
+And `poll-drain stopped after **0 deliveries**` in both runs. So every one of
+those deliveries came through the **real completion-event path**. Under `fw=5`
+it is the exact opposite: `frame_events=0`, and the poll-drain finds the frame
+by scanning. The two builds do not merely differ in cadence - they deliver
+through different mechanisms, and only tinyvenc7 uses the one the hardware was
+designed around.
+
+### The `POLLDRAIN=2000` control was answered, but not by the mechanism intended
+
+The design was "give the card 2 s per look". It changed nothing - still exactly
+16 bytes - but **not because 16 is the transfer size**. `POLLDRAIN` only paces
+the *poll* fallback, which did 0 deliveries in both runs. The drain fires on the
+event, so the poll interval was never in the path being measured. The control
+was inert by construction. Recording that as a design error: *check which code
+path your variable is actually in before spending a spawn on it.*
+
+### What is really truncating the frame - and it is ours
+
+`mz0380_drain_frame_snapshot()` infers the length from the poison boundary,
+delivers whatever it finds, and then **re-poisons the buffer** - unconditionally,
+through `goto repoison`.
+
+M115 already knew this was wrong:
+
+> *only deliver a COMPLETE frame. The poison boundary marks how far the DMA has
+> got, not that it has finished, so polling a burst in flight yields a torn
+> prefix - the first run delivered 794368 bytes and then the real 3110400*
+
+...and added the `want = width*height*3/2` guard **to the poll-drain only**.
+The event path never got it, and nobody noticed, because with `frame_events=0`
+**that path had never executed against a live producer.** It was untested code
+that looked tested.
+
+So on every one of tinyvenc7's ~60 Hz completion events the driver read the
+buffer while the DMA was still filling it, delivered the 16 bytes that had
+landed, and then **re-poisoned the buffer underneath the transfer** - destroying
+the rest of the frame and guaranteeing the next event would find a short prefix
+too. A self-sustaining truncation, entirely host-side.
+
+That the length was *always exactly 16* is consistent: the event fires early in
+the transfer, and re-poisoning resets the boundary every time, so the driver
+samples the same early point of every frame.
+
+### The fix
+
+`mz0380_drain_frame_snapshot()` now applies the M115 rule. A short frame is
+**left completely alone** - not delivered, and crucially **not re-poisoned**
+(`return`, not `goto repoison`) - so the DMA finishes and a later event or the
+poll-drain picks it up whole.
+
+`event_require_complete=0` restores the old behaviour, which is the only way to
+see the torn prefixes again if it turns out the card really does send 16 bytes.
+
+### The run
+
+    sudo POLLDRAIN=20 VICFW=7 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
+        ./mz0380-m55-real-capture.sh 4
+    sudo dmesg | grep -aE "poll-drain|stream stop|producer watch|in flight"
+
+- **Whole frames delivered, more than one** - that is streaming video, and the
+  remaining work is quality, not cadence.
+- **`DMA still in flight` lines and then nothing** - the card starts a frame per
+  event but never finishes it. That is a real card-side truncation and the
+  target moves to the DMAC descriptor, with the `<< 10` control field the first
+  place to look.
+- **Whole frames but still only one** - the completeness rule is right and
+  something else bounds the cadence.
+
+Do not judge this run on the captured byte count alone: with 4 requested frames
+and a 60 Hz producer, `frame_events` and the delivered lengths in dmesg are the
+result.
