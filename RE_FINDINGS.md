@@ -10412,3 +10412,610 @@ frame and never said so - exactly as predicted.
 A default that every caller overrides is not a default, it is dead code with an
 opinion. The way to find these is to run the software the way a user would,
 once, rather than always through the harness that knows the magic arguments.
+
+---
+
+## M168 (source, 2026-08-24): the node lied about its own format and then refused to describe itself - and it hung instead of admitting the one-frame bound
+
+M167 loaded the driver the way a user would and found six defaults that could
+not capture. M168 asks the next question in the same direction: once the node
+exists, does it describe **the device it actually is**? Three answers, all no,
+all on the shipping defaults, and all invisible to this tree because every
+script here drives `v4l2-ctl` with the format already decided and never
+negotiates.
+
+### 1. The advertised fourcc was NV12. The payload is I420.
+
+M130 settled the layout on hardware: Y, then a 960x540 **U** plane, then a
+960x540 **V** plane - confirmed visually (a red pedal on a neutral mat, no cast)
+and by correlation, with the U/V-swapped rendering giving the textbook red/blue
+swap. RE_FINDINGS says it in three places, and `mz0380-m55-real-capture.sh`
+prints `-pixel_format yuv420p` because getting it wrong "cost two viewing
+mistakes in one session".
+
+`mz0380-video.c` advertised `V4L2_PIX_FMT_NV12` anyway - on the poll-drain path,
+which is the default path since M166. NV12 is the same 3110400 bytes with the
+chroma **interleaved** rather than planar, so nothing fails loudly: ffmpeg,
+GStreamer and OBS all accept the buffer and render the magenta/green interleave
+banding this document already describes at M130. The frame was always right.
+The label was wrong, and the label is the only thing an application has.
+
+Fixed: the poll-drain path now advertises `V4L2_PIX_FMT_YUV420`, which is I420.
+`sizeimage` and `bytesperline` are unchanged - `w*h*3/2` and `w` either way - so
+no size arithmetic anywhere moves.
+
+The **nosg** fake-frame path keeps NV12 deliberately. Its layout was never
+confirmed either way: different producer, different 1920x1107 geometry, and flat
+logo content where interleave banding would not show. Correcting it would be a
+guess dressed as a measurement, and it is a diagnostic path that defaults off.
+
+### 2. The node contradicted itself within one ioctl sequence
+
+`ENUM_FMT` returned the raw format. `ENUM_FRAMESIZES` and `ENUM_FRAMEINTERVALS`
+still tested `pixel_format != V4L2_PIX_FMT_H264` and returned **-EINVAL for the
+very format `ENUM_FMT` had just handed out**. A client that enumerates before
+opening - the documented order, and what GStreamer's `v4l2src` and
+`v4l2-ctl --list-formats-ext` do - was told the device supports no sizes and no
+frame rates.
+
+The cause is ordinary drift: three places independently decided the fourcc, and
+two of them were never revisited when M111 added the raw path. There is now one
+`mz0380_current_pixelformat()` and every call site asks it - `fill_pix_format`,
+`ENUM_FMT`, `TRY_FMT`, `S_FMT`, `ENUM_FRAMESIZES`, `ENUM_FRAMEINTERVALS` and the
+procfs line. `struct mz0380_capture_state.pixelformat` was **deleted** rather
+than kept in sync: `poll_drain_ms` and `stream_nosg` are both `0644`, so the
+advertised format can change under a running driver and any cached copy is a
+stale answer waiting to be printed. The procfs view had in fact been printing
+`H264` unconditionally since bring-up, because the field was assigned once at
+init and never again.
+
+### 3. It hung rather than reporting the bound
+
+Under `fw=5` the card is a single-shot grabber and M166 closed that as a proven
+bound. The driver did nothing about it, so an application that kept reading -
+ffmpeg, OBS, anything that streams rather than grabs - blocked in `DQBUF`
+**forever** after receiving its one correct frame. A hang is the worst available
+way to report a known limit: it is indistinguishable from broken hardware, a
+broken driver, and a wedged card, and this project has spent sessions telling
+those apart.
+
+`stall_eos_ms` (default 2000, 0 = old behaviour) now errors the vb2 queue when a
+frame **has** been delivered and nothing follows it for that long. `DQBUF` then
+returns `-EIO` and `poll()` reports `EPOLLERR`, which is how V4L2 says the source
+has stopped; applications finalise their output and exit with the frame they
+got. `vb2_queue_error()`'s own documentation confirms the flag is cleared by
+`vb2_streamoff()`, so STREAMOFF/STREAMON is a clean way to ask for another
+frame.
+
+Three properties of the gate matter:
+
+- It arms **only after the first delivery**. The first frame lands ~1.2 s after
+  stream start behind `start_delay_ms`; erroring before it would break every
+  capture in the tree.
+- It never respawns anything. A respawn does yield one more frame (M39), but
+  each costs part of the 8-18 spawn budget, so faking a video stream that way
+  would wedge the card within seconds of an OBS session.
+- Under `vic_fw=7` it cannot fire: those frames are 16 bytes, fail the M115
+  completeness check, are never delivered, and so `delivered` stays 0. fw=7
+  keeps the old blocking behaviour, which is the correct answer for a path whose
+  producer is genuinely still running.
+
+This also removes the hazard M116 documented in `mz0380-m55-real-capture.sh`:
+asking for more frames than the card can deliver used to mean `timeout` SIGTERMed
+`v4l2-ctl` mid-write and the last frame lost its unflushed stdio tail. The reader
+now exits on its own, with whole frames only.
+
+### Also corrected
+
+`enable_video`, `enable_dma` and `dma_handshake` still described themselves as
+"disabled by default", "off by default" and "M4 diagnostic" in their
+`MODULE_PARM_DESC` strings. M166 flipped all three to `true` and the help text
+was not updated, so `modinfo` contradicted the code - the same defect M167's
+method note is about, one layer up.
+
+### Verified on hardware, 2026-08-24
+
+`sudo ./mz0380-m168-v4l2-abi.sh`, one spawn, on 7.2.0-1-cachyos:
+
+    [0]: 'YU12' (Planar YUV 4:2:0)
+            Size: Discrete 1920x1080
+                    Interval: Discrete 0.017s (60.000 fps)
+            ... 4 discrete sizes, intervals for each
+
+    <VIDIOC_DQBUF: failed: Input/output error
+    v4l2-ctl rc=0 after 7s, captured 3110400 bytes
+
+    poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
+    poll-drain: 1 frame(s) delivered and nothing for 2000 ms - signalling end
+      of stream (DQBUF will return -EIO)
+    poll-drain stopped after 1 deliveries, 0 kicks
+
+    VERDICT: NOT SPLASH   Y 212 distinct values, UV 219
+
+All three: the fourcc is `YU12` (`V4L2_PIX_FMT_YUV420`), `ENUM_FRAMESIZES` now
+answers for the format `ENUM_FMT` hands out - four sizes, each with its
+intervals, where it previously returned `-EINVAL` - and a reader that asked for
+three frames on a card that has one **exited by itself in 7 s with exactly one
+whole frame**, where it would have blocked until something killed it. Note
+`rc=0`: the `-EIO` ends the stream without making the tool report failure.
+
+### What the verification run exposed, none of it in the capture path
+
+**The check itself was wrong.** It parsed `--list-formats-ext` for
+`Pixel Format :`, which is `--get-fmt-video`'s spelling and does not appear in
+that output, so it read the fourcc as empty and printed
+`FAIL fourcc = 'none' - expected YU12` **against a driver that was correct** -
+the same class of mistake as the bug it was checking for. It now matches the
+`[0]: 'YU12'` form that command actually prints.
+
+**`mz0380-m127-splash.py` was still handing out the NV12 viewing hint.** Its
+NOT SPLASH verdict printed
+`ffplay -f rawvideo -pixel_format nv12 ...`, which is precisely the trap M130
+documents, on the line a reader sees at the exact moment they have a real frame
+in hand. `mz0380-m126-score.py` had the same line. Both now say `yuv420p`;
+`mz0380-m130-chroma.py` already did.
+
+**The driver's own delivery line said `inferred H.264 length=`** for a raw I420
+frame - format-agnostic inference, mislabelled, on the only path that runs. Now
+`inferred payload length=`.
+
+**The buffer priming line said the same thing**: "H.264 payload size will be
+inferred from the bounded changed prefix". Also now `payload size`.
+
+**And the extent report at stream stop can imitate a failure.** The run printed
+
+    stop buf[0] @0x0000000100000000 head=aa aa aa ... | 0/1024 sampled pages
+      touched, last @0x0
+
+on the buffer that had **just delivered a correct 1080p frame**. The drain
+re-poisons immediately after copying, so by the time the report scans, a
+successful buffer is 0xaa again and reads exactly like one the card never wrote
+to. "0/1024 pages touched" is load-bearing evidence in several diagnoses in this
+file, and until now the successful case could imitate the empty one. Each
+`stream_buf` now counts the frames delivered out of it and the line says so:
+
+    | 0/1024 sampled pages touched, last @0x0 | 1 frame(s) delivered from it
+      (so it is poison again by design, not untouched)
+
+The pattern across all of it is the M168 pattern one layer out: the payload has
+been I420 since M129, the capture path was corrected then, and every *name* and
+*diagnostic* around it stayed as it was - H.264, NV12, and a page-touch count
+that describes the buffer after the driver has wiped it. None of it changed a
+captured byte. All of it changes what the next reader concludes.
+
+### Method note
+
+M167's note says to run the software the way a user would. M168 is the same rule
+applied one level out: the V4L2 node is not the thing the driver writes, it is
+the thing an application **reads**, and no script in this tree has ever read it.
+Every capture here passes `--stream-to` with the geometry known in advance, so
+the entire format-negotiation surface - the part a real application depends on
+first - was never exercised by anything, ever.
+
+---
+
+## M169 (source, 2026-08-24): the spawn budget was never actually counted, so the experiment this project keeps asking for could not be run
+
+NEXT_SESSION_START's first open question has had the same shape for several
+sessions:
+
+> **If a session passes 18 spawns on one power cycle without wedging, that is
+> the answer.**
+
+Nothing in this tree can produce that number.
+
+- The driver counted `stream_cycles`, not spawns. It increments on every stream
+  cycle **including the ones where SET_VIC was deliberately skipped**
+  (`setvic_once`), and it was never exposed anywhere - not in procfs, not in the
+  stream-stop line. `nosg_spawns` is a real count but only of the diagnostic
+  path's per-frame respawns.
+- Whatever count existed reset at every `insmod`, and **every hardware script in
+  this tree rmmods and reinsmods per run**. So each run starts from zero.
+- `dmesg` would have spanned the reloads, since each spawn prints a
+  `stream start: SET_VIC(...)` line - except that the same scripts open with
+  `dmesg -C`.
+
+So the budget has been tracked by memory and by re-reading the handoff's prose.
+That is how a session ends up recording "12 spawns on top of whatever the
+current power cycle had already used", which is not a measurement, and how the
+first symptom of the cliff has always been arriving at it.
+
+### What now counts
+
+`dev->encoder_spawns` increments at the driver's **single** SET_VIC send site,
+which is definitionally every fork of a fresh `tinyvenc5` - the nosg loop's
+per-frame respawns reach that site through `mz0380_dma_start()` and so are
+included. It increments on the **fire**, not on the result, for the reason the
+comment already sitting above that call gives: a SET_VIC that times out may
+still have spawned an encoder, and a budget that counted only successes would
+under-report exactly when the card is in trouble.
+
+It warns once at 8 - the bottom of the historical wedge range - and
+`/proc/mz0380-state` carries `enc spawns : N since insmod`.
+
+### Counting across reloads, which is the granularity the wedge has
+
+`mz0380-spawns.sh` accumulates that per-insmod count into `/run`, which a tmpfs
+clears at every boot. That is the right granularity **by construction** rather
+than by bookkeeping: the handoff records that a soft PC shutdown is enough to
+reset the card, so a host boot bounds a card power cycle. It is wrong for a warm
+reboot, where the card may stay powered while `/run` is cleared, so `reset`
+exists for when you know better.
+
+`commit` adds only the delta since the last commit and treats a count that went
+**backwards** as a fresh insmod, so it is idempotent within a load and correct
+across them. `mz0380-m55-real-capture.sh` calls it from `cleanup()` rather than
+at the end of the script, so a run that aborts early or is interrupted still
+banks the spawns it already spent - those are the runs where the remaining
+budget matters most.
+
+    ./mz0380-spawns.sh          # no root needed, reads the tally + live count
+    sudo ./mz0380-spawns.sh commit
+    sudo ./mz0380-spawns.sh reset
+
+The verdict line is the experiment: below 8 is the safe range, 8-18 is the
+gamble, and past 18 without a wedge is M157's answer.
+
+Working on hardware as of the M168 run:
+
+    === 7. spawn budget ===
+    spawns this power cycle: 1  (this load has spawned 1)
+      Below 8 - the range where the card has never wedged.
+
+That tally starts from this boot's M168 run; spawns spent before the instrument
+existed are not in it.
+
+### Method note
+
+The project had a stated next experiment, a stated success criterion, and no
+instrument. The reason is worth naming because it recurs: the number existed in
+`dmesg`, and the harness that runs the experiment **clears `dmesg` first**. Every
+piece was present and the measurement was still impossible. Before designing the
+next experiment, check that something can actually read out its result.
+
+---
+
+## M170 (source, 2026-08-24): the parts of the driver an application talks to, that no application had ever talked to
+
+M168 fixed what the V4L2 node said about its **format**. The same question asked
+about everything else the node exposes found three more, plus a build and a
+front door that both point at deleted code.
+
+### The source-change event was dead at both ends
+
+`mz0380_signal_event()` builds a `V4L2_EVENT_SOURCE_CHANGE` and queues it. It is
+`EXPORT_SYMBOL_GPL`, it has been there since bring-up, and **nothing has ever
+called it** - `grep` across the tree returns the definition and no callers.
+
+Had anything called it, nobody could have received it: the ops table set
+
+    .vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+
+which accepts `V4L2_EVENT_CTRL` and returns `-EINVAL` for everything else. So
+`SUBSCRIBE_EVENT(SOURCE_CHANGE)` failed for every client. `PLAN.md` lists the
+feature as implemented.
+
+Both halves fixed together, because either alone is still nothing:
+`mz0380_subscribe_event()` routes `SOURCE_CHANGE` to
+`v4l2_src_change_event_subscribe()`, and `mz0380_query_signal()` now compares
+the new detection against what was last reported and emits on a change - lock
+gained, lock lost, or different timings.
+
+There is no background poller, so the event fires when something asks
+(`QUERY_DV_TIMINGS`, `ENUM_INPUT`, arming a stream). That is useful to a polling
+client and honest about what it is. A client that only sleeps on the event needs
+a poller, deliberately not added: it would drive receiver I2C on a timer, and
+M74 is the record of what a watch running alongside a capture costs.
+
+### The HDMI input could not say whether anything was plugged into it
+
+`mz0380_enum_input()` `memset` the whole struct and filled in three fields. So:
+
+- `capabilities` was **0**, with no `V4L2_IN_CAP_DV_TIMINGS`, even though this
+  driver implements the entire DV-timings ioctl set. That flag is how a client
+  learns those calls are worth making, and they are the *only* way to get
+  geometry off this card, because the card never pushes format to the host (M6).
+  A well-behaved application therefore never asked.
+- `status` was **0**, which in V4L2 means *no problems*. The node asserted a
+  healthy source unconditionally, cable in or out. `V4L2_IN_ST_NO_SIGNAL` is the
+  standard bit for exactly the question this project has repeatedly answered by
+  hand.
+
+Both are filled in now. The live query is skipped while streaming - it reads the
+MST3367 over the mailbox I2C proxy and streaming already knows what it locked -
+and only the selected input is measured, since the receiver serves one at a
+time. The others report `NO_SIGNAL` rather than claiming a clean bill of health
+for a path nothing has looked at.
+
+### `make load-streaming` failed on a correctly-installed system
+
+Its `fw-install` prerequisite tested for `/lib/firmware/mz0380/MZ0380.HD.HEX`
+and aborted with instructions to go and extract it from the Windows installer.
+**That blob is the firmware-upload path, which was deleted from this tree.**
+Nothing reads it. The only file the driver requests is the optional
+`MZ0380.FW.TXT` version sidecar. The target now reports the sidecar's presence
+and never fails. `load`/`load-streaming` stopped spelling out parameters that
+have been defaults since M166, and `capture-h264` - which asked a one-frame card
+for six frames of a format it does not produce - became `capture`, asking for
+one.
+
+### The README described a different driver
+
+It opened with "The host driver uploads firmware", gave a three-step bring-up
+sequence in which two steps pass `firmware_upload=1`, documented that parameter
+in its table, and closed by warning readers to be careful before "flipping
+`firmware_upload=1` on production hardware". **That parameter does not exist**;
+`insmod` rejects it. It also promised "a V4L2 H.264 capture device" for a raw
+I420 payload, listed defaults that changed in M166, and had a stray
+`sudo chown` line loose in the Status section.
+
+The front door was the last place in the tree still advertising the one
+operation the project has a standing rule against. Rewritten around what the
+device actually is, leading with the single-frame bound. `PLAN.md` carries a
+SUPERSEDED banner naming each of its false claims rather than being quietly
+left to be believed.
+
+### Status
+
+Source-verified, both kernels clean. `mz0380-m170-readiness.sh` is the check:
+`v4l2-compliance` plus the first repeat-capture test this project has ever run.
+
+### Method note
+
+M168's note said the node is what an application *reads*. M170 is the rest of
+that surface, and the pattern is consistent: every part of this driver that a
+script in this tree drives has been debugged to death, and every part that only
+an outside application would touch - input status, event subscription, the
+build's own load target, the README - was never executed by anything and quietly
+described a driver that no longer exists.
+
+---
+
+## M171 (hardware, 2026-08-24): v4l2-compliance, run for the first time - 148 tests, 16 failures, three causes
+
+`mz0380-m170-readiness.sh` on the card. The repeat-capture half passed
+outright; the conformance half found three defects, each multiplied across the
+five inputs.
+
+### Repeat capture works - the still grabber is usable as one
+
+Three consecutive stills, one encoder spawn each:
+
+    /tmp/m170-1.i420  3110400 bytes  sha 0d776cc4b79a61f7  NOT SPLASH, Y 214
+    /tmp/m170-2.i420  3110400 bytes  sha 46ea2b605a72caef  NOT SPLASH, Y 212
+    /tmp/m170-3.i420  3110400 bytes  sha aee605059e797904  NOT SPLASH, Y 213
+
+Every one a whole frame, every one a real picture, and **all three hashes
+different** - so each STREAMOFF/STREAMON genuinely captured the scene again
+rather than re-reading one buffer. M39 said a fresh spawn yields one more frame;
+this is the first run that took three in a row and checked they were whole and
+distinct. Spawn tally ended at 3, still below the 8-18 wedge range.
+
+### 148 tests, 132 succeeded, 16 failed, 5 warnings
+
+**1. `VIDIOC_G/S_CTRL` and `G/S/TRY_EXT_CTRLS`: "returned control value out of
+range", "invalid control 009909cb" (10 failures).**
+
+`0x009909cb` is `V4L2_CID_MPEG_VIDEO_GOP_SIZE`, declared `min=1 max=300
+default=30`, and reporting **0**. `/proc/mz0380-state` shows where the 0 came
+from:
+
+    gop hw     : 0 raw=00000000 via BAR5[0x0080] mask=0xffffffff shift=0
+    bitrate hw : 0 raw=00000000 via BAR5[0x005c] mask=0xffffffff shift=0
+
+The `mz0380_sync_*` helpers read those BAR5 fields and adopt whatever they hold.
+The fields are written only by the H.264 path; this driver's capture path is raw
+I420, so they have never been written and read back as zero. **Zero means
+UNSET.** `v4l2-ctl --list-ctrls` was showing `video_bitrate ... min=262144 ...
+value=0` for the same reason.
+
+The bitrate sync already *knew*: it printed
+`candidate bitrate field is outside current V4L2 range [262144..12582912]` and
+then stored the value anyway. Meanwhile `mz0380_sync_candidate_b_frames()` and
+`mz0380_sync_candidate_record_mode()` had it right all along - they range-check
+and return false. So the fix is not a new policy, it is making the other six
+agree with the two that were already correct: `mz0380_sync_in_range()` rejects
+an out-of-range readback and leaves the cached value, which is the declared
+default until userspace sets something.
+
+The GOP range lived in `mz0380-video.c` while the readback lives in
+`mz0380-core.c`, so the check could not have been written where it was needed.
+`MZ0380_MIN_GOP`/`DEFAULT`/`MAX` moved to `mz0380.h` beside the other ranges.
+
+**2. `VIDIOC_G/S_PARM`: `!cap->readbuffers` (5 failures).**
+
+The node advertises `V4L2_CAP_READWRITE` and `vb2_fop_read`, so `read()` is a
+supported I/O method - and `parm.capture.readbuffers` was left 0 by the memset.
+A device claiming `read()` support while declaring it has no buffers to read
+into. Now reports `MZ0380_READ_BUFFERS`.
+
+**3. `VIDIOC_ENUM/G/S/QUERY_DV_TIMINGS`: `g_timings.bt.width !=
+enumtimings.timings.bt.width` (1 failure).**
+
+`G_DV_TIMINGS` returned `detected_timings` and `S_DV_TIMINGS` was a bare
+`return 0` under a comment reading "card auto-detects; setting is a
+no-op-but-validate" - which neither noted the value nor validated it. So S
+followed by G returned something unrelated to what was set.
+
+V4L2 keeps these distinct: **G returns what was SET, QUERY returns what is
+DETECTED.** They are now separate fields. `S_DV_TIMINGS` validates against
+`mz0380_timings_cap`, returns `-EBUSY` while streaming, and stores; a successful
+detection also updates the set value so G tracks reality for a client that never
+calls S. Nothing about capture changes - stream start reads the detection, as it
+always did.
+
+**Warning, not fixed:** `V4L2_CID_DV_RX_POWER_PRESENT not found` on every input.
+The standard control for "is the source powering the hotplug pin". The driver
+has the underlying information; exposing it is a genuine addition rather than a
+correction, and it is a warning.
+
+### Re-run: 132/16 -> 142/6
+
+The control-range, `readbuffers` and DV-timings-contract fixes all took. The six
+that remained were of two kinds, and five of them were **introduced by the fix
+itself**.
+
+**`testCanSetSameTimings` (5).** `S_DV_TIMINGS` gained a bare
+`vb2_is_busy()` -> `-EBUSY`. Compliance allocates buffers and then sets the
+timings it already has, which must succeed: setting a value to itself
+invalidates nothing. `-EBUSY` is for a change that would resize the format under
+allocated buffers, so the test is now `busy AND the timings differ`.
+
+**`fmt.fmt.pix.width >= enumtimings.timings.bt.width * 1.5` (1).** Compliance
+set a small timing, asked for the format, and was still told 1920x1080 -
+`S_DV_TIMINGS` updated its own stored copy and nothing else. For an HDMI
+receiver **the capture format is the source geometry**: there is no scaler on
+this path and the delivered frame is exactly `width*height*3/2` of I420. So
+setting the timings now snaps `capture.width/height` through
+`mz0380_find_mode()` and picks the matching interval.
+
+Worth noting what was NOT changed with it: the *detection* path still leaves
+`capture.width/height` alone. Making the advertised format follow the detected
+source is the coherent design for a capture card - and it is what the
+source-change event wired up in M170 exists to announce - but it cannot be
+validated without a non-1080p source, and if the card turns out to deliver
+1080p-sized frames for a 720p input the drain's "does not fit vb2 plane" check
+would start rejecting every frame. It stays on the open list with the rest of
+the non-1080p question.
+
+### Second re-run: 142/6 -> 147/1
+
+Both M172 fixes took. The single remaining failure was
+`v4l2-test-io-config.cpp(210): field == V4L2_FIELD_NONE`.
+
+`mz0380_fill_pix_format()` set `pix->field = V4L2_FIELD_NONE` as a literal. This
+driver's `mz0380_timings_cap` advertises `V4L2_DV_BT_CAP_INTERLACED`, so
+`ENUM_DV_TIMINGS` enumerates two interlaced modes - index 11 and 13, 1080i50 and
+1080i60. Compliance sets one, asks for the format, and is told a **progressive
+format for an interlaced signal**.
+
+The field now follows the negotiated timings. `V4L2_FIELD_INTERLACED` rather
+than `ALTERNATE` because this path delivers a whole frame per buffer, and for
+interlaced BT timings `bt.height` is already the frame height - both interlaced
+entries report `Active height: 1080` - so the geometry stays consistent either
+way. The delivery path uses the same helper, so a buffer never claims a
+different field from the format negotiated for it.
+
+`mz0380_current_field()` also answers `NONE` unconditionally under
+`stream_nosg`: that path is the card's fixed progressive test pattern whatever
+timings were set, and its delivery site says `NONE` outright. Without that the
+format and the buffer would have disagreed on the one path where the answer is
+not in doubt.
+
+### Third re-run: 148 tests, 148 succeeded, 0 failed
+
+    Total for mz0380 device /dev/video0: 148, Succeeded: 148, Failed: 0, Warnings: 5
+
+**v4l2-compliance is clean.** 132/16 -> 142/6 -> 147/1 -> 148/0.
+
+The five remaining warnings are all `V4L2_CID_DV_RX_POWER_PRESENT not found`,
+one per input, and that is deliberately still open - see below.
+
+### Method note
+
+The conformance suite has existed for the whole life of this project and had
+never been pointed at the driver. It found in one run, costing zero encoder
+spawns, three defects that no amount of capturing would have surfaced - because
+all three live in the half of the ABI that answers questions rather than moves
+pixels, and nothing in this tree asks questions.
+
+The follow-up is the second half of that note: **five of the six remaining
+failures were introduced by the fix for the first sixteen.** A conformance suite
+is not a checklist you satisfy once; it is the only thing in this tree that
+notices when a correction goes too far. `mz0380-compliance.sh` makes re-running
+it one word, and it costs nothing against the spawn budget.
+
+
+---
+
+## M173 (open, 2026-08-24): the last compliance warning needs a fact this project has only ever guessed at
+
+`V4L2_CID_DV_RX_POWER_PRESENT` is the standard control for "is a powered source
+attached to this input" - the +5V line, distinct from whether the receiver has
+locked. Exporting it would clear the last five warnings and is genuinely useful:
+it is how an application distinguishes *nothing plugged in* from *plugged in but
+not transmitting*, which is a distinction this project has repeatedly made by
+hand and at some cost.
+
+The driver appears to have the bits. `mz0380-mst3367.c` says of R55:
+
+>  we consistently read 0x03 - bits the driver does not use, most plausibly
+>  5V/clock presence.
+
+and M45 reasoned the same way: "The natural reading is 5V/cable presence and/or
+clock detect." With a source attached, R55 currently reads **0x7f** - bits 0 and
+1 set, outside the 0x3c lock mask the GPL driver gates on.
+
+**"Most plausibly" and "the natural reading" are not measurements.** Wiring a
+standard V4L2 control to a hypothesis would export a guess to every application
+that reads it, and would do it in the one place a client is entitled to trust -
+worse than the warning, which at least says "not found" honestly.
+
+M45 wrote the test years of sessions ago and it was never run: does R55 & 0x03
+track the cable? It costs **zero encoder spawns** and needs only an unplug:
+
+    cat /proc/mz0380-hdmi | grep '55='        # source connected  -> 55=7f now
+    # unplug the HDMI cable
+    cat /proc/mz0380-hdmi | grep '55='        # expect the low bits to drop
+
+`/proc/mz0380-hdmi` is world-readable, so this needs no root and no reload.
+
+### ANSWERED, 2026-08-24, on hardware: the guess is WRONG
+
+`mz0380-m173-5v-test.sh`, one unplug/replug, zero encoder spawns:
+
+    18:24:25  R55=0x83   bits0-1=3   lock(0x3c)=0x00     <- cable out
+    18:24:27  R55=0x03   bits0-1=3   lock(0x3c)=0x00     <- settled, out
+    18:24:38  R55=0x83   bits0-1=3   lock(0x3c)=0x00     <- replugging
+    18:24:40  R55=0xff   bits0-1=3   lock(0x3c)=0x3c     <- acquiring
+    18:24:42  R55=0x7f   bits0-1=3   lock(0x3c)=0x3c     <- settled, locked
+
+The lock bits went `0x3c -> 0x00 -> 0x3c`, which is what makes this conclusive
+rather than null: the read is live and the cable really was out. **Bits 0-1 held
+the value 3 through all of it.** They are not 5V presence, not cable presence,
+and not clock presence - they do not move at all.
+
+`V4L2_CID_DV_RX_POWER_PRESENT` therefore stays unimplemented and
+v4l2-compliance keeps its five warnings. The driver has no +5V detect. "Locked"
+is not a substitute: a source that is powered but not transmitting reads
+lock = 0, which is the exact distinction the control exists to make, so wiring
+it to the lock bits would answer the question wrongly rather than not at all.
+
+### What the same trace did establish
+
+Decomposing the four observed values by what is constant and what moves:
+
+| | mask | |
+|---|---|---|
+| set in every sample, cable in or out | `0x03` | not status - stuck high |
+| set only with the cable in | `0x7c` | tracks the signal |
+| the driver's lock mask | `0x3c` | a **subset** of what tracks |
+
+**Bit 6 tracks the cable exactly as the 0x3c lock bits do, and neither this
+driver nor hdcapm gates on it.** That is not a reason to change the mask - 0x3c
+has correctly reported LOCKED in every capture this project has made, and
+widening a working detect for tidiness is how a working detect stops working -
+but it is now a recorded fact rather than an unexamined one.
+
+**Bit 7 is not a status bit in the usual sense.** It was set at 18:24:25 (just
+after the unplug), 18:24:38 and 18:24:40 (during the replug), and clear in both
+*settled* states, 0x03 (out) and 0x7f (locked). That is consistent with a
+transition or instability flag. Five samples is not enough to call it, and it is
+recorded here as an observation with its sample count - which is the whole
+difference between this entry and the one it replaces.
+
+### Method note
+
+M45 wrote "most plausibly 5V/clock presence" and "the natural reading is 5V/cable
+presence". Both were reasonable. Both were wrong, and the test that would have
+shown it cost **zero encoder spawns, no root, and forty seconds** - it needed a
+person to pull a cable, which is the only reason it sat unrun for the life of
+the project.
+
+The near-miss is worth recording too. The first run of the test changed nothing
+at all, because the cable was still in. Two `cat`s of R55 would have been
+indistinguishable from a real negative, and would have "confirmed" the opposite
+conclusion just as convincingly. The script prints changes as they happen and
+reports "nothing moved - not even the lock bits" as a **failed experiment**
+rather than a negative result, and that distinction is what made the second run
+mean anything.

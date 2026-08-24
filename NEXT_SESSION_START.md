@@ -59,17 +59,118 @@ with it off, a plain `insmod` delivered nothing at all and looked like dead
 hardware. Every real frame in this project came from a script passing
 `POLLDRAIN=20` by hand.
 
-Expect from a plain load: **one correct 1080p I420 frame, then a freeze.** That
-is the hardware's actual behaviour. Do not "fix" it by respawning per frame -
-each respawn costs one of the 8-18 spawn budget (`## Card state`), so an OBS
-session would wedge the card within seconds.
+Expect from a plain load: **one correct 1080p I420 frame, then a clean
+end-of-stream.** The single frame is the hardware's actual behaviour. Do not
+"fix" it by respawning per frame - each respawn costs one of the 8-18 spawn
+budget (`## Card state`), so an OBS session would wedge the card within seconds.
+
+**M168 stopped it being a hang.** The frame was always correct; the node
+describing it was not. It advertised NV12 for a payload that is planar I420
+(M130), so every application that trusted the driver rendered interleave
+banding; `ENUM_FRAMESIZES` and `ENUM_FRAMEINTERVALS` still tested for H.264 and
+returned `-EINVAL` for the format `ENUM_FMT` had just handed out; and after the
+one frame `DQBUF` blocked forever, which is indistinguishable from dead
+hardware. All three are fixed - one `mz0380_current_pixelformat()` decides the
+fourcc, and `stall_eos_ms` (def 2000) errors the queue once a frame has been
+delivered and nothing follows, so `DQBUF` returns `-EIO` and readers exit with
+what they got.
+
+**Verified on hardware 2026-08-24**: `YU12` advertised, four frame sizes
+enumerated where the node used to return `-EINVAL`, and `v4l2-ctl` asked for
+three frames on a one-frame card and **exited by itself in 7 s with exactly
+3110400 bytes, rc=0**. Re-run it any time with
+
+```bash
+sudo ./mz0380-m168-v4l2-abi.sh
+```
+
+One spawn. The enumeration half of it costs none.
+
+**M170 did the same sweep over the rest of the application-facing surface.**
+`V4L2_EVENT_SOURCE_CHANGE` was dead at both ends - an emitter nothing called,
+and a `subscribe_event` that returned `-EINVAL` for it; the HDMI input reported
+`capabilities = 0` and `status = 0`, i.e. "no DV timings here" and "no problems"
+with the cable out; `make load-streaming` aborted demanding the deleted
+firmware-upload blob; and the README still told users to pass
+`firmware_upload=1`, a parameter `insmod` rejects. All fixed, README rewritten,
+`PLAN.md` marked SUPERSEDED with its false claims named. **Not yet run:**
+
+```bash
+sudo ./mz0380-m170-readiness.sh
+```
+
+`v4l2-compliance` (zero spawns) plus the first repeat-capture test this project
+has run - three stills in a row, checked for whole frames and for being
+different images. Costs 3 spawns; check `./mz0380-spawns.sh` first.
+
+**M171 ran it. Repeat capture PASSES** - three stills, all 3110400 bytes, all
+real pictures, all three hashes different, so each STREAMOFF/STREAMON really did
+capture again. The still grabber is usable as one.
+
+**v4l2-compliance: 148 tests, 132 passed, 16 failed** - three causes, all fixed
+in source, all needing a re-run to confirm:
+
+1. GOP/bitrate controls reported values outside their own declared ranges,
+   because the BAR5 readback adopts a register the H.264 path never wrote. Zero
+   means unset. Two of the six sync helpers already rejected out-of-range
+   readbacks; the rest now agree with them.
+2. `readbuffers` was 0 while the node advertises `V4L2_CAP_READWRITE`.
+3. `G_DV_TIMINGS` answered with the live detection instead of what
+   `S_DV_TIMINGS` was told, and S validated nothing.
+
+```bash
+sudo rmmod mz0380; sudo insmod ./mz0380.ko && sleep 3 && v4l2-compliance -d /dev/video0 2>&1 | tail -25
+```
+
+Zero spawns, and `./mz0380-compliance.sh` makes it one word.
+
+**Progress: 132/16 -> 142/6 -> 147/1.** Note the middle step: **five of those
+six were introduced by the fix for the first sixteen** (a bare `vb2_is_busy()`
+in `S_DV_TIMINGS`, which broke compliance's "you may set the timings you already
+have"). Conformance is not a checklist you satisfy once - it is the only thing
+in this tree that notices when a correction overshoots, and it costs nothing
+against the spawn budget. Re-run it after any ABI change.
+
+**148 tests, 148 succeeded, 0 failed.** v4l2-compliance is clean.
+
+The last failure was `field == V4L2_FIELD_NONE`: the driver enumerates 1080i50
+and 1080i60 but reported a progressive format for them, because `field` was a
+literal. It now follows the negotiated timings, and the delivery path uses the
+same answer. **Fixed in source, awaiting the confirming run.**
+
+`V4L2_CID_DV_RX_POWER_PRESENT not found` (5 warnings) stays: the driver has the
+information and does not export it, which is an addition rather than a
+correction. **M173 answered it and the answer is no.** R55 bits
+0-1 were "most plausibly 5V/clock presence" (M45). They are not: across a live
+unplug/replug they held the value 3 throughout, while the lock bits went
+`0x3c -> 0x00 -> 0x3c` and proved the read was live. **This card has no +5V
+detect**, so the control stays unimplemented and the five warnings stay. Do not
+substitute the lock bits - a powered-but-idle source reads lock 0, which is the
+very distinction the control exists to make.
+
+Same trace, recorded properly this time: bit 6 tracks the cable exactly as the
+0x3c bits do and nothing gates on it (leave the mask alone - 0x3c has been
+correct in every capture), and bit 7 was set only in transition and clear in
+both settled states, which is 5 samples and therefore an observation, not a
+finding.
 
 ### If you want to keep going, the honest options
 
 1. **Widen the spawn budget** so single-shot capture is at least repeatable.
    M157's `vic_fast_kill=0` is already the default and is the only candidate;
    it needs ordinary runs to accumulate evidence (18+ spawns on one power cycle
-   without a wedge is the answer).
+   without a wedge is the answer). **M169 built the instrument for this** - the
+   count did not exist before, and `dmesg` could not supply it because every
+   script here opens with `dmesg -C`. Now:
+
+   ```bash
+   ./mz0380-spawns.sh
+   ```
+
+   No root needed to read. `mz0380-m55-real-capture.sh` banks each run's spawns
+   automatically from its `cleanup()`, so ordinary runs accumulate the evidence
+   by themselves. The tally lives in `/run` and so resets when the host boots,
+   which is the same event that resets the card.
 2. **Make recovery cheap** - `mz0380-m52-card-recovery.sh` is fixed and has
    never been run. Do it *while wedged*.
 3. Accept the bound and present the device as a still grabber.
@@ -160,10 +261,11 @@ move the wedge** - proving that directly costs ~30 spawns - so the plan is to
 let ordinary runs accumulate the evidence. Every dmesg records which regime it
 belonged to via `fk=` in the SET_VIC banner. **If a session passes 18 spawns on
 one power cycle without wedging, that is the answer.** If it wedges anyway, the
-next move is `mz0380-m52-card-recovery.sh` (never run; its `mailbox_alive`
-greps still reference the deleted firmware-upload path and need refreshing to
-`CMD_INIT answered on attempt 1`) - a working bus-reset stage would turn the
-wedge from a mains-off cold boot into five seconds.
+next move is `mz0380-m52-card-recovery.sh`. Its `mailbox_alive` greps were
+refreshed to `CMD_INIT answered on attempt` in e93285b - this file said they
+still needed it, and that was already out of date. The script has still **never
+been run**; a working bus-reset stage would turn the wedge from a mains-off cold
+boot into five seconds.
 
 **The wedge has TWO signatures, and the second one was only named on
 2026-08-23.** The one this file has always described is a wall of
