@@ -10078,3 +10078,102 @@ argument is which, made by reading one function in isolation.** StartDMAC alone
 cannot tell you what its parameter is; only its caller can. The check that would
 have caught it is mechanical - before asserting what a field is, read the call
 site that supplies it.
+
+
+---
+
+## M164 (static, 2026-08-24): the 16 bytes are a FRAME-INTERVAL SELECTOR - tinyvenc7 sends a small block every frame and a full frame every Nth, and N makes the full one unreachable
+
+All three gates from M163 are now resolved. Two pass. The third explains
+everything.
+
+### Gate 1 - passes, always
+
+    124cc  ldrb r0, [r5, #-0xf3f]     ; global 0x4c0e9
+    124e0  cmp  r0, #1
+    124fc  beq  0x12944               ; == 1 diverts
+
+The **only** writer in the whole binary is `main` at 0xdf60, `strb r4, ...`
+with `r4 = 0` (0xdf44). It is 0 for the process lifetime, so this gate is never
+the diverter.
+
+### Gate 3 - passes, always
+
+    12508  ldrb r1, [r7, #-0xf10]     ; global 0x4c118
+    1250c  cmp  r1, r8                ; r8 = 0
+    12510  beq  0x12944               ; == 0 diverts
+
+`main` initialises it to **1** (0xe430, `strb r2, [r11, #-0xf10]` with `r2=1`),
+and the only other writer is the **`-A`** option handler (0x100f4), which sets
+it to 0 after printing a banner. `video_capture_mgr` spawns tinyvenc7 as
+`./tinyvenc7 -D [-L] -a .. -w ..` and **never passes `-A`**, so this gate is 1
+and passes.
+
+### Gate 2 - THIS is the one, and it is a modulo
+
+    124b0  ldrb r1, [r5, #-0xf42]     ; N, global 0x4c1e6
+    124b8  cmp  r1, #0
+    124bc  beq  0x129d0               ; N == 0 -> a different path entirely
+    124c0  ldr  r0, [r4, #0x7c]       ; frame counter, in the config struct
+    124c4  bl   __aeabi_uidivmod      ; r1 = counter % N
+    124c8  mov  r10, r1
+    12500  cmp  r10, #1
+    12504  bne  0x12944               ; remainder != 1 -> 16-byte push
+
+**`(frame_counter % N) == 1`.** So tinyvenc7's design is not broken and not a
+truncation: it pushes a **small block every frame and a full frame every Nth**
+- a preview/keyframe cadence. We are getting the small block 100% of the time
+because the full-frame case never comes up:
+
+- **`N == 1`** makes `counter % 1` identically 0, so the remainder can never be
+  1 and the full push is **unreachable for the life of the process**.
+- **`N == 0`** diverts at 0x124b8 before the modulo is even reached.
+
+Either value produces exactly what M161 measured: a completion interrupt per
+frame, 16 bytes every time, forever, with the producer otherwise healthy.
+
+### Where N comes from - and why it is not an argv option
+
+`N` at `0x4c1e6` is written once, in `main` at 0xeb70, and its source is
+`[r8-0xe06]` = **0x4c222**, which is **read twice and never written anywhere in
+the binary**. So it arrives as part of a bulk-loaded config struct, not from
+`getopt`. The second read confirms the shape - it is a per-channel value with a
+global fallback:
+
+    f02c  ldrb   r1, [r8, #-0xe06]    ; per-channel N   (0x4c222)
+    f030  cmp    r1, #0
+    f034  ldrbeq r1, [r8, #-0xf43]    ; fall back to the global default
+    f038  strb   r1, [r2, #0xe]
+
+and the neighbouring field `[r8-0xe05]` gets the identical treatment into
+`[r2, #0xf]` - adjacent bytes, i.e. a per-channel array.
+
+**This matters because the cfg is host-reachable.** M126/M128 established that
+`video_capture_mgr` (0xa290) `atoi()`s every line of
+`/tmp/nullsensor_yuan%d.cfg` and rewrites values from the SET_VIC payload. If
+the key backing 0x4c222 is in that cfg, **N is host-settable and this becomes a
+knob.**
+
+### Why this is the whole game
+
+At N = 2 the card would send a full 1080p frame every other frame - **30 fps at
+1920x1080**, on a producer already proven to sustain 1621 completion interrupts
+with zero FIFO drops (M161). Nothing else about the pipeline needs to change.
+
+### Next, still static
+
+1. Find which cfg key populates 0x4c222 - read tinyvenc7's cfg parser (it opens
+   `/tmp/nullsensor_yuan%d.cfg`) and map key strings to the 0x4c1xx/0x4c2xx
+   cluster.
+2. Cross that key against vcm's patcher (0xa290) to see whether it is one of the
+   lines vcm rewrites, and from which SET_VIC field.
+3. Only then spend a spawn.
+
+### Method note
+
+This chain held because every hop was resolved to an absolute address and then
+grepped for **all** writers, rather than reading the first plausible one. Gate 3
+looked like the obvious suspect (a flag that defaults to "off" would have
+explained everything) and it is the opposite - it defaults to 1 and only an
+option nobody passes can clear it. Two gates were eliminated by writer-census,
+not by argument.
