@@ -9626,3 +9626,109 @@ board's VIC, which is a clean negative and costs one spawn.
 
 Risk is one spawn. vcm kills tinyvenc5/7/8 at startup, so the binaries do not
 collide.
+
+
+---
+
+## M159 (hardware, 2026-08-24): `fw=7` BREAKS THE ONE-FRAME BOUND - continuous ~61 Hz production, and the frame-token register moves for the first time
+
+    sudo POLLDRAIN=20 VICFW=7 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
+        ./mz0380-m55-real-capture.sh 4
+
+    stream start: SET_VIC(... fw=7 ... bitstreams=1) ret=0
+
+    14998.536  frame token 0 ... payload counters a5a5a5a0/ffffffff/a5a5a5a5
+    14998.556  frame token 1 ... payload counters a5a5a5a1/ffffffff/a5a5a5a5
+    14998.570  frame token 2 ... payload counters a5a5a5a2/ffffffff/a5a5a5a5
+    14998.587  frame token 3 ... payload counters a5a5a5a3/ffffffff/a5a5a5a5
+    14998.602  frame token 0 ...            (and so on, 14 events in 213 ms)
+
+**This is a cadence.** Fourteen events in 213 ms, mean gap 16.4 ms = **61 Hz**,
+cycling all four buffers in order, and - decisively - **re-writing each buffer
+after the driver re-poisons it**. The card is producing continuously.
+
+Under `fw=5` the same recipe produces exactly one write and then nothing, ever,
+until the process is replaced. **M158's prediction is confirmed: the one-frame
+bound is a property of the tinyvenc5 build, not of the board, not of the VIC,
+and not of anything host-side.**
+
+### The frame-token register moved - a first
+
+Every run in this file's history has ended `producer watch saw 0 change(s),
+final 40=a5a5a5a5`, and M151 concluded the sentinel was blind because its
+writer (`store_channel_done`) is unreachable. Under `fw=7` the sentinel
+**moves**: the token register reads `a5a5a5a0`, `a5a5a5a1`, `a5a5a5a2`,
+`a5a5a5a3` on successive events - our seed `a5a5a5a5` with the low bits
+replaced by the buffer index - and `payload[1]` reads `ffffffff` where it was
+seeded `a5a5a5a5`. The driver's `idx = token & 7` picks 0,1,2,3 from exactly
+those values.
+
+So the reporting path tinyvenc5 has compiled out **is present and running in
+tinyvenc7**. M151's "the sentinel is blind" was true of tinyvenc5 and is not a
+property of the hardware.
+
+### The new defect: 16 bytes per event, and it is real video
+
+Each event carries **16 bytes**, not 3110400. But the bytes are real:
+
+    2c 2c 2c 2c 2c 2c 2c 2c 2c 2c 2c 2c 2c 2c 2c 2c
+    2d 2d 2d 2d 2c 2c 2c 2c 2c 2c 2d 2d 2d 2c 2c 2c
+
+Dark luma with real variation - not poison (`aa`), not the sentinel (`a5`), not
+zeros. Four events reached v4l2 (64 bytes total); the rest were dropped with
+`no queued vb2 buffer` because 16-byte "frames" exhaust the queue immediately.
+
+### A trap: do NOT read the 16 as tinyvenc5's literal
+
+tinyvenc5's only reachable MMA push passes a constant:
+
+    142fc  mov r1, #0x90000000
+    14300  mov r2, r5             ; phys addr
+    14304  ldr r0, [sp, #0x60]    ; handle
+    14308  mov r3, #16            ; <-- literal
+    1430c  bl  TK_MMA_StartOneFrame
+
+and tinyvenc7's passes a variable (`r3 = r9`, 0x125b8). That looks like the
+answer and **is not**. Through the wrapper
+(`TK_MMA_StartOneFrame` 0xc64: `ctx[0x18] = a3`, then
+`MassMemAccess_StartOneFrame(ctx[0], ctx+4)`), that argument lands at
+StartDMAC's `[base+0x14]`, which is `orr`'d into the DMAC **control word** at
+`<< 10` (0x1d5c/0x1d6c) and written to the mapped MMR at `[block+8]`. It is a
+control field, not a byte count. The two 16s are not known to be the same
+thing. **Unresolved - do not build on it.**
+
+### What was NOT captured, and why
+
+m55's section-3 grep showed the token flood and **nothing after it**: no
+`poll-drain armed`, no `poll-drain stopped after N deliveries`, and **no
+`stream stop:` summary**. So `frame_events`, `irq_total` and the final token
+values are unknown for this run, and *which path delivered* - the real
+frame-event path or the poll-drain - is unknown with it. That distinction
+matters: real completion events would be another first.
+
+The flood pushed them out. The numbers are still in the kernel ring buffer and
+cost nothing to recover:
+
+```bash
+sudo dmesg | grep -aE "poll-drain|stream stop|producer watch"
+```
+
+**m55 needs a fix**: its section-3 grep has to keep the summary lines when a
+run produces hundreds of per-frame lines. Until then, run the command above
+after every `fw=7` capture.
+
+### The next question, and it is one spawn
+
+Is 16 bytes what the card transfers, or what our re-poison leaves behind? The
+poll-drain re-poisons the whole buffer after every delivery *and* after every
+drop, so a card writing progressively would be reset every 20 ms and would
+always present a short prefix. Change **one variable** - give the card 2 s per
+look instead of 20 ms:
+
+    sudo POLLDRAIN=2000 VICFW=7 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
+        ./mz0380-m55-real-capture.sh 4
+    sudo dmesg | grep -aE "poll-drain|stream stop|producer watch"
+
+A length that grows means we were truncating it ourselves and the fix is
+host-side. A length still exactly 16 means the transfer really is one burst,
+and the target moves to the DMAC control word.
