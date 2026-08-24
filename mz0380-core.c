@@ -220,7 +220,18 @@ module_param(record_mode_shift, uint, 0644);
 MODULE_PARM_DESC(record_mode_shift,
 		 "bit shift for the property-407 record-mode candidate field");
 
-bool mz0380_enable_video;
+/*
+ * M166: the shipping default is now the known-good capture configuration.
+ *
+ * This was `bool mz0380_enable_video;` - off - since bring-up, and every successful
+ * capture in this project's history passed it explicitly. Left off, `insmod
+ * ./mz0380.ko` produces a device that cannot capture, and the user sees either
+ * no /dev/video* at all or a node that never delivers. That is not a safe
+ * default, it is a broken one.
+ *
+ * Pass enable_video=0 to get the old bring-up behaviour back.
+ */
+bool mz0380_enable_video = true;
 module_param_named(enable_video, mz0380_enable_video, bool, 0444);
 MODULE_PARM_DESC(enable_video,
 		 "register the probe-safe V4L2 node; disabled by default to keep unloads simple during bring-up");
@@ -521,7 +532,18 @@ module_param_named(rx_strap, mz0380_rx_strap, uint, 0644);
 MODULE_PARM_DESC(rx_strap,
 		 "M109: GPIO8 companion reset/power strap level after the receiver reset (def:0, the level this driver has always driven; 1 = release; 0xffffffff = do not drive it at all)");
 
-bool mz0380_enable_dma;
+/*
+ * M166: the shipping default is now the known-good capture configuration.
+ *
+ * This was `bool mz0380_enable_dma;` - off - since bring-up, and every successful
+ * capture in this project's history passed it explicitly. Left off, `insmod
+ * ./mz0380.ko` produces a device that cannot capture, and the user sees either
+ * no /dev/video* at all or a node that never delivers. That is not a safe
+ * default, it is a broken one.
+ *
+ * Pass enable_dma=0 to get the old bring-up behaviour back.
+ */
+bool mz0380_enable_dma = true;
 module_param_named(enable_dma, mz0380_enable_dma, bool, 0444);
 MODULE_PARM_DESC(enable_dma,
 		 "allocate ring buffers, request MSI, enable bus mastering; off by default");
@@ -1522,7 +1544,18 @@ module_param_named(irq_intx, mz0380_irq_intx, bool, 0444);
 MODULE_PARM_DESC(irq_intx,
 		 "M82: force legacy INTx instead of MSI, as the Windows driver does (def:1)");
 
-bool mz0380_dma_handshake;
+/*
+ * M166: the shipping default is now the known-good capture configuration.
+ *
+ * This was `bool mz0380_dma_handshake;` - off - since bring-up, and every successful
+ * capture in this project's history passed it explicitly. Left off, `insmod
+ * ./mz0380.ko` produces a device that cannot capture, and the user sees either
+ * no /dev/video* at all or a node that never delivers. That is not a safe
+ * default, it is a broken one.
+ *
+ * Pass dma_handshake=0 to get the old bring-up behaviour back.
+ */
+bool mz0380_dma_handshake = true;
 module_param_named(dma_handshake, mz0380_dma_handshake, bool, 0444);
 MODULE_PARM_DESC(dma_handshake,
 		 "enable bus master + MSI (no ring programming) before firmware handshake; M4 diagnostic");
