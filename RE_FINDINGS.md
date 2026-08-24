@@ -9827,3 +9827,77 @@ see the torn prefixes again if it turns out the card really does send 16 bytes.
 Do not judge this run on the captured byte count alone: with 4 requested frames
 and a 60 Hz producer, `frame_events` and the delivered lengths in dmesg are the
 result.
+
+
+---
+
+## M161 (hardware, 2026-08-24): the 16 bytes are the CARD's, not ours - and the producer is rock solid at 1621 completion interrupts
+
+M160's fix went in and the answer is its second branch. Over a ~57 s stream:
+
+    stream stop: EVENT[0x30]=00000000 token[0x40]=a5a5a5a0 0x44=a5a5a5a0
+                 0x48=ffffffff 0x4c=a5a5a5a5 enc[0x50]=00000000
+                 irq_total=1628 frame_events=1621 fifo_drops=0
+
+    poll-drain stopped after 0 deliveries; producer watch saw 1558 change(s)
+
+    $ grep -aoE "holds [0-9]+ of" m161-dmesg.log | sort -u
+    holds 16 of
+
+**`frame_events=1621`, `fifo_drops=0`, 1558 token transitions.** The card raises
+a real completion interrupt per frame, continuously, for a minute, cycling
+`0->1->2->3->0`. Under `fw=5` this number has been **0 in every run ever
+recorded**.
+
+**And "16" is the only length that ever appears.** This run left every short
+buffer **un-poisoned for the entire stream** - the M160 fix means nothing
+overwrote them - and no buffer ever grew past 16 bytes. So the truncation is not
+our re-poison racing the DMA. The card transfers 16 bytes per frame and stops.
+
+M160 was still a real bug (the event path genuinely lacked M115's guard, and it
+had never executed against a live producer), but it was not this bug. Both
+paths now agree, which is what makes the measurement trustworthy:
+
+    poll-drain: buf 0 holds 16 of 3110400 bytes - DMA still in flight, waiting
+    frame token 0 holds 16 of 3110400 bytes on the completion event - ...
+
+### The lead: tinyvenc5 hardcodes what tinyvenc7 computes
+
+`TK_MMA_StartOneFrame(ctx, 0x90000000, phys, a3)`. In tinyvenc5 (0x14308):
+
+    14308  mov r3, #16                  ; literal
+
+In tinyvenc7's `vcap_handler` (0x12518):
+
+    12518  ldrh r9, [r4, #86]           ; a geometry field at +0x56
+    12528  add  r9, r9, r9, lsl #1      ; * 3
+    1252c  asr  r9, r9, #1              ; / 2     -> value * 3/2
+
+`x * 3 / 2` is the 4:2:0 size formula. tinyvenc7 **derives** that argument from
+frame geometry; tinyvenc5 pins it to a constant. This is the same shape as the
+`mma_already_start` defect (M158): the correct idiom in one build, stubbed in
+the other.
+
+**What is NOT established:** the units of `a3`, and whether it is the transfer
+length at all. Through the wrapper it reaches `MassMemAccess_StartDMAC`'s
+`[base+0x14]` and is `orr`'d into the DMAC control word at `<< 10` (0x1d6c),
+into a field the preceding `bic #0xFF0` only clears to bit 11 - so a value of 16
+would land at bit 14, outside the cleared field. That does not read like an
+integer length, and the descriptor's size fields come from
+`MassMemAccess_Initial`/`SetOptions` instead (the TK wrapper's `Init` passes a
+hardcoded 2560 and 1920 - stride and width - at 0x9c4/0x9c8). **Do not build on
+"a3 is the length" until the descriptor layout is read.** Flagged, not resolved.
+
+### Method note, and it is mine
+
+The `POLLDRAIN=2000` run (M160) was designed to test whether our re-poison was
+truncating an in-flight frame. It could not have: `POLLDRAIN` paces only the
+poll fallback, and the drain fires on the completion event. **The variable was
+not in the code path under measurement.** One spawn, no information. The rule
+that would have caught it costs nothing: before spending a spawn, name the
+function the variable is read in.
+
+### State
+
+Four spawns into this power cycle, `vic_fast_kill=0` throughout, no wedge, and
+the card sustained a 57-second stream with 1628 interrupts and zero FIFO drops.
