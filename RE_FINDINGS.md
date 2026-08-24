@@ -10177,3 +10177,90 @@ looked like the obvious suspect (a flag that defaults to "off" would have
 explained everything) and it is the opposite - it defaults to 1 and only an
 option nobody passes can clear it. Two gates were eliminated by writer-census,
 not by argument.
+
+
+---
+
+## M165 (static, 2026-08-24): the frame-interval knob is opcode 0x32, and **ep.ko does not forward it** - the fw=7 full-frame path is not host-reachable
+
+M164's chain completes, and it ends in a wall. Recording it fully, because the
+wall is the result.
+
+### The config cluster is the MAILBOX PAYLOAD BUFFER
+
+`N` (0x4c222) and `M` (0x4c221) looked like cfg values because nothing in
+tinyvenc7 writes them with a direct offset. They are not. `main` at 0xe014:
+
+    e014  ldr  r1, =0x4c218
+    e018  mov  r2, #44            ; exactly the max mailbox payload (M127)
+    e01c  bl   pread              ; pread(fd, 0x4c218, 44, ...)
+    e028  ldr  r1, [r8, #-0xe10]  ; = [0x4c218] = the OPCODE
+    e02c  sub  r3, r1, #6
+    e034  ldrls pc, [pc, r3, lsl #2]   ; jump table, opcodes 6..98
+
+So **0x4c218 is the command buffer**, and the "config bytes" are payload
+offsets: `M` = byte **9**, `N` (ch0) = byte **10**, ch1 = byte **11**.
+
+### The command is 0x32
+
+Walking the jump table, the handler containing 0xeb28-0xeb70 - the code that
+stores `M` and `N` - is entry **50 = 0x32**. Its handler reads payload offsets
+4..18. `0x32` is **not in tinyvenc5's command set** (M128 enumerated it:
+`0x06 0x09 0x2a 0x2d 0x2f 0x31 0x50 0x51 0x52 0x62` plus `0x29`), which is why
+this project has never seen it.
+
+### And ep.ko will not deliver it
+
+`ep.ko`'s `epint_show` copies `rodata[0xa0 + cmd]` bytes to the card's
+userspace (M127). Extracting `.rodata` and checking that table against M127's
+twelve independently-verified lengths - **all twelve match exactly**, so the
+table base is confirmed:
+
+    0x06:8  0x07:8  0x09:8  0x29:40  0x2a:20  0x2d:44
+    0x2f:44 0x31:20 0x50:44 0x51:20  0x52:7   0x62:12
+
+    opcode 0x32 -> rodata[0xd2] = 0
+
+**Zero.** The complete set of opcodes this firmware's `ep.ko` forwards is
+`0x06 0x07 0x09 0x29 0x2a 0x2d 0x2f 0x31 0x50 0x51 0x52 0x60 0x61 0x62`.
+`0x32` is not among them, so a `0x32` we send is copied as **0 bytes** - the
+opcode itself never reaches tinyvenc7's dispatch.
+
+### Therefore, and this is now fully determined
+
+`M` and `N` stay at their `.bss` value of **0** forever. `N == 0` takes the
+bitmap path (M164), the 128-bit schedule bitmap at `[-0xf38]/[-0xf30]/[-0xf2c]`
+is **read-only in the entire binary** - never written, so all zeros - the
+extracted bit is 0, and `r10 != 1` diverts to the 16-byte push. **Every frame,
+forever.** That is exactly what M161 measured, with no free parameters left.
+
+**The `fw=7` full-frame push is unreachable on this card's firmware**, and the
+only thing that would change it is a different `ep.ko` - which the standing
+no-upload rule forbids, and which broke the card once already.
+
+### What survives, and what it cost
+
+`fw=7` is not wasted. It proved, on hardware, things `fw=5` never could:
+
+- the card's **completion-interrupt path works** (`frame_events=1621`,
+  `fifo_drops=0`) - it had been 0 in every run in this file's history;
+- the frame-token register **does** move (1558 transitions);
+- the producer sustains 60 Hz indefinitely, so the one-frame bound was never
+  a hardware or VIC limit.
+
+Those are permanent gains. The route to *pixels* through tinyvenc7 is closed.
+
+### The thread this leaves open, and it is the important one
+
+**Under `fw=5` the host receives 3110400 bytes, and no push site examined so far
+accounts for it.** tinyvenc5's `a3` values across its twelve aperture sites are
+`4096` x4, `16` x2, and **`mov r3, r9`** x1 - one variable site. `a3` is the
+length (M163), and a full 1080p I420 frame is `a3 = 1620` at a 1920 stride. So
+tinyvenc5 has a frame-sized push and it is the `r9` site, which M153's
+reachability work did not cover.
+
+**Next: identify tinyvenc5's `mov r3, r9` push site, establish what `r9` is
+there, and determine what makes it fire once and only once.** That is where the
+pixels actually come from, it is the path that already delivers whole frames,
+and its bound (M158's livelock) is a defect in tinyvenc5 rather than a missing
+opcode.
