@@ -1,3 +1,24 @@
+> **SUPERSEDED — historical bring-up plan, 2026-08-24.**
+>
+> This file describes the driver as it was imagined at bring-up and several of
+> its central claims are now false. It is kept for the reasoning, not as a
+> reference. Current state lives in `README.md`, `NEXT_SESSION_START.md` and
+> `RE_FINDINGS.md`.
+>
+> Specifically, do not act on the following, which appear below:
+>
+> - **"Firmware loader ... chunked BAR5 scratch-window upload state machine"**
+>   and the `firmware_upload` gate. **The driver does not upload firmware and
+>   the code to do so has been deleted from the tree.** The card boots its own
+>   flash image; a previous attempt at a host-side upload broke the card's
+>   userspace. This is a standing rule, not a preference.
+> - **"All default OFF so probe stays safe"** — `enable_video`, `enable_dma` and
+>   `dma_handshake` have defaulted ON since M166, because the old defaults
+>   produced a device that could not capture.
+> - **"exposes the encoded result as a V4L2 H.264 capture device"** — the
+>   delivered payload is raw planar I420, not an H.264 bitstream (M129/M146).
+> - The BAR5 mailbox description — the command mailbox is in **BAR0**, not BAR5.
+
 # MZ0380 / HD60 Pro Driver — Implementation Status
 
 ## Current state (post-build)

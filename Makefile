@@ -55,7 +55,7 @@ endif
 
 .PHONY: all all-kernels kernels kcheck clean objclean distclean legacy fw-install \
         load load-streaming unload tarball list probe \
-        capture-h264 capture-audio
+        capture capture-h264 capture-audio
 
 TARFILES = Makefile *.h *.c *.txt *.md
 
@@ -196,31 +196,42 @@ legacy: kcheck
 # installer (or from a Windows install) into /lib/firmware/mz0380/.
 #
 FW_DIR ?= /lib/firmware/mz0380
+# M170: this checked for MZ0380.HD.HEX - the blob the driver STOPPED USING when
+# the upload path was deleted from the tree. load-streaming depends on it, so
+# `make load-streaming` failed outright on a correctly-installed system, telling
+# the user to go and extract a firmware image that nothing reads.
+#
+# The card boots its own flash. The only file the driver ever requests is the
+# MZ0380.FW.TXT sidecar, and only to compare a version string and warn on a
+# mismatch. It is optional: without it the driver says so and carries on.
 fw-install:
-	@if [ ! -f $(FW_DIR)/MZ0380.HD.HEX ]; then \
-		echo "ERROR: copy MZ0380.HD.HEX into $(FW_DIR) first."; \
-		echo "       (extract from Game_Capture_HD60_Pro_*.exe with 7z)"; \
-		exit 1; \
+	@if [ ! -f $(FW_DIR)/MZ0380.FW.TXT ]; then \
+		echo "note: $(FW_DIR)/MZ0380.FW.TXT is absent."; \
+		echo "      The driver does not need it to run - the card boots its"; \
+		echo "      own flash image. It is a version sidecar: without it the"; \
+		echo "      expected-vs-actual firmware check is simply skipped."; \
+		echo "      Create it with the card's version if you want the check:"; \
+		echo "          echo 01.11 | sudo tee $(FW_DIR)/MZ0380.FW.TXT"; \
+	else \
+		echo "firmware version sidecar: $(FW_DIR)/MZ0380.FW.TXT = $$(cat $(FW_DIR)/MZ0380.FW.TXT)"; \
 	fi
-	@echo "firmware present in $(FW_DIR)"
 
 #
 # Load helpers.
 #
 load: all
 	sudo dmesg -c >/dev/null
-	sudo modprobe videobuf2-common
-	sudo modprobe videodev
-	sudo insmod ./mz0380.ko procfs_verbosity=2 enable_video=1
+	sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc \
+		v4l2-dv-timings snd-pcm
+	sudo insmod ./mz0380.ko procfs_verbosity=2
 
+# M166/M167: the shipping defaults ARE the capture configuration, so this no
+# longer has to spell them out. Kept because the name is in the README and in
+# muscle memory; it is now a plain load with the dependencies pulled in.
 load-streaming: all fw-install
-	sudo modprobe videobuf2-common
-	sudo modprobe videodev
-	sudo insmod ./mz0380.ko procfs_verbosity=2 \
-		enable_video=1 \
-		enable_dma=1 \
-		dma_iova_remap=1 \
-		aic_on=1
+	sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc \
+		v4l2-dv-timings snd-pcm
+	sudo insmod ./mz0380.ko procfs_verbosity=2
 
 unload:
 	sudo rmmod mz0380 || true
@@ -238,8 +249,12 @@ list:
 probe:
 	@echo "Use: sudo ./mz0380-m55-real-capture.sh 6 45"
 
-capture-h264:
-	sudo ./mz0380-m55-real-capture.sh 6 45
+# M130: the payload is planar I420, not an H.264 bitstream. The old name said
+# h264 and the old argument asked for 6 frames from a card that delivers one.
+capture: all
+	sudo ./mz0380-m55-real-capture.sh 1 45
+
+capture-h264: capture
 
 capture-audio:
 	@echo "ALSA PCM DMA is not implemented; enable_audio must remain disabled."
