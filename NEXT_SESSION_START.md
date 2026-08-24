@@ -83,6 +83,28 @@ are in the risky zone. tinyvenc5 is spawned per stream by `video_capture_mgr`
 `SET_VIC ret=-110`" is consistent with tinyvenc5 finally failing to start and
 nothing being left to ACK.
 
+**M157 named a mechanism and changed a default because of it.** SET_VIC byte 33
+`fast_kill` picks how vcm disposes of the previous encoder: `1` (what Windows
+sends, and our old default) is a bare `kill(pid, 9)`; `0` is `kill(pid, 2)`
+followed by a 2 s poll for a clean exit. tinyvenc5 handles SIGINT with a
+handler that runs `EncodingGroup::~EncodingGroup()` and `exit(0)`, so only the
+second branch ever reaches the destructor, the atexit chain, `SSM_Recycle` ->
+`shm_unlink` and `MemBroker_FreeMemory`. SIGKILL skips all of it, and the
+resources it skips (`[SSM] over %d handles`, a 32 MB `/tmp`, the DRAM
+carve-out) are the finite cross-process kind that only a power cycle otherwise
+reclaims.
+
+**`vic_fast_kill` now defaults to 0.** Verified neutral on capture: a full
+3110400-byte frame, NOT SPLASH, CHROMA OK, `ret=0`. It is **not yet proven to
+move the wedge** - proving that directly costs ~30 spawns - so the plan is to
+let ordinary runs accumulate the evidence. Every dmesg records which regime it
+belonged to via `fk=` in the SET_VIC banner. **If a session passes 18 spawns on
+one power cycle without wedging, that is the answer.** If it wedges anyway, the
+next move is `mz0380-m52-card-recovery.sh` (never run; its `mailbox_alive`
+greps still reference the deleted firmware-upload path and need refreshing to
+`CMD_INIT answered on attempt 1`) - a working bus-reset stage would turn the
+wedge from a mains-off cold boot into five seconds.
+
 **The wedge has TWO signatures, and the second one was only named on
 2026-08-23.** The one this file has always described is a wall of
 `SET_VIC ret=-110` mid-run. The other kills the card before anything starts:

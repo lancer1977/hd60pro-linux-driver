@@ -9332,3 +9332,142 @@ parking should not stop the main loop answering the mailbox, yet `0x2d` returns
 the next static step, and it is the last thread in this investigation that has
 not been pulled.
 
+
+
+---
+
+## M157 (static + hardware, 2026-08-24): SET_VIC byte 33 `fast_kill` picks SIGKILL over a clean encoder shutdown - the first named mechanism for the 8-18 spawn wedge
+
+The wedge has been a bare observation since M52: the card stops answering after
+somewhere between 8 and 18 encoder spawns, only a power cycle clears it, and
+nothing in this file has ever said *what* runs out. It has cost whole sessions
+(M121, M122) and it caps every experiment that needs more than a handful of
+streams (M154, M155).
+
+**`video_capture_mgr` disposes of the previous tinyvenc5 in one of two ways, and
+SET_VIC byte 33 chooses which.** From vcm at 0x9554:
+
+```
+9554: r0 = &g_setvic            ; 0x141d4
+9558: ldrb r3, [r0, #0x21]      ; byte 33 = fast_kill
+955c: cmp  r3, #1
+9560: beq  0x97d0               ; fk == 1:
+                                ;   puts("[Video_MGR] ----> SIG   KILL")
+                                ;   kill(pid, 9)          <- no wait, no cleanup
+                                ; fk != 1:
+9564:                           ;   puts("[Video_MGR] ----> SIG    INT")
+956c:                           ;   kill(pid, 2)
+9584: kill(pid, 0)              ;   poll, 200 iterations
+95a0: usleep(0x2710)            ;   10 ms apart -> 2 s ceiling
+95ac: printf("[Video_MGR] timeout ---->break(%d)")
+95c4:                           ;   killall -9 tinyvenc5   <- backstop only
+```
+
+**And tinyvenc5 has a real clean-exit path that only the second branch reaches.**
+`main` installs one handler for SIGTERM(15), SIGINT(2) and SIGSEGV(11) at
+0xe418/0xe424/0xe430; the handler is `sig_kill` at 0x187ec:
+
+```
+187ec  sig_kill(sig):
+         printf(...); usleep(1000)
+         if (sig == 11) puts(...)
+         g_stop = 1
+         if (g_count > 0 && g_group)
+                 EncodingGroup::~EncodingGroup(g_group)   ; 0x10d9c
+                 operator delete(g_group)
+         exit(0)
+```
+
+`exit(0)` also runs the atexit chain, and `libsyncsharedmemory.so.0` registers
+one (`reg_release_func`, `SSM_Recycle`). So the SIGINT path gets the encoder
+destructor **plus** `SSM_RecycleHandle` -> `shm_unlink` and
+`MemBroker_FreeMemory`. Under `kill(pid, 9)` none of it runs.
+
+### Why that is the leading candidate for the wedge
+
+The resources the skipped cleanup owns are exactly the finite, cross-process
+kind that a power cycle is the only other way to reclaim:
+
+- `libsyncsharedmemory.so.0` carries `[SSM] over %d handles, name: %s` and
+  `[SSM] cannot allocate buffer over %d` - hard caps, whose recycler
+  (`SSM_RecycleHandle`) is what SIGKILL skips. Its segments are POSIX
+  `shm_open` objects, which survive SIGKILL until an `shm_unlink` that never
+  comes.
+- `/tmp` is a **32 MB** tmpfs (`mount -o remount,rw,size=32768k /tmp` in
+  `etc/rc.local`).
+- `MemBroker_*` allocations come from the DRAM carve-out via `/dev/vpl_edmc`.
+
+`EncodingGroup::Start`'s failure path calls `exit()`, which is precisely the
+"nothing is left to ACK" shape of both wedge signatures.
+
+### Two drivers checked and cleared as the primary suspect
+
+- **`vpl_edmc.ko` frees properly.** Its `Close` (0x7b8) calls
+  `DeleteBlkInfoNode` **and** `DeleteSharedBlkInfoNode` on the dying file, then
+  `kfree`s the private struct - and it even handles death-while-locked, by
+  `up()`ing the allocator semaphore when `private[0] == 1` before freeing. Both
+  the "Regular:" and "Shared:" lists are per-file. So media memory is not leaked
+  by SIGKILL at the driver layer.
+- **`vpl_dmac.ko` has a real hazard, but not this one.** Its `Close` (0xb8)
+  busy-waits for the profile's completion word - `ldr` / `cmp #1` / `bne` at
+  0xec, **no timeout, no `schedule()`, no signal check** - before releasing the
+  profile (64 of them, state array at MMIO +0x208, freed flag at +0x308; the
+  ISR sets state = 1 on completion). A process killed with a profile that never
+  completes can never finish dying. Our one transfer does complete, so this is
+  not what we are hitting, but it is worth remembering the next time a process
+  on the card appears unkillable.
+
+### Hardware control: `vic_fast_kill=0` is neutral on capture
+
+    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1 \
+        vic_fast_kill=0" ./mz0380-m55-real-capture.sh 1
+
+    stream start: SET_VIC(... fk=0 ...) ret=0
+    poll-drain: buf 0 holds 3110400 bytes; delivering
+    captured 3110400 bytes = 1 whole frames + 0 bytes
+
+    VERDICT: NOT SPLASH   Y 212 distinct values, UV 221
+    VERDICT: CHROMA OK    luma explains A 0.01 / B 0.00 of chroma
+
+A complete, real, correctly-coloured frame - indistinguishable from the fk=1
+baseline. The card accepts byte 33 = 0 and the SET_VIC still returns 0. The
+card's teardown wait is invisible from the host because it hides inside the
+SET_VIC settle we already pay (SET_VIC 12542.166 -> START 12544.375, 2.21 s,
+against M154's 2.18 s at fk=1).
+
+Also note the packing was already right: `params[7] = (fast_kill & 0xff) << 8`,
+and `params[k]` covers payload bytes `4+4k .. 7+4k`, so that is byte 33.
+
+**The default is now 0** (`mz0380-core.c`). This is the one field where we
+deliberately do not match Windows, which sends `fk=1` in every `[CH00]` line of
+every trace (M82). The justification: byte 33 governs only the disposal of the
+*previous* encoder, M156 already showed our STOP is not what kills tinyvenc5,
+and the frame is byte-for-byte the same shape either way. Retail opens one
+stream and keeps it; our workflow spends one spawn per capture, so we are the
+only party for whom the budget is a live constraint.
+
+### What this does NOT do, and how it can be judged
+
+It does not touch the one-frame bound - that is M153/M155, a different defect.
+
+And it is **not yet proven to move the wedge**. Proving it directly costs
+reaching the wedge twice, ~30 spawns, which is more than this question is worth
+paying up front. The cheap alternative is to leave the default at 0 and let
+every ordinary run accumulate evidence for free: if this session and the next
+pass 18 spawns on one power cycle without a wedge, that is the answer. The
+per-run marker is `fk=0` in the SET_VIC banner, so every dmesg records which
+regime it belonged to.
+
+The card is at roughly **1 spawn** into this power cycle (fresh boot), so the
+counter starts clean here.
+
+### If it wedges anyway: make the recovery cheap
+
+`mz0380-m52-card-recovery.sh` walks pm-reset -> secondary-bus reset ->
+remove+rescan, testing the mailbox after each. It has **never been run**, and
+its `mailbox_alive` markers are stale - they grep for `BEGIN_FW_DL` and firmware
+upload text from the era before that path was deleted. Refresh it to the current
+`CMD_INIT answered on attempt 1` / `card handshake failed` markers before use.
+If the slot's PERST# reaches the SoC's reset tree, the bus-reset stage reboots
+the card's Linux and a wedge becomes a five-second recovery instead of a
+mains-off cold boot. Worth exactly one run, while actually wedged.

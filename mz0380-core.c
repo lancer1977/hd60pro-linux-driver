@@ -929,10 +929,32 @@ module_param_named(vic_color_info, mz0380_vic_color_info, uint, 0644);
 MODULE_PARM_DESC(vic_color_info,
 		 "M82: SET_VIC bytes 16..19 color_info (def:0x02010101, what Windows always sends)");
 
-/* M82: SET_VIC byte33 fast_kill. Windows logs fk=1 unconditionally. */
-unsigned int mz0380_vic_fast_kill = 1;
+/*
+ * M82: SET_VIC byte33 fast_kill. Windows logs fk=1 unconditionally.
+ *
+ * M157: we default to 0 anyway, and this is the one place we deliberately do
+ * not match Windows. The byte selects how video_capture_mgr disposes of the
+ * previous tinyvenc5 before it spawns the next one (vcm 0x9554):
+ *
+ *   fk == 1  ->  "SIG   KILL"  kill(pid, 9)      - no cleanup at all
+ *   fk != 1  ->  "SIG    INT"  kill(pid, 2), then poll kill(pid,0) every
+ *                10 ms up to 200 times (2 s) for a clean exit, and only
+ *                then fall back to killall -9
+ *
+ * tinyvenc5 handles SIGINT/SIGTERM/SIGSEGV with sig_kill() (0x187ec), which
+ * runs EncodingGroup::~EncodingGroup() and exit(0) - so the SIGINT path also
+ * gets the atexit chain, i.e. SSM_Recycle -> shm_unlink and
+ * MemBroker_FreeMemory. Under SIGKILL none of that runs, which is the best
+ * candidate for the 8-18 spawn wedge (RE_FINDINGS M157).
+ *
+ * Neutral on capture: verified on hardware, full 3110400-byte frame, NOT
+ * SPLASH, CHROMA OK. Costs at most the card's own teardown wait, which hides
+ * inside our existing SET_VIC settle.
+ */
+unsigned int mz0380_vic_fast_kill;
 module_param_named(vic_fast_kill, mz0380_vic_fast_kill, uint, 0644);
-MODULE_PARM_DESC(vic_fast_kill, "M82: SET_VIC byte33 fast_kill (def:1)");
+MODULE_PARM_DESC(vic_fast_kill,
+		 "SET_VIC byte33 fast_kill: 0 = card SIGINTs the old encoder and waits for a clean exit (def, M157), 1 = SIGKILL, what Windows sends");
 
 /*
  * M82: SET_VIC bytes 36..39 - no-signal fill colour, back.Y.U.V. Windows sends

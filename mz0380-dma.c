@@ -1256,9 +1256,14 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 		    ((mz0380_stream_nosg ? 1u : 0u) << 24);
 	/*
 	 * M82: byte 33 is fast_kill and Windows sends 1, always ("fk=1" in
-	 * every [CH00] line of every trace). We have sent 0 for the life of
-	 * this driver. Bytes 32 (vanc_lines) and 34..35 (mix, is_slave) are
-	 * zero there too, which is what we already send.
+	 * every [CH00] line of every trace). Bytes 32 (vanc_lines) and 34..35
+	 * (mix, is_slave) are zero there too, which is what we already send.
+	 *
+	 * M157: byte 33 is the only field where we deliberately diverge from
+	 * Windows - it picks SIGKILL (1) versus SIGINT-and-wait (0) for the
+	 * card's teardown of the previous tinyvenc5, and only the second runs
+	 * the encoder's destructor and atexit cleanup. Default 0. See the
+	 * mz0380_vic_fast_kill block in mz0380-core.c.
 	 */
 	params[7] = ((mz0380_vic_fast_kill & 0xff) << 8) |	/* [33] */
 		    ((mz0380_vic_int_mode & 0xff) << 16);	/* [34] M136 */
