@@ -904,11 +904,24 @@ MODULE_PARM_DESC(signal_cache_ms,
  * - but a value that demonstrably kills the capture loop is not one to ship
  * for the sake of parity. 0 selects the Windows rule (6 at <=30 fps, 7 above)
  * for anyone re-testing that contradiction.
+ *
+ * M159/M161 OVERTURN the "fw = 7 -> nothing written" line above. That verdict
+ * came from the pre-M129 regime - splash oracle, post_mask=0x1f truncating the
+ * DMA, fake_frame_off unset - which M129 says invalidates every negative of
+ * that era, and this was one. Re-measured with the M129 recipe, fw=7 is the
+ * ONLY value that streams: 1621 completion interrupts in 57 s, fifo_drops=0,
+ * the frame-token register cycling 0->1->2->3 1558 times. fw=5 raises
+ * frame_events=0 - always has - and delivers one frame per encoder process
+ * because tinyvenc5's build never writes its mma_already_start latch (M158).
+ *
+ * The default stays 5 only because fw=7 currently transfers 16 bytes per frame
+ * instead of 3110400 (M161, card-side, unresolved). When that is fixed, 7 is
+ * the value to ship - it is the one the completion path was designed around.
  */
 unsigned int mz0380_vic_fw = 5;
 module_param_named(vic_fw, mz0380_vic_fw, uint, 0644);
 MODULE_PARM_DESC(vic_fw,
-		 "SET_VIC byte6 'fw' - 5=tinyvenc5/YV12, the only value that works here (M88); 0=Windows rule (6 at <=30fps, 7 above); 6, 7, 8 (def:5)");
+		 "SET_VIC byte6 'fw' - picks which encoder BINARY the card spawns (M158): 7=tinyvenc7 (streams continuously, 16 bytes/frame - M159/M161), anything else=tinyvenc5 (one frame per process, then frozen); 0=Windows rule (6 at <=30fps, 7 above) (def:5)");
 
 /*
  * M72: SET_VIC byte12 ("m" in the card's log) is VideoCap's OUTPUT FORMAT.
