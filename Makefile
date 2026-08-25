@@ -12,10 +12,32 @@
 
 mz0380-objs := \
 	mz0380-cards.o \
+	mz0380-pci.o \
+	mz0380-params-base.o \
+	mz0380-params-signal.o \
+	mz0380-params-windows.o \
 	mz0380-core.o \
+	mz0380-snapshot.o \
+	mz0380-proc-diagnostics.o \
+	mz0380-proc-debug.o \
+	mz0380-proc.o \
+	mz0380-controls-read.o \
+	mz0380-controls-write.o \
+	mz0380-mailbox.o \
 	mz0380-video.o \
+	mz0380-video-state.o \
+	mz0380-vb2.o \
+	mz0380-no-signal.o \
+	mz0380-signal.o \
 	mz0380-mst3367.o \
+	mz0380-mst3367-debug.o \
+	mz0380-mst3367-signal.o \
+	mz0380-mst3367-bitbang.o \
 	mz0380-dma.o \
+	mz0380-dma-extent.o \
+	mz0380-dma-stream.o \
+	mz0380-dma-drain.o \
+	mz0380-dma-nosg.o \
 	mz0380-fw.o \
 	mz0380-audio.o
 
@@ -49,6 +71,15 @@ MZ0380_HAVE_VB2_WAIT_OPS := $(shell grep -sqw vb2_ops_wait_prepare \
 	$(srctree)/include/media/videobuf2-v4l2.h && echo 1)
 ifeq ($(MZ0380_HAVE_VB2_WAIT_OPS),1)
 ccflags-y += -DMZ0380_HAVE_VB2_WAIT_OPS
+endif
+
+# Linux 7.2 split the old system_wq into explicit percpu/default-unbound
+# queues and warns whenever new work is queued on the compatibility alias.
+# Probe the declaration so the same source keeps building on older kernels.
+MZ0380_HAVE_SYSTEM_DFL_WQ := $(shell grep -sqw system_dfl_wq \
+	$(srctree)/include/linux/workqueue.h && echo 1)
+ifeq ($(MZ0380_HAVE_SYSTEM_DFL_WQ),1)
+ccflags-y += -DMZ0380_HAVE_SYSTEM_DFL_WQ
 endif
 
 endif

@@ -93,6 +93,8 @@
 #define MZ0380_MB_OPCODE               0x04    /* PARAM0 slot = opcode            */
 #define MZ0380_MB_RESULT               0x08    /* PARAM1 slot = result (0 == ok)  */
 #define MZ0380_MB_PARAM(i)             (0x04 + ((i) * 4)) /* i=0 -> opcode slot   */
+#define MZ0380_MB_MAX_ARGS             10U
+#define MZ0380_MB_COMMAND_WORDS        (MZ0380_MB_MAX_ARGS + 1U)
 #define MZ0380_MB_STATUS               0x2c    /* bit0 = command done             */
 #define MZ0380_MB_EVENT                0x30    /* interrupt/event status word      */
 /*
@@ -486,6 +488,28 @@
  */
 #define MZ0380_STREAM_BUF_SIZE          0x400000 /* 4 MiB per frame buffer     */
 #define MZ0380_STREAM_BUF_STRIDE        MZ0380_STREAM_BUF_SIZE
+
+/*
+ * Windows gives opcode 0x04 (outbound window 1) a separate four-buffer bank
+ * for the H.264 encoder.  Its command advertises 0x97f00 bytes per slot; use
+ * a 1 MiB backing allocation so the mapping is page/order aligned and leaves
+ * a guard margin around the observed Windows size.
+ */
+#define MZ0380_H264_BUF_SIZE            0x100000 /* 1 MiB backing per slot     */
+#define MZ0380_H264_SET_BUF_SIZE        0x097f00 /* Windows command size word  */
+#define MZ0380_H264_POISON_BYTE         0xcc
+
+/*
+ * Windows' HD60 Pro branch gives outbound window 0 two independent four-slot
+ * banks.  Both op 0x02 and op 0x08 advertise this exact YUV422 allocation:
+ * 2048-byte stride * 1125 lines * 2 bytes + a 4096-byte header.
+ */
+#define MZ0380_RAW_PROBE_BANKS          2
+#define MZ0380_RAW_PROBE_NR_BUFS        \
+	(MZ0380_RAW_PROBE_BANKS * MZ0380_STREAM_NR_BUFS)
+#define MZ0380_RAW_PROBE_BUF_SIZE       0x466000
+#define MZ0380_RAW_PROBE_BANK0_POISON   0xa5
+#define MZ0380_RAW_PROBE_BANK1_POISON   0x5a
 
 /*
  * M36/M37 (proven on hw): the fake-frame path lands ONE fully contiguous raw

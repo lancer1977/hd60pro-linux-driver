@@ -1748,7 +1748,7 @@ echo "After capture complete."
 show_diff "control" \
 	"${prefix}.control.before.txt" \
 	"${prefix}.control.after.txt"
-show_optional_diff "experiment" \
+show_optional_diff "experimsent" \
 	"${prefix}.experiment.before.txt" \
 	"${prefix}.experiment.after.txt"
 show_diff "snapshot" \

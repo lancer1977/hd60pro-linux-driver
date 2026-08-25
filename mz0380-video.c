@@ -9,7 +9,7 @@
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
 
-#include "mz0380.h"
+#include "mz0380-internal.h"
 
 #define MZ0380_DEFAULT_COLOR        128
 #define MZ0380_MAX_COLOR            255
@@ -23,11 +23,6 @@ enum mz0380_record_mode {
 	MZ0380_RECORD_MODE_VBR = 0,
 	MZ0380_RECORD_MODE_CBR = 1,
 	MZ0380_RECORD_MODE_HBR = 2,
-};
-
-struct mz0380_mode {
-	u32 width;
-	u32 height;
 };
 
 static const struct mz0380_mode mz0380_modes[] = {
@@ -100,44 +95,6 @@ const char *mz0380_input_name(u32 input)
 	return mz0380_input_names[input];
 }
 
-static const char *mz0380_h264_profile_name(u32 profile)
-{
-	switch (profile) {
-	case V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE:
-		return "baseline";
-	case V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE:
-		return "constrained-baseline";
-	case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
-		return "main";
-	case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
-		return "high";
-	default:
-		return "other";
-	}
-}
-
-static const char *mz0380_h264_level_name(u32 level)
-{
-	switch (level) {
-	case V4L2_MPEG_VIDEO_H264_LEVEL_3_0:
-		return "3.0";
-	case V4L2_MPEG_VIDEO_H264_LEVEL_3_1:
-		return "3.1";
-	case V4L2_MPEG_VIDEO_H264_LEVEL_3_2:
-		return "3.2";
-	case V4L2_MPEG_VIDEO_H264_LEVEL_4_0:
-		return "4.0";
-	case V4L2_MPEG_VIDEO_H264_LEVEL_4_1:
-		return "4.1";
-	case V4L2_MPEG_VIDEO_H264_LEVEL_4_2:
-		return "4.2";
-	case V4L2_MPEG_VIDEO_H264_LEVEL_5_0:
-		return "5.0";
-	default:
-		return "other";
-	}
-}
-
 static const struct v4l2_fract *
 mz0380_interval_table(const struct mz0380_capture_state *capture,
 		      unsigned int *count)
@@ -194,7 +151,32 @@ mz0380_default_interval_for_size(u32 width, u32 height)
 	return &mz0380_ntsc_frame_intervals[0];
 }
 
-static const struct mz0380_mode *
+/*
+ * tinyvenc7's H.264 producer emits one access unit per input-frame divisor,
+ * not at the VIC/source cadence. Keep capture.timeperframe describing the
+ * source (SET_VIC still needs that), but report the encoded cadence to V4L2.
+ * A non-reduced fraction such as 2/60 is valid and preserves odd source rates.
+ */
+static struct v4l2_fract mz0380_reported_interval(struct mz0380_dev *dev)
+{
+	struct v4l2_fract interval = dev->capture.timeperframe;
+	u32 divisor = mz0380_h264_frame_divisor;
+	u32 source_fps = dev->capture.source_fps;
+
+	if (!mz0380_h264_probe)
+		return interval;
+
+	if (divisor < 2 || divisor > U8_MAX)
+		divisor = 2;
+	if (!source_fps)
+		source_fps = 60;
+
+	interval.numerator = divisor;
+	interval.denominator = source_fps;
+	return interval;
+}
+
+const struct mz0380_mode *
 mz0380_find_mode(u32 width, u32 height)
 {
 	unsigned int i;
@@ -215,7 +197,7 @@ mz0380_find_mode(u32 width, u32 height)
 	return best;
 }
 
-static const struct v4l2_fract *
+const struct v4l2_fract *
 mz0380_find_interval(u32 width, u32 height, const struct v4l2_fract *wanted)
 {
 	unsigned int i;
@@ -283,10 +265,12 @@ static u32 mz0380_raw_frame_size(const struct mz0380_capture_state *capture)
 	return capture->width * capture->height * 3 / 2;
 }
 
-static u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
+u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
 {
 	u32 size;
 
+	if (mz0380_h264_probe)
+		return MZ0380_H264_SET_BUF_SIZE - 4096;
 	if (mz0380_stream_nosg)
 		return MZ0380_NOSG_NV12_SIZEIMAGE;
 	if (mz0380_poll_drain_ms)
@@ -336,8 +320,10 @@ static u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
  * where interleave banding would not show), so correcting it would be a guess
  * rather than a measurement. It is a diagnostic path and defaults off.
  */
-static u32 mz0380_current_pixelformat(void)
+u32 mz0380_current_pixelformat(void)
 {
+	if (mz0380_h264_probe)
+		return V4L2_PIX_FMT_H264;
 	if (mz0380_stream_nosg)
 		return V4L2_PIX_FMT_NV12;
 	if (mz0380_poll_drain_ms)
@@ -522,6 +508,7 @@ static int mz0380_enum_framesizes(struct file *file, void *priv,
 static int mz0380_enum_frameintervals(struct file *file, void *priv,
 				      struct v4l2_frmivalenum *fival)
 {
+	struct mz0380_dev *dev = video_drvdata(file);
 	const struct mz0380_mode *mode;
 	const struct v4l2_fract *interval;
 	struct mz0380_capture_state capture = { 0 };
@@ -532,6 +519,13 @@ static int mz0380_enum_frameintervals(struct file *file, void *priv,
 	mode = mz0380_find_mode(fival->width, fival->height);
 	if (mode->width != fival->width || mode->height != fival->height)
 		return -EINVAL;
+	if (mz0380_h264_probe) {
+		if (fival->index != 0)
+			return -EINVAL;
+		fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+		fival->discrete = mz0380_reported_interval(dev);
+		return 0;
+	}
 
 	capture.width = fival->width;
 	capture.height = fival->height;
@@ -580,7 +574,8 @@ static int mz0380_enum_input(struct file *file, void *priv,
 		return -EINVAL;
 
 	if (index == dev->capture.input) {
-		if (READ_ONCE(dev->streaming)) {
+		if (READ_ONCE(dev->streaming) ||
+		    READ_ONCE(dev->pipeline_running)) {
 			locked = dev->signal_locked;
 		} else {
 			struct v4l2_dv_timings live;
@@ -625,7 +620,7 @@ static int mz0380_g_parm(struct file *file, void *priv,
 
 	memset(&a->parm, 0, sizeof(a->parm));
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	a->parm.capture.timeperframe = dev->capture.timeperframe;
+	a->parm.capture.timeperframe = mz0380_reported_interval(dev);
 	/*
 	 * M171: the node advertises V4L2_CAP_READWRITE, so read() is a
 	 * supported I/O method and V4L2 requires this field to say how many
@@ -647,13 +642,16 @@ static int mz0380_s_parm(struct file *file, void *priv,
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	interval = mz0380_find_interval(dev->capture.width, dev->capture.height,
-					&a->parm.capture.timeperframe);
-	dev->capture.timeperframe = *interval;
+	if (!mz0380_h264_probe) {
+		interval = mz0380_find_interval(dev->capture.width,
+						dev->capture.height,
+						&a->parm.capture.timeperframe);
+		dev->capture.timeperframe = *interval;
+	}
 
 	memset(&a->parm, 0, sizeof(a->parm));
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	a->parm.capture.timeperframe = dev->capture.timeperframe;
+	a->parm.capture.timeperframe = mz0380_reported_interval(dev);
 	a->parm.capture.readbuffers = MZ0380_READ_BUFFERS;
 
 	return 0;
@@ -772,482 +770,6 @@ static const struct v4l2_ctrl_ops mz0380_ctrl_ops = {
 	.g_volatile_ctrl = mz0380_g_volatile_ctrl,
 	.s_ctrl = mz0380_s_ctrl,
 };
-
-/* ===== vb2 queue ops ================================================= */
-
-static int mz0380_queue_setup(struct vb2_queue *vq,
-			      unsigned int *nbuffers, unsigned int *nplanes,
-			      unsigned int sizes[], struct device *alloc_devs[])
-{
-	struct mz0380_dev *dev = vb2_get_drv_priv(vq);
-	unsigned int size = mz0380_current_sizeimage(dev);
-
-	if (*nplanes) {
-		if (sizes[0] < size)
-			return -EINVAL;
-		return 0;
-	}
-
-	*nplanes = 1;
-	sizes[0] = size;
-	if (*nbuffers < 3)
-		*nbuffers = 3;
-	return 0;
-}
-
-static int mz0380_buf_prepare(struct vb2_buffer *vb)
-{
-	struct mz0380_dev *dev = vb2_get_drv_priv(vb->vb2_queue);
-	unsigned int size = mz0380_current_sizeimage(dev);
-
-	if (vb2_plane_size(vb, 0) < size) {
-		dev_err(&dev->pci->dev,
-			"buffer too small (%lu < %u)\n",
-			vb2_plane_size(vb, 0), size);
-		return -EINVAL;
-	}
-	vb2_set_plane_payload(vb, 0, 0);
-	return 0;
-}
-
-static void mz0380_buf_queue(struct vb2_buffer *vb)
-{
-	struct mz0380_dev *dev = vb2_get_drv_priv(vb->vb2_queue);
-	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
-	struct mz0380_vb_buffer *buf =
-		container_of(vbuf, struct mz0380_vb_buffer, vb);
-	unsigned long flags;
-
-	spin_lock_irqsave(&dev->buf_lock, flags);
-	list_add_tail(&buf->list, &dev->buf_list);
-	spin_unlock_irqrestore(&dev->buf_lock, flags);
-}
-
-static u32 mz0380_source_fps(const struct v4l2_dv_timings *timings);
-static int mz0380_start_streaming(struct vb2_queue *vq, unsigned int count)
-{
-	struct mz0380_dev *dev = vb2_get_drv_priv(vq);
-	int ret;
-
-	if (!dev->dma_armed) {
-		dev_warn(&dev->pci->dev,
-			 "start_streaming called but DMA is not armed (enable_dma=1?)\n");
-		ret = -ENODEV;
-		goto error;
-	}
-
-	/*
-	 * Real capture is driven by whatever the receiver is actually locked
-	 * to, so re-detect here: SET_VIC carries the geometry AND the frame
-	 * rate down to the card, and a stale timing would arm the encoder for
-	 * the wrong cadence. The fake-frame generator ignores the input, so a
-	 * lock failure is only fatal for the real path.
-	 */
-	if (!mz0380_stream_nosg) {
-		struct v4l2_dv_timings live;
-
-		ret = mz0380_query_signal(dev, &live);
-		if (ret && dev->have_last_good && mz0380_signal_cache_ms &&
-		    time_before(jiffies, dev->last_good_stamp +
-				msecs_to_jiffies(mz0380_signal_cache_ms))) {
-			/*
-			 * M65: no live lock, but we detected this source's mode
-			 * moments ago. A source that transmits in ~300ms bursts
-			 * around a power-cycle can never be locked at the
-			 * instant STREAMON runs, and SET_VIC only needs the
-			 * geometry - which has not changed. Arm with what we
-			 * measured; the frames are black until the source
-			 * transmits again, which is an EDID problem, not a
-			 * reason to refuse to stream.
-			 */
-			live = dev->last_good_timings;
-			dev->detected_timings = live;
-			dev->signal_locked = true;
-			dev->capture.source_width = live.bt.width;
-			dev->capture.source_height = live.bt.height;
-			dev->capture.source_fps = mz0380_source_fps(&live);
-			dev->capture.source_interlaced = live.bt.interlaced;
-			if (dev->capture.source_fps) {
-				dev->capture.timeperframe.numerator = 1;
-				dev->capture.timeperframe.denominator =
-					dev->capture.source_fps;
-			}
-			dev_info(&dev->pci->dev,
-				 "no live lock (%d) - arming with the detection from %ums ago (%ux%u%c) [signal_cache_ms=%u]\n",
-				 ret,
-				 jiffies_to_msecs(jiffies - dev->last_good_stamp),
-				 live.bt.width, live.bt.height,
-				 live.bt.interlaced ? 'i' : 'p',
-				 mz0380_signal_cache_ms);
-			ret = 0;
-		} else if (ret && mz0380_stream_without_signal) {
-			/*
-			 * M113: no source, on purpose. Arm at 1080p60 so the
-			 * card runs its normal capture path and falls back to
-			 * its own no-signal splash - which is what Windows
-			 * delivers to OBS in this exact situation.
-			 */
-			dev->capture.source_width = 1920;
-			dev->capture.source_height = 1080;
-			dev->capture.source_fps = 60;
-			dev->capture.source_interlaced = false;
-			dev->capture.timeperframe.numerator = 1;
-			dev->capture.timeperframe.denominator = 60;
-			dev->signal_locked = false;
-			dev_info(&dev->pci->dev,
-				 "no HDMI signal locked (%d) - arming anyway at 1920x1080p60 [stream_without_signal=1]; expect the card's no-signal splash, not source pixels\n",
-				 ret);
-			ret = 0;
-		} else if (ret) {
-			dev_warn(&dev->pci->dev,
-				 "no HDMI signal locked (%d) - check the source, HPD and EDID load\n",
-				 ret);
-			goto error;
-		}
-
-		dev_info(&dev->pci->dev,
-			 "live input %ux%u%c@%u -> encoder output %ux%u@%u\n",
-			 dev->capture.source_width, dev->capture.source_height,
-			 dev->capture.source_interlaced ? 'i' : 'p',
-			 dev->capture.source_fps, dev->capture.width,
-			 dev->capture.height,
-			 dev->capture.timeperframe.denominator /
-			 max_t(u32, dev->capture.timeperframe.numerator, 1));
-
-		/*
-		 * M174: the buffers and the card must agree on the frame size.
-		 *
-		 * Two geometries have always existed side by side and nothing
-		 * checked they matched. mz0380_queue_setup() sizes the vb2
-		 * plane from capture.width/height - what the application
-		 * negotiated, 1920x1080 unless it said otherwise - while the
-		 * drain measures and delivers
-		 * source_width * source_height * 3/2, what the card actually
-		 * wrote. On the only source this project has ever tested those
-		 * are the same number, so the gap has never shown.
-		 *
-		 * With a 720p source they differ: the card writes 1382400
-		 * bytes, the drain delivers them, and the application is
-		 * holding a buffer it was told is 1920x1080 with 1382400 bytes
-		 * of payload in it. Nothing errors. It just renders garbage,
-		 * which is the worst available outcome and precisely the class
-		 * of defect M168 was about.
-		 *
-		 * Refusing is the honest answer, and it is also the useful one:
-		 * the source-change event queued below tells a well-behaved
-		 * client to re-negotiate, S_FMT to the detected geometry then
-		 * resizes the buffers, and the capture works. Delivering the
-		 * mislabelled frame would leave the client no way to find out.
-		 *
-		 * NOTE: the non-1080p path is CORRECT BY CONSTRUCTION here, not
-		 * verified - this project has never had a non-1080p source. All
-		 * that is proven is that the old behaviour was wrong.
-		 */
-		if (mz0380_strict_geometry && dev->signal_locked &&
-		    dev->capture.source_width &&
-		    dev->capture.source_height &&
-		    (dev->capture.source_width != dev->capture.width ||
-		     dev->capture.source_height != dev->capture.height)) {
-			dev_err(&dev->pci->dev,
-				"refusing to stream: the source is %ux%u but the buffers were allocated for %ux%u, and this path has no scaler - the card would write %u bytes into a buffer described as %u. S_FMT to %ux%u (or VIDIOC_SUBSCRIBE_EVENT the source change) and try again\n",
-				dev->capture.source_width,
-				dev->capture.source_height,
-				dev->capture.width, dev->capture.height,
-				dev->capture.source_width *
-				dev->capture.source_height * 3 / 2,
-				dev->capture.width * dev->capture.height * 3 / 2,
-				dev->capture.source_width,
-				dev->capture.source_height);
-			if (dev->video_registered)
-				mz0380_signal_event(dev);
-			ret = -EPIPE;
-			goto error;
-		}
-	}
-
-	/*
-	 * Fake-frame path: no completion IRQ exists (M41), so streaming is a
-	 * polling kthread that spawns the encoder itself, once per frame
-	 * (M39). The real path arms the encoder here and delivers from the
-	 * MSI-driven drain.
-	 */
-	/* Completion work may run as soon as START is posted. */
-	dev->streaming = true;
-	if (mz0380_stream_nosg)
-		ret = mz0380_nosg_capture_start(dev);
-	else
-		ret = mz0380_dma_start(dev);
-	if (ret) {
-		dev->streaming = false;
-		dev_err(&dev->pci->dev,
-			"%s failed (%d)\n",
-			mz0380_stream_nosg ? "nosg_capture_start" : "dma_start",
-			ret);
-		goto error;
-	}
-
-	return 0;
-
-error:
-	{
-		struct mz0380_vb_buffer *buf, *tmp;
-		unsigned long flags;
-		spin_lock_irqsave(&dev->buf_lock, flags);
-		list_for_each_entry_safe(buf, tmp, &dev->buf_list, list) {
-			list_del(&buf->list);
-			vb2_buffer_done(&buf->vb.vb2_buf,
-					VB2_BUF_STATE_QUEUED);
-		}
-		spin_unlock_irqrestore(&dev->buf_lock, flags);
-	}
-	return ret;
-}
-
-static void mz0380_stop_streaming(struct vb2_queue *vq)
-{
-	struct mz0380_dev *dev = vb2_get_drv_priv(vq);
-	struct mz0380_vb_buffer *buf, *tmp;
-	unsigned long flags;
-
-	/*
-	 * nosg: the capture thread owns the start/stop cycle; its last
-	 * iteration already sent STOP, so only the thread needs joining. The
-	 * verbose dma_stop still runs for its end-of-stream diagnostics dump.
-	 */
-	dev->streaming = false;
-	mz0380_nosg_capture_stop(dev);
-	mz0380_dma_stop(dev);
-
-	spin_lock_irqsave(&dev->buf_lock, flags);
-	list_for_each_entry_safe(buf, tmp, &dev->buf_list, list) {
-		list_del(&buf->list);
-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-	}
-	spin_unlock_irqrestore(&dev->buf_lock, flags);
-}
-
-static const struct vb2_ops mz0380_qops = {
-	.queue_setup     = mz0380_queue_setup,
-	.buf_prepare     = mz0380_buf_prepare,
-	.buf_queue       = mz0380_buf_queue,
-	.start_streaming = mz0380_start_streaming,
-	.stop_streaming  = mz0380_stop_streaming,
-#ifdef MZ0380_HAVE_VB2_WAIT_OPS
-	/*
-	 * Kernels up to 6.x require the driver to drop q->lock around a
-	 * blocking DQBUF itself. The ops and the vb2_ops_wait_* helpers were
-	 * removed once vb2 core took that over, so newer kernels must not set
-	 * them. The Makefile probes videobuf2-v4l2.h rather than testing
-	 * LINUX_VERSION_CODE - the removal release is not worth guessing.
-	 */
-	.wait_prepare    = vb2_ops_wait_prepare,
-	.wait_finish     = vb2_ops_wait_finish,
-#endif
-};
-
-/* ===== HDMI signal detect ============================================ */
-
-static const struct v4l2_dv_timings mz0380_no_signal = {
-	.type = V4L2_DV_BT_656_1120,
-};
-
-static const struct v4l2_dv_timings_cap mz0380_timings_cap = {
-	.type = V4L2_DV_BT_656_1120,
-	.bt = {
-		.min_width = 640,
-		.max_width = 1920,
-		.min_height = 480,
-		.max_height = 1080,
-		.min_pixelclock = 24000000,
-		.max_pixelclock = 297000000,
-		.standards = V4L2_DV_BT_STD_CEA861,
-		.capabilities = V4L2_DV_BT_CAP_INTERLACED |
-				V4L2_DV_BT_CAP_PROGRESSIVE,
-	},
-};
-
-static u32 mz0380_source_fps(const struct v4l2_dv_timings *timings)
-{
-	const struct v4l2_bt_timings *bt = &timings->bt;
-	u64 total = (u64)V4L2_DV_BT_FRAME_WIDTH(bt) *
-		    V4L2_DV_BT_FRAME_HEIGHT(bt);
-
-	if (!total || !bt->pixelclock)
-		return 0;
-
-	return min_t(u64, 255,
-		     div_u64(bt->pixelclock + total / 2, total));
-}
-
-/*
- * HDMI signal query. The card never pushes format to the host (RE_FINDINGS.md
- * M6), but the host reads it straight off the MST3367 receiver over the mailbox
- * I2C proxy once the receiver is out of reset (M15). We delegate to
- * mz0380_mst3367_read_signal(), which brings the receiver up on first use, then
- * reads the mode-detect registers and maps the geometry to a v4l2_dv_timings.
- * -ENOLCK = receiver locked to nothing; -ENODEV = firmware not ready.
- */
-int mz0380_query_signal(struct mz0380_dev *dev,
-			struct v4l2_dv_timings *out)
-{
-	/*
-	 * M170: remember what we last told userspace, so a change can be
-	 * reported as one. mz0380_signal_event() has existed since bring-up
-	 * and NOTHING HAS EVER CALLED IT - the source-change event was
-	 * generated by dead code, to a subscription the ops table refused to
-	 * accept. Both halves are fixed together or neither is worth fixing.
-	 *
-	 * There is no background signal poller in this driver, so the event
-	 * fires when something asks - QUERY_DV_TIMINGS, ENUM_INPUT, or arming
-	 * a stream. That is honest and useful for a client that polls; a
-	 * client that only sleeps on the event still needs a poller, which is
-	 * deliberately not added here because it would drive receiver I2C on a
-	 * timer and M74 is what that costs during a capture.
-	 */
-	bool was_locked = dev->signal_locked;
-	struct v4l2_dv_timings prev = dev->detected_timings;
-	int ret = mz0380_mst3367_read_signal(dev, out);
-
-	if (ret) {
-		dev->signal_locked = false;
-		dev->detected_timings = mz0380_no_signal;
-		dev->capture.source_width = 0;
-		dev->capture.source_height = 0;
-		dev->capture.source_fps = 0;
-		dev->capture.source_interlaced = false;
-		*out = mz0380_no_signal;
-		if (was_locked && dev->video_registered)
-			mz0380_signal_event(dev);
-		return ret == -ENODEV ? -ENOLCK : ret;
-	}
-
-	if (dev->video_registered &&
-	    (!was_locked || !v4l2_match_dv_timings(&prev, out, 250000, false)))
-		mz0380_signal_event(dev);
-
-	dev->signal_locked = true;
-	dev->detected_timings = *out;
-	dev->set_timings = *out;	/* M171: G tracks reality absent an S */
-	dev->last_good_timings = *out;      /* M65: survives later failures */
-	dev->last_good_stamp = jiffies;
-	dev->have_last_good = true;
-	dev->capture.source_width = out->bt.width;
-	dev->capture.source_height = out->bt.height;
-	dev->capture.source_fps = mz0380_source_fps(out);
-	dev->capture.source_interlaced = out->bt.interlaced;
-	if (dev->capture.source_fps) {
-		/* The firmware exposes one whole-frame fps byte; report that cadence. */
-		dev->capture.timeperframe.numerator = 1;
-		dev->capture.timeperframe.denominator =
-			dev->capture.source_fps;
-	}
-	return 0;
-}
-EXPORT_SYMBOL_GPL(mz0380_query_signal);
-
-void mz0380_signal_event(struct mz0380_dev *dev)
-{
-	static const struct v4l2_event ev = {
-		.type = V4L2_EVENT_SOURCE_CHANGE,
-		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
-	};
-
-	v4l2_event_queue(&dev->vdev, &ev);
-}
-EXPORT_SYMBOL_GPL(mz0380_signal_event);
-
-static int mz0380_query_dv_timings(struct file *file, void *fh,
-				   struct v4l2_dv_timings *t)
-{
-	struct mz0380_dev *dev = video_drvdata(file);
-	return mz0380_query_signal(dev, t);
-}
-
-/*
- * M171: G returns what was SET, QUERY returns what is DETECTED.
- *
- * Both used to answer with the live detection, and S_DV_TIMINGS was a comment
- * saying "no-op-but-validate" that neither noted nor validated. So
- * S_DV_TIMINGS(x) followed by G_DV_TIMINGS returned something else entirely,
- * which is what v4l2-compliance reported as
- * "g_timings.bt.width != enumtimings.timings.bt.width".
- *
- * The card does auto-detect and nothing host-side changes what it receives, so
- * the set value does not steer the hardware - stream start uses the detection.
- * But the ioctl contract is still a contract, and a successful detection
- * updates the set value too, so G tracks reality for anyone who never calls S.
- */
-static int mz0380_g_dv_timings(struct file *file, void *fh,
-			       struct v4l2_dv_timings *t)
-{
-	struct mz0380_dev *dev = video_drvdata(file);
-
-	*t = dev->set_timings;
-	return 0;
-}
-
-static int mz0380_s_dv_timings(struct file *file, void *fh,
-			       struct v4l2_dv_timings *t)
-{
-	struct mz0380_dev *dev = video_drvdata(file);
-	const struct mz0380_mode *mode;
-	const struct v4l2_fract *interval;
-
-	if (!v4l2_valid_dv_timings(t, &mz0380_timings_cap, NULL, NULL))
-		return -EINVAL;
-
-	/*
-	 * M172: busy only blocks a CHANGE.
-	 *
-	 * A bare vb2_is_busy() test failed v4l2-compliance's
-	 * testCanSetSameTimings: it allocates buffers and then sets the timings
-	 * it already has, which must succeed because nothing about the buffers
-	 * is invalidated by setting a value to itself. -EBUSY is for the case
-	 * where the new timings would resize the format out from under
-	 * allocated buffers.
-	 */
-	if (vb2_is_busy(&dev->vb_queue) &&
-	    !v4l2_match_dv_timings(&dev->set_timings, t, 0, false))
-		return -EBUSY;
-
-	dev->set_timings = *t;
-
-	/*
-	 * M172: and the format follows the timings.
-	 *
-	 * v4l2-compliance caught this as
-	 * "fmt.fmt.pix.width >= enumtimings.timings.bt.width * 1.5" - it set a
-	 * small timing, asked for the format, and was still told 1920x1080,
-	 * because S_DV_TIMINGS touched nothing but its own stored copy.
-	 *
-	 * For an HDMI receiver the capture format IS the source geometry; there
-	 * is no scaler on this path, and the delivered frame is exactly
-	 * width*height*3/2 of I420. So a client that declares the incoming
-	 * timings must get a format that matches them, snapped to a mode this
-	 * driver supports.
-	 */
-	mode = mz0380_find_mode(t->bt.width, t->bt.height);
-	interval = mz0380_find_interval(mode->width, mode->height,
-					&dev->capture.timeperframe);
-	dev->capture.width = mode->width;
-	dev->capture.height = mode->height;
-	dev->capture.timeperframe = *interval;
-
-	return 0;
-}
-
-static int mz0380_enum_dv_timings(struct file *file, void *fh,
-				  struct v4l2_enum_dv_timings *t)
-{
-	return v4l2_enum_dv_timings_cap(t, &mz0380_timings_cap, NULL, NULL);
-}
-
-static int mz0380_dv_timings_cap(struct file *file, void *fh,
-				 struct v4l2_dv_timings_cap *cap)
-{
-	*cap = mz0380_timings_cap;
-	return 0;
-}
 
 /* ===== ioctl table & file ops ======================================== */
 
@@ -1519,195 +1041,4 @@ void mz0380_video_unregister(struct mz0380_dev *dev)
 		v4l2_device_unregister(&dev->v4l2_dev);
 		dev->v4l2_registered = false;
 	}
-}
-
-void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
-{
-	unsigned int fps_milli;
-	u32 hw_input;
-	u32 hw_word;
-	u32 hw_mode;
-	u32 hw_mode_word;
-	u32 hw_mode_reg;
-	u32 hw_mode_mask;
-	u32 hw_mode_shift;
-	u32 hw_quality;
-	u32 hw_quality_word;
-	u32 hw_quality_reg;
-	u32 hw_quality_mask;
-	u32 hw_quality_shift;
-	u32 hw_gop;
-	u32 hw_gop_word;
-	u32 hw_gop_reg;
-	u32 hw_gop_mask;
-	u32 hw_gop_shift;
-	u32 candidate_qp_step;
-	u32 candidate_qp_step_word;
-	u32 candidate_qp_step_reg;
-	u32 candidate_qp_step_mask;
-	u32 candidate_qp_step_shift;
-	u32 hw_qp_step;
-	u32 hw_qp_step_word;
-	u32 hw_qp_step_reg;
-	u32 hw_qp_step_mask;
-	u32 hw_qp_step_shift;
-	u32 candidate_b_frames;
-	u32 candidate_b_frames_word;
-	u32 candidate_b_frames_reg;
-	u32 candidate_b_frames_mask;
-	u32 candidate_b_frames_shift;
-	u32 hw_b_frames;
-	u32 hw_b_frames_word;
-	u32 hw_b_frames_reg;
-	u32 hw_b_frames_mask;
-	u32 hw_b_frames_shift;
-	u32 hw_bitrate;
-	u32 hw_bitrate_word;
-	u32 hw_bitrate_reg;
-	u32 hw_bitrate_mask;
-	u32 hw_bitrate_shift;
-	u32 fourcc = mz0380_current_pixelformat();
-
-	fps_milli = DIV_ROUND_CLOSEST(dev->capture.timeperframe.denominator * 1000,
-				      max_t(u32, dev->capture.timeperframe.numerator, 1));
-
-	if (!mz0380_enable_video) {
-		seq_puts(m,
-			 "  capture    : cached encoded-first control model (V4L2 node disabled; load with enable_video=1 to register /dev/video*)\n");
-	} else {
-		seq_puts(m, "  capture    : encoded-first V4L2 scaffolding\n");
-	}
-
-	if (dev->video_registered)
-		seq_printf(m, "  video node : /dev/%s\n",
-			   video_device_node_name(&dev->vdev));
-	seq_printf(m, "  pixelformat: %4.4s\n", (char *)&fourcc);
-	/*
-	 * M169: the spawn budget, which is the number that decides whether the
-	 * next hardware run is safe. Per insmod here - the driver cannot see
-	 * across a module reload - so ./mz0380-spawns.sh accumulates it per
-	 * boot, which is the granularity the card's wedge actually has.
-	 */
-	seq_printf(m, "  enc spawns : %u since insmod (card wedges somewhere in 8-18 per POWER CYCLE)\n",
-		   dev->encoder_spawns);
-	seq_printf(m, "  frame size : %ux%u\n",
-		   dev->capture.width, dev->capture.height);
-	seq_printf(m, "  frame rate : %u.%03u fps\n",
-		   fps_milli / 1000, fps_milli % 1000);
-	if (dev->capture.source_width && dev->capture.source_height)
-		seq_printf(m, "  source     : %ux%u%c @ %u fps (SET_VIC input geometry)\n",
-			   dev->capture.source_width,
-			   dev->capture.source_height,
-			   dev->capture.source_interlaced ? 'i' : 'p',
-			   dev->capture.source_fps);
-	else
-		seq_puts(m, "  source     : unlocked\n");
-	seq_printf(m, "  input      : %s\n",
-		   mz0380_input_name(dev->capture.input));
-	if (mz0380_read_hw_input_select(dev, &hw_input, &hw_word)) {
-		if (hw_input < MZ0380_INPUT_COUNT)
-			seq_printf(m,
-				   "  input hw   : %s (%u) raw=%08x via BAR5[0x%04x][2:0]\n",
-				   mz0380_input_name(hw_input), hw_input,
-				   hw_word, MZ0380_INPUT_SELECT_HW_REG);
-		else
-			seq_printf(m,
-				   "  input hw   : invalid (%u) raw=%08x via BAR5[0x%04x][2:0]\n",
-				   hw_input, hw_word,
-				   MZ0380_INPUT_SELECT_HW_REG);
-	}
-	seq_printf(m, "  recordmode : %s\n",
-		   mz0380_record_mode_name(dev->capture.record_mode));
-	seq_printf(m, "               property=%u value=%u\n",
-		   MZ0380_RECORD_MODE_PROPERTY, dev->capture.record_mode);
-	if (mz0380_read_hw_record_mode(dev, &hw_mode, &hw_mode_word,
-				       &hw_mode_reg, &hw_mode_mask,
-				       &hw_mode_shift)) {
-		seq_printf(m,
-			   "  record hw  : %s (%u) raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   mz0380_record_mode_name(hw_mode), hw_mode,
-			   hw_mode_word, hw_mode_reg, hw_mode_mask,
-			   hw_mode_shift);
-	}
-	seq_printf(m, "  quality    : %u\n", dev->capture.quality);
-	if (mz0380_read_hw_quality(dev, &hw_quality, &hw_quality_word,
-				   &hw_quality_reg, &hw_quality_mask,
-				   &hw_quality_shift)) {
-		seq_printf(m,
-			   "  quality hw : %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   hw_quality, hw_quality_word,
-			   hw_quality_reg, hw_quality_mask,
-			   hw_quality_shift);
-	}
-	seq_printf(m, "  bitrate    : %u peak=%u\n",
-		   dev->capture.bitrate, dev->capture.bitrate_peak);
-	if (mz0380_read_hw_bitrate(dev, &hw_bitrate, &hw_bitrate_word,
-				   &hw_bitrate_reg, &hw_bitrate_mask,
-				   &hw_bitrate_shift)) {
-		seq_printf(m,
-			   "  bitrate hw : %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   hw_bitrate, hw_bitrate_word,
-			   hw_bitrate_reg, hw_bitrate_mask,
-			   hw_bitrate_shift);
-	}
-	seq_printf(m, "  gop        : %u\n", dev->capture.gop_size);
-	if (mz0380_read_hw_gop(dev, &hw_gop, &hw_gop_word,
-			       &hw_gop_reg, &hw_gop_mask,
-			       &hw_gop_shift)) {
-		seq_printf(m,
-			   "  gop hw     : %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   hw_gop, hw_gop_word,
-			   hw_gop_reg, hw_gop_mask,
-			   hw_gop_shift);
-	}
-	seq_printf(m, "  qpstep     : %u\n", dev->capture.qp_step);
-	if (mz0380_read_hw_qp_step(dev, &hw_qp_step, &hw_qp_step_word,
-				   &hw_qp_step_reg, &hw_qp_step_mask,
-				   &hw_qp_step_shift)) {
-		seq_printf(m,
-			   "  qpstep hw  : %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   hw_qp_step, hw_qp_step_word,
-			   hw_qp_step_reg, hw_qp_step_mask,
-			   hw_qp_step_shift);
-	}
-	if (mz0380_read_candidate_qp_step(dev, &candidate_qp_step,
-					  &candidate_qp_step_word,
-					  &candidate_qp_step_reg,
-					  &candidate_qp_step_mask,
-					  &candidate_qp_step_shift)) {
-		seq_printf(m,
-			   "  qpstep cand: %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   candidate_qp_step, candidate_qp_step_word,
-			   candidate_qp_step_reg, candidate_qp_step_mask,
-			   candidate_qp_step_shift);
-	}
-	seq_printf(m, "  b-frames   : %u\n", dev->capture.b_frames);
-	if (mz0380_read_hw_b_frames(dev, &hw_b_frames, &hw_b_frames_word,
-				    &hw_b_frames_reg, &hw_b_frames_mask,
-				    &hw_b_frames_shift)) {
-		seq_printf(m,
-			   "  bframes hw : %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   hw_b_frames, hw_b_frames_word,
-			   hw_b_frames_reg, hw_b_frames_mask,
-			   hw_b_frames_shift);
-	}
-	if (mz0380_read_candidate_b_frames(dev, &candidate_b_frames,
-					   &candidate_b_frames_word,
-					   &candidate_b_frames_reg,
-					   &candidate_b_frames_mask,
-					   &candidate_b_frames_shift)) {
-		seq_printf(m,
-			   "  bframes cand: %u raw=%08x via BAR5[0x%04x] mask=0x%x shift=%u\n",
-			   candidate_b_frames, candidate_b_frames_word,
-			   candidate_b_frames_reg, candidate_b_frames_mask,
-			   candidate_b_frames_shift);
-	}
-	seq_printf(m, "  h264       : profile=%s level=%s\n",
-		   mz0380_h264_profile_name(dev->capture.h264_profile),
-		   mz0380_h264_level_name(dev->capture.h264_level));
-	seq_printf(m, "  image ctrl : bright=%u contrast=%u hue=%u sat=%u sharp=%u\n",
-		   dev->capture.brightness, dev->capture.contrast,
-		   dev->capture.hue, dev->capture.saturation,
-		   dev->capture.sharpness);
-	seq_puts(m, "  stream     : disabled until control path and DMA are understood\n");
 }

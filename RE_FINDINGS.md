@@ -11258,3 +11258,1052 @@ where the producer is demonstrably alive and pushing continuously, is a
 different experiment with the same command.
 
 Both cost one spawn each. Neither has been tried.
+
+---
+
+## M177 (hardware/source, 2026-08-24): window 1 is the continuous H.264 output, and V4L2/OBS now consume it
+
+M176's closure was wrong because it treated tinyvenc7's 16-byte preview DMA as
+the only output. Windows registers a separate opcode-`0x04` four-slot bank for
+the encoder. With four 1 MiB backing buffers mapped at IOVAs `0x500000000`
+through `0x800000000`, and the Windows-advertised slot size `0x97f00`, all four
+buffers receive continuous encoded output.
+
+The decisive start sequence is `fw=7`, `win_seq=1`, `win_start_op6=1`,
+`post_mask=0`, `vic_fast_kill=1`. Window 1 must be registered again after
+SET_VIC, because SET_VIC spawns tinyvenc7 and resets the card-side state.
+
+Each slot has a 4 KiB transport header:
+
+```
++0x00  encoded byte count
++0x08  encoder metadata
++0x0c  one-based slot identity
++0x10  duplicate encoded byte count
++0x1000 Annex-B H.264 access unit
+```
+
+The driver validates both lengths, the identity, and the Annex-B start code,
+then strips the transport header and completes one V4L2 H.264 buffer per access
+unit. It also ignores repeated BAR0+0x44 tokens from preview-only completion
+events.
+
+First bounded capture:
+
+```
+77 V4L2 access units, 2 startup drops
+11,476,992-byte elementary stream
+ffprobe: H.264 High, 1920x1080, yuvj420p, level 4.1, 77 frames
+ffmpeg: all 77 frames decoded (one recoverable macroblock error)
+```
+
+The first decoded frame was the live Nucleo-board HDMI picture, not the splash.
+OBS then ran the same path for 910 delivered access units with only 2 drops for
+lack of an initial userspace buffer. Its render 99th percentile was under
+0.5 ms. Continuous HDMI capture is therefore open and working; the remaining
+problem is encoded cadence, not transport or userspace loss.
+
+OBS initially showed black for a separate reason: a hidden old V4L2 source
+owned `/dev/video0`, while the visible duplicate failed with `EBUSY`. Removing
+the duplicate sources left one owner and produced the picture.
+
+---
+
+## M178 (static/source, 2026-08-24): the 12 fps limiter is tinyvenc7 reusing Windows's QP-min byte as a frame divisor
+
+OBS negotiated 60 fps, but the first run converged near 12 fps. The driver
+delivered 910 and dropped only 2, and tinyvenc7 continued producing preview
+completion events near the 60 Hz input rate, so neither OBS nor the host queue
+was the limiter.
+
+tinyvenc7 `vcap_handler` at `0x12668` supplies the explanation:
+
+```
+ldrb  r1, [stream + 0x18]
+bl    __aeabi_uidivmod       ; remainder = input counter % byte
+cmp   remainder, #1
+bne   no_h264_this_frame
+```
+
+SET_ENC_PARAMS mask bit 7 copies payload byte `+0x14` (the field the firmware
+banner calls minimum QP) to `stream+0x18`. Windows sends 5 and runs tinyvenc5,
+where this value is a normal QP bound. We copied that Windows value while
+running tinyvenc7. On tinyvenc7 it therefore also means encode one frame in
+five: `60 / 5 = 12 fps`, exactly the measured cadence.
+
+The fastest usable divisor is 2, giving 30 fps from 60 Hz input. Divisor 1 is
+a firmware edge case: `counter % 1` is always zero and can never equal one, so
+it produces no H.264. Divisor 0 selects a 128-bit schedule bitmap populated by
+opcode `0x32`; the shipping `ep.ko` forwards zero bytes for that opcode, so the
+all-frames schedule is not host-reachable without changing card firmware.
+
+The driver now exposes `h264_frame_divisor`, defaults it to 2, rejects values
+outside 2..255, and passes it in that nominal QP-min byte. The module builds
+cleanly. The 30 fps prediction still needs one post-power-cycle hardware run;
+the previous power cycle ended at 6 SET_VIC spawns, and opening OBS properties
+caused two capture restarts, so do not spend that run before resetting the
+card's spawn tally.
+
+---
+
+## M179 (hardware/source, 2026-08-24): divisor 2 produces 30 fps; OBS latency is a separate buffering problem
+
+The first divisor-2 OBS run used one SET_VIC spawn and delivered 1125 frames
+before the live status sample. Consecutive card access units in the kernel log
+arrived 32.7-34.1 ms apart. The complete OBS session captured 1975 frames from
+23:30:53.630 to 23:32:02.949: 28.5 fps including encoder startup, converging on
+the predicted 30 fps. OBS render work remained negligible (99th percentile
+0.513 ms). The divisor fix is therefore proven.
+
+The source still felt delayed/unresponsive because two independent timing
+facts were wrong for a low-latency preview:
+
+1. The driver advertised the 60 Hz VIC input cadence even though tinyvenc7
+   emitted H.264 at 30 Hz. The H.264 V4L2 path now enumerates only its effective
+   `divisor/source_fps` interval and G/S_PARM return the same value, while the
+   internal source interval remains 60 Hz for SET_VIC.
+2. OBS's Linux V4L2 source defaults `buffering=true`; the saved scene did not
+   override it. For interactive capture, uncheck **Use Buffering** on the one
+   V4L2 source. This changes OBS's async queue mode and does not change the
+   card's encoder cadence.
+
+Ten `no queued vb2 buffer` messages occurred in a short burst during the live
+status interaction, but 10/1135 is below one percent and cannot explain the
+overall responsiveness. The producer itself stayed at a regular 30 Hz.
+
+The corrected-cadence module builds cleanly but needs a new post-power-cycle
+OBS run. The last cycle ended at 7 spawns, so no further run is safe on it.
+
+---
+
+## M180 (hardware/OBS, 2026-08-24): 30 fps reporting verified; disabling OBS buffering improves responsiveness
+
+After a full power cycle, the corrected-cadence module was loaded with
+`VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=1
+H264DIVISOR=2`. `VIDIOC_ENUM_FRAMEINTERVALS` reported a discrete 0.033 s / 30.000
+fps interval for H.264 at all four advertised sizes. OBS independently logged
+`Framerate: 30.00 fps` and set its select timeout to 166666 us (five frame
+periods), proving the V4L2 reporting fix reached the application.
+
+Turning off the OBS source's **Use Buffering** option made the live preview
+visibly smoother/more responsive. Although OBS itself was not restarted,
+applying the source property did restart V4L2 capture: the log stopped the first
+capture after 447 frames and began a second one about 397 ms later. Corresponding
+driver status showed two SET_VIC spawns. Treat opening/applying source Properties
+as potentially costing one spawn in this installed OBS build.
+
+The post-change status showed a locked 1920x1080p60 HDMI input, 1111 H.264
+frames delivered, 10 dropped, and zero command timeouts. The ten drops form the
+expected approximately 333 ms no-vb2-buffer gap around capture restart, not a
+producer stall. The firmware continued generating access units every roughly
+33.3 ms. The machine/card will be fully powered off before the next session, so
+the next run starts with a reset card spawn budget.
+
+### Requirement carried forward after M180
+
+The user states that the card should work at 60 fps. Therefore M178's 30 fps
+result is a working checkpoint, not project closure. It proves only that
+tinyvenc7's currently selected modulo/divisor mode cannot encode every 60 Hz
+input frame (`N=2` gives 30; `N=1` never satisfies remainder 1). The next
+session must use the Windows collection at
+`/run/media/wolffyx/Work/hd60-trace/collect-2026-08-19` to find the all-frame
+mode or missing initialization. Re-examine divisor 0 / the 128-bit schedule,
+opcode `0x32` and alternate transports, main versus sub stream setup, and
+pre-`SET_ENC_PARAMS` state. Do not generalize the current divisor-mode limit
+into a claim that the card or complete firmware cannot do 60 fps.
+
+---
+
+## M181 (hardware/OBS, 2026-08-25): the post-power-cycle run is healthy; OBS spent three spawns
+
+After removing mains power and starting clean, the documented live command was
+run unchanged:
+
+```
+sudo env VICFW=7 H264PROBE=1 POLLDRAIN=0 \
+    WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=1 \
+    H264DIVISOR=2 ./mz0380-live.sh load
+```
+
+The board reported its already-running firmware 1.11 and legacy INTx came up
+normally. The subsequent status sample, while OBS was the sole `/dev/video0`
+owner, reported:
+
+```
+signal       : locked 1920x1080p60
+SET_VIC sent : 3
+H.264        : 2915 delivered, 10 dropped (current stream)
+timeouts     : 0
+users        : 1
+```
+
+The ten drops form one contiguous producer-paced burst from 540.906351 through
+541.206733: one access unit every about 33 ms had no queued vb2 buffer. That is
+userspace buffer starvation over roughly 333 ms, not an HDMI unlock or encoder
+stall. The receiver remained locked and its post-START output/link snapshots
+were normal immediately afterward.
+
+This run independently confirms that the corrected 30 fps H.264 path survives
+a cold card start and a longer OBS session. It does **not** test 60 fps: the
+encoder still ran with `h264_frame_divisor=2`. `SET_VIC sent: 3` proves OBS
+caused three V4L2 STREAMON cycles during the attempt. The log alone cannot say
+which UI actions caused the two extra cycles, so do not attribute them more
+narrowly; the operational rule remains that reopening/applying Properties can
+spend another spawn.
+
+---
+
+## M182 (Windows trace/static, 2026-08-25): Windows does not select an all-frame H.264 schedule; its raw buffer topology is the real unimplemented difference
+
+The complete saved Windows collection was revisited specifically for the 60 fps
+requirement. The 1080p60 transitions in
+`logs/hd60-bringup-20260819-223305.log` say:
+
+```
+[CH00] vi=6, fw=7, cx=1920, cy=1080, fps=60, ...
+SET_ENC main: fps=60, ... qp=5~51
+SET_ENC sub : fps=60, ... qp=5~51
+```
+
+That is not an all-frame tinyvenc7 H.264 configuration. M178 proved that
+tinyvenc7 copies this nominal QP-min byte into the divisor used by
+`(frame_counter % N) == 1`; `N=5` selects one encoded frame in five. The
+Windows driver's structural mailbox sweep finds 38 opcodes and **does not
+contain `0x32`**, so there is no traced Windows host command populating the
+128-bit all-frame schedule either.
+
+This corrects the next-work premise after M180. The saved Windows trace does not
+hide a different `SET_ENC_PARAMS` value or an opcode-`0x32` send that Linux
+missed. Either Windows' requested 60 fps was not a measurement of 60 distinct
+delivered frames, or its usable 60 fps capture comes through a different output
+path. The latter now has a concrete structural candidate.
+
+For the exact `PCI\VEN_12AB&DEV_0380&SUBSYS_00061CFA` branch, disassembly of the
+Windows buffer-registration function at `0x14027b62b..0x14027b925` shows:
+
+| opcode | bank | buffers | advertised bytes | context address fields |
+|---|---:|---:|---:|---|
+| `0x02` | window 0, first half | 4 | `0x466000` | `+0x190..+0x1c0` |
+| `0x08` | window 0, second half | 4 | `0x466000` | `+0x1d0..+0x200` |
+| `0x03` | window 3/control | 4 per group | `0x2000` | common small pool |
+| `0x04` | window 1 | 4 | `0x34bd00` | `+0x390..+0x3c0` |
+| `0x05` | window 2 | 4 | `0x34bd00` | `+0x590..+0x5c0` |
+
+The sizes agree with the Windows startup line `[MEMORY] [00466000]
+[0034BD00] [0034BD00]`: `0x466000` is a 2048-stride, 1125-line YUV422-sized
+region plus 4096 bytes, while `0x34bd00` is the corresponding YUV420-sized
+region plus 256 bytes.
+
+Linux does not reproduce that topology:
+
+- its opcode-`0x02` ring has four 4 MiB allocations, smaller than `0x466000`;
+- `set_buf_op8=1` sends the **same four addresses** again rather than the four
+  independent addresses Windows uses;
+- the working live path assigns opcode `0x04` to a separate four-slot
+  `0x097f00` H.264 transport ring.
+
+This difference was never tested by M93/M116: those experiments enabled op
+`0x08` with aliased buffers, under the old path, and therefore did not reproduce
+Windows' second four-buffer bank.
+
+### Next experiment, after a host-only implementation
+
+Add an opt-in raw-bank diagnostic with eight independently mapped buffers:
+four for opcode `0x02` and four for opcode `0x08`, each advertising `0x466000`.
+Keep it separate from `h264_probe`, poison both banks distinctly, and inspect
+write extents plus the BAR0 completion token during one bounded `fw=7` run.
+The discriminator is exact:
+
+- a complete raw frame in either bank identifies the 60 fps data path;
+- 16 bytes in both banks closes this buffer-topology lead;
+- writes only in the second bank prove that aliasing op `0x08` hid the Windows
+  producer.
+
+Do not spend that spawn until the independent mappings and bounds are
+build-checked. Do not retry divisor 1 or host opcode `0x32`; both are already
+closed statically.
+
+---
+
+## M183 (user observation, 2026-08-25): Linux freezes the last frame across source loss and resumes after reconnect; Windows presents NO SIGNAL
+
+The user supplied the missing user-visible comparison:
+
+- On Windows, when no HDMI source is available, the capture output displays a
+  **NO SIGNAL** message rather than holding the previous frame.
+- On the current Linux H.264 path, moving to another source/device froze the
+  preview on the last decoded frame while the input was absent.
+- After the replacement device was connected, the picture changed and live
+  capture started working again.
+
+The first point is consistent with the card's already-proven rendered NO SIGNAL
+splash, but this observation alone does not establish whether the Windows
+driver asks the firmware for that splash or substitutes it elsewhere. Linux's
+freeze is expected for an H.264 consumer receiving no new access units: OBS
+continues displaying its last decoded frame.
+
+The recovery is the important positive result. The receiver and running live
+path can apparently survive a source-loss/relock transition; a driver reload is
+not intrinsically required just because the HDMI source changes. However, the
+observation alone cannot prove that OBS did not cycle V4L2 internally. Preserve
+the `SET_VIC sent` count immediately before and after the next source swap:
+
+- unchanged count = same tinyvenc7 process relocked and resumed;
+- incremented count = OBS recovered by STREAMOFF/STREAMON and spent another
+  encoder spawn.
+
+Do not implement the Windows-style no-signal display by respawning the card's
+firmware encoder on every unlock. That would consume the finite per-power-cycle
+spawn budget. It is a presentation/fallback feature separate from the 60 fps
+data-path work and should eventually be handled without a SET_VIC cycle.
+
+### Reload accounting
+
+The user plans to unload and load the driver again. `mz0380-live.sh unload`
+first commits the current module's encoder-spawn count to the `/run` tally and
+then removes the module, so use it rather than a bare `rmmod`. Reloading resets
+only the driver's `since insmod` counter; it does not reset the card-side
+8--18-spawn budget. Only a slot power removal resets that physical state.
+
+---
+
+## M184 (hardware, 2026-08-25): reload tally is correct; replacement input was 1080p30 YUV422 and captured cleanly
+
+The planned unload/reload was completed without removing card power. The first
+unload reported and committed 3 encoder spawns. `mz0380-spawns.sh` then showed
+3 committed with the module absent. After the next load, OBS had caused 2 new
+`SET_VIC` sends; the final unload therefore committed a power-cycle total of 5:
+
+```
+first unload:  spawns this power cycle: 3 (this load has spawned 3)
+second status: SET_VIC sent: 2
+final unload:  spawns this power cycle: 5 (this load has spawned 2)
+```
+
+This validates the persistent accounting across module unload/reload. A module
+reload did not incorrectly reset the card-side budget.
+
+The second load was healthy: firmware 1.11 remained running, INTx 40 came up,
+the current stream delivered 301 H.264 access units with zero drops, and there
+were zero command timeouts. The one early
+`len=3435973836 ... prefix=cc cc cc cc` message is the expected untouched
+`0xcccccccc` poison sentinel before slot 3's first completion; later delivery
+proves it was not a stuck slot.
+
+This source was not the earlier 60 Hz input. Its receiver measurements were:
+
+```
+htot=2200 vtot=1125 hper=336 vper=299 hact=1920
+input colorspace YUV422 (B2:48=b0)
+```
+
+Those counters identify 1920x1080p30. The prior cold-start source measured
+`hper~=674 vper~=599` (1920x1080p60) and reported YUV444 (`B2:48=d2`). The
+encoder and preview parameters in this reload were both set to 30 fps, so the
+301 clean access units demonstrate correct capture of the replacement 30 Hz
+source, not delivery of 60 distinct frames per second.
+
+The current status already read `SET_VIC sent: 2`, but there is no preserved
+count immediately before the source was disconnected. Consequently this run
+still cannot prove whether source-loss recovery kept one encoder instance alive
+or OBS performed a STREAMOFF/STREAMON. If that distinction is tested again,
+capture `status` before disconnect, while disconnected, and after reconnect,
+without opening OBS Properties. Because the power-cycle tally is now 5, remove
+slot power before spending additional diagnostic spawns.
+
+---
+
+## M185 (host-only, 2026-08-25): adaptive card readiness, short live-lock cache, and first file-size refactor
+
+The apparent 25-second card-boot delay in the live workflow was not imposed by
+the card. `insmod` is synchronous and returns after the PCI driver's probe has
+finished, yet `mz0380-live.sh` then slept for 25 seconds unconditionally. The
+latest hardware log showed CMD_INIT/version completing in roughly 100 ms, so
+that sleep delayed a healthy load without testing anything. It is replaced by
+an early-exit device-node poll, bounded by `LOADWAIT=5` seconds.
+
+The actual cold-card CMD_INIT wait is now adaptive too. The old ten attempts at
+600 ms allowed only about six seconds before the driver gave up permanently for
+that probe. `card_ready_timeout_ms=15000` now supplies a deadline: the first
+successful response exits immediately, while a slow flash boot may continue
+retrying for up to 15 seconds. The CMD_INIT log includes attempt count and
+elapsed milliseconds so this can be measured rather than inferred.
+
+OBS issues bursts of duplicate DV-timings queries. One successful MST3367 mode
+measurement takes roughly 80--180 ms of serialized mailbox traffic, so several
+queries can add visible negotiation delay and contend with other commands.
+`signal_query_cache_ms=1000` now reuses only a successful, currently locked
+result for one second. It does not extend the 30-second stale-mode fallback used
+to arm a stream; it is a separate short cache. Signal loss may be visible one
+second late. Set the new parameter to zero for an exact pre-change comparison.
+
+The first structural split moved unrelated responsibilities out of the former
+6739-line `mz0380-core.c`:
+
+- `mz0380-mailbox.c`: mailbox transport, peripheral proxy, card handshake;
+- `mz0380-pci.c`: PCI probe/remove and BAR ownership;
+- three parameter files grouped by base/stream, receiver, and Windows sequence;
+- control read/synchronization and validated write units;
+- snapshot, proc diagnostic, proc debug, and proc registration/state units;
+- `mz0380-signal.c`, `mz0380-vb2.c`, and `mz0380-video-state.c`.
+
+`mz0380-core.c` is now 13 lines. Every new translation unit is at most 942
+lines, and `mz0380-video.c` is down to 1043. The two remaining large files are
+`mz0380-mst3367.c` (2865) and `mz0380-dma.c` (2766); they deliberately remain
+for a second phase after hardware validates the readiness/cache change.
+
+The full combined module builds successfully against Linux 7.2.0-1-cachyos
+with clang/lld. `git diff --check` and `bash -n mz0380-live.sh` also pass. No
+hardware command or encoder spawn was used for M185.
+
+---
+
+## M186 (hardware, 2026-08-25): adaptive readiness and lock-query cache validated
+
+The M185 build was loaded after resetting slot power with the standard fw7,
+H.264 divisor-2 command. The full shell command completed in 13 seconds,
+including compilation and the mandatory load/unload smoke test. This compares
+with roughly 40 seconds for the previous workflow; the removed unconditional
+25-second sleep accounts for the improvement.
+
+The new readiness diagnostic reported:
+
+```
+CMD_INIT answered on attempt 1 after 6ms (status=0xdddddddd)
+```
+
+Probe began at 4688.296704, firmware 1.11 was reported at 4688.406237, and INTx
+40 was ready at 4688.406274. The real card-side readiness and version handshake
+therefore took about 110 ms in this power cycle. The 15-second deadline imposed
+no delay on the healthy card and remains available for genuinely slow boots.
+
+OBS negotiated with one V4L2 user and exactly one `SET_VIC`. Only one
+`MST3367 signal:` line appeared, versus the earlier repeated query burst. It
+identified a locked 1920x1080p60 YUV444 source (`hper=674`, `vper=599`,
+`B2:48=d2`). This is the expected effect of the one-second successful-query
+cache.
+
+The first status caught the userspace queueing gap at 28 access units delivered
+and 17 dropped. Roughly 21 seconds of kernel time after stream startup, status
+showed 615 delivered and 18 dropped with zero command timeouts. The producer
+continued at the expected approximately 30 fps and the drop count had nearly
+stopped; the drops are missing queued vb2 buffers, not encoder, receiver, or
+mailbox failures. The refactored module remained live and stable.
+
+---
+
+## M187 (host-only, 2026-08-25): MST3367 and DMA split; driver units now meet the size target
+
+After M186 validated the first refactor and readiness behavior on hardware, the
+two remaining oversized translation units were split without changing command
+ordering, register values, allocation sizes, or stream policy.
+
+The former 2865-line MST3367 unit is now:
+
+| unit | responsibility | lines |
+|---|---|---:|
+| `mz0380-mst3367.c` | reset, initialization, EDID/HPD, receiver bring-up | 938 |
+| `mz0380-mst3367-signal.c` | measurement, mode matching, output commit | 744 |
+| `mz0380-mst3367-debug.c` | diagnostics, watch, CSC/output inspection | 653 |
+| `mz0380-mst3367-bitbang.c` | GPIO I2C and EDID discovery tools | 513 |
+
+Shared receiver-private types and low-level helpers are declared only in
+`mz0380-mst3367-internal.h`.
+
+The former 2766-line DMA unit is now:
+
+| unit | responsibility | lines |
+|---|---|---:|
+| `mz0380-dma.c` | allocation, IOVA programming, IRQ/event setup | 836 |
+| `mz0380-dma-stream.c` | encoder configuration and start/stop sequence | 773 |
+| `mz0380-dma-drain.c` | frame inference, event/poll draining | 616 |
+| `mz0380-dma-extent.c` | poison/extent diagnostics and teardown | 355 |
+| `mz0380-dma-nosg.c` | no-SG fallback polling capture | 189 |
+
+Shared DMA-private helpers are declared in `mz0380-dma-internal.h`. The largest
+remaining ordinary `.c` file is `mz0380-video.c` at 1043 lines; every other
+driver implementation unit is 942 lines or less, and `mz0380-core.c` remains
+13 lines.
+
+The full module builds and links successfully against Linux 7.2.0-1-cachyos
+with clang/lld. `git diff --check` and the live-script shell syntax check pass.
+The module currently loaded during M186 is the already-validated pre-M187
+binary; these second-phase mechanical splits have not yet been reloaded onto
+hardware and spent no additional encoder spawn.
+
+---
+
+## M188 (hardware/source, 2026-08-25): the post-START wait starved VB2 and cut a hole in the first H.264 GOP
+
+The first run of the M187 split build exposed a repeatable user-visible startup
+defect: before settling into a clean picture, OBS could show black and the
+first few visible pictures could be blurry, smeared, or incomplete. The exact
+appearance varied with the connected camera.
+
+The status snapshot was otherwise healthy: one V4L2 user, one `SET_VIC`, a
+locked 1920x1080p60 YUV444 input, 465 H.264 access units delivered, 11 dropped,
+and zero command timeouts. Ten of those drops formed this contiguous burst:
+
+```
+7577.589657  first no-queued-vb2 drop
+7577.622176  next drop
+...          one access unit about every 33 ms
+7577.822966  eighth listed drop
+7577.847102  output stage [after START] diagnostic
+7577.856314  final drop in the startup burst
+```
+
+The source explains the timestamp boundary. `mz0380_start_streaming()` marks
+the stream live and calls `mz0380_dma_start()` synchronously from VB2's
+`STREAMON` callback. `mz0380_dma_start()` fires opcode `0x06`, allowing the
+encoder to produce immediately, but then slept 500 ms and ran the receiver
+diagnostic before returning. Userspace cannot finish `VIDIOC_STREAMON`, dequeue
+completed buffers, and requeue them during that wait. Once the finite initial
+VB2 queue was exhausted, `mz0380_drain_h264_snapshot()` had no destination and
+dropped otherwise complete access units. The burst stopped when the diagnostic
+finished and STREAMON returned.
+
+This is not torn DMA or an encoder warm-up effect. Every accepted access unit
+still passed the duplicated length, slot identity, bounds, and Annex-B prefix
+checks. Instead, the deterministic loss cuts a hole in the first inter-frame
+reference chain. H.264 decoder concealment then accounts for camera-dependent
+black, smeared, or blurry output until a clean random-access point/reference
+chain is available.
+
+The synchronous post-START sleep and diagnostic are removed. The earlier
+pre-START receiver diagnostic remains because it supplies the cached input
+colour-space value used immediately by CSC programming. `STREAMON` now returns
+as soon as START succeeds and the drain is armed; any future post-start
+observation must run asynchronously. The remaining isolated eleventh drop at
+7593.221571 is not part of the startup burst and should be monitored separately.
+
+This change is host-only until the next load. The validation discriminator is
+simple: one OBS open should produce no regular approximately 33 ms startup drop
+burst, and the first displayed pictures should decode cleanly.
+
+---
+
+## M189 (hardware/source, 2026-08-25): startup loss is gone with clean kill; live timing queries caused a separate five-frame gap
+
+After a real slot-power reset, the M188 build was loaded with the normal fw7
+H.264 sequence but `FASTKILL=0`. Probe was healthy, firmware 1.11 answered,
+legacy INTx 40 came up, and OBS opened the node exactly once. The first status
+snapshot reported:
+
+```
+SET_VIC sent   : 1
+h264 frames    : 1482 delivered, 0 dropped
+command timeouts: 0
+signal         : locked 1920x1080p60 YUV444
+```
+
+This closes M188's primary discriminator: removing the synchronous 500 ms
+post-START wait eliminated the deterministic startup drop burst. It also proves
+that tinyvenc7's continuous window-1 H.264 path works with the firmware's clean
+encoder-replacement branch (`fast_kill=0`), rather than requiring Windows'
+SIGKILL branch. Keep `FASTKILL=0` in the normal recipe.
+
+A later status snapshot found 1629 delivered and five dropped. Those five were
+one contiguous approximately 33 ms-spaced group at 2498.947507 through
+2499.082578, immediately after:
+
+```
+2498.680961 drained stale EVENT=0x00000001 before command 0x1a
+```
+
+Opcode `0x1a` is the MST3367 mailbox-I2C register read. The proc status reader
+itself performs only cached/MMIO state reads; the live command comes from a
+V4L2 signal/timing query. `ENUM_INPUT` already deliberately avoids receiver
+I2C while streaming, but `VIDIOC_QUERY_DV_TIMINGS` still called
+`mz0380_query_signal()` unconditionally. OBS can issue that ioctl while active,
+and its serialized receiver measurement pauses userspace buffer recycling long
+enough for the finite VB2 queue to empty.
+
+`mz0380_query_dv_timings()` now returns `dev->detected_timings` while streaming,
+or `-ENOLCK` from cached state if the stream has no known lock. This is also the
+only semantically consistent result: the running encoder cannot adopt new
+geometry until a new stream configuration. Outside streaming, the ioctl keeps
+performing a live receiver measurement, so negotiation and source discovery
+remain unchanged. The follow-up is host-only until the next module load.
+
+The single `slot 3 not complete` line containing the untouched `0xcccccccc`
+poison values is the already-understood pre-first-write observation from M184;
+it did not increment the dropped-frame count and is unrelated to both gaps.
+
+---
+
+## M190 (host-only, 2026-08-25): frame-silence HDMI hotplug recovery and clean-IDR delivery
+
+Moving the camera cable from the Elgato to a USB capture device and back could
+leave OBS frozen on its last Elgato picture. This exposed a real missing
+lifecycle rather than an ordinary decoder colour/range problem.
+
+The driver had every ingredient except a reconnect trigger. Source-change
+event support existed, but there was no background signal monitor. The
+`MZ0380_IRQ_SIGNAL_CHANGE` bit was defined but never interpreted by the IRQ
+handler and `irq_signal_count` was never incremented. Live timing queries had
+just been made cache-only to prevent receiver mailbox I2C from starving VB2.
+Finally, `mst3367_set_auto_position()` refused to re-arm acquisition whenever
+`dev->streaming` was true. HDMI loss stops access units but does not make VB2
+call STREAMOFF, so that condition remains true forever.
+
+Recovery is now triggered by absence of valid H.264 VCL access units. Healthy
+video merely refreshes a jiffies timestamp and the delayed worker returns
+without any receiver access. After 1500 ms of silence the worker marks the
+stream recovering, making the sole narrow exception to the active-stream
+AUTO_POSITION guard, and performs uncached stable-lock detection. A failed
+attempt leaves acquisition armed and retries after 500 ms. A successful
+same-mode lock lets the existing VIC/encoder resume. Loss and same-mode return
+are intentionally not reported as V4L2 source changes because that can make a
+client restart V4L2 and spend another scarce SET_VIC spawn. A stable changed
+mode is reported, but no hidden SET_VIC is issued.
+
+The drain also classifies Annex-B NAL units. At initial STREAMON and after a
+frame gap, metadata-only access units may pass but dependent VCL pictures are
+discarded until an IDR arrives. The IDR is marked with
+`V4L2_BUF_FLAG_KEYFRAME`. This prevents a new or resumed OBS decoder from being
+fed the middle of an old GOP, which accounts for both persistent freeze and
+the earlier camera-dependent smeared first pictures.
+
+This is host-build-verified with clang/lld against Linux 7.2.0-1-cachyos,
+including `W=1`. It is not hardware-verified. It handles same-mode cable
+round trips without a new encoder spawn; changed-mode in-place card
+reconfiguration remains part of the persistent-encoder work.
+
+---
+
+## M191 (host-only, 2026-08-25): persistent card pipeline removes SET_VIC from ordinary OBS restarts
+
+The experimental `stop_on_streamoff=0,setvic_once=1` pair did not constitute
+persistence. It suppressed STOP and the next SET_VIC, but the second STREAMON
+still replayed SET_ENC, SET_BUF and START into a tinyvenc process that had
+already advanced beyond those command states. Hardware had shown those later
+commands timing out. Persistence therefore requires a separate attach path,
+not a selectively shortened start sequence.
+
+`pipeline_running` now represents the card-side VIC/tinyvenc/DMA lifetime;
+`streaming` represents only whether a VB2 userspace consumer is attached. The
+first STREAMON follows the proven Windows sequence and records the configured
+source/output geometry. On persistent STREAMOFF, the driver publishes VB2
+detachment and synchronizes with any drain already copying a buffer, but does
+not flush the completion FIFO or send STOP. New completions continue to be
+validated and consumed, the window-1 token advances, and the batch drain sends
+the normal whole-word `enc_stat` ACK. This prevents the encoder from parking
+after its four host buffers fill while OBS is closed.
+
+The detached drain caches exact Annex-B SPS and PPS NAL units in a bounded
+4096-byte module-owned buffer and counts complete discarded access units
+separately. Reattachment checks output compatibility, resets only the V4L2
+sequence/decoder boundary, marks VB2 attached, and sends no card command at
+all. Dependent VCL pictures remain held until IDR. A parameter-set-free IDR is
+returned as cached SPS/PPS concatenated with the original access unit and is
+marked KEYFRAME, allowing a newly constructed OBS decoder to join a pipeline
+which may have been running for hours.
+
+Receiver writes and live timing queries now use `pipeline_running`, not VB2
+attachment, as the protection boundary: closing OBS must not make diagnostics
+think it is safe to retime a still-running receiver. HDMI recovery remains
+dormant while detached and starts when a consumer attaches; the continuously
+drained H.264 timestamp distinguishes a healthy producer immediately.
+
+A true stable timing change sets `pipeline_reconfigure_pending` and queues one
+V4L2 source-change event without restarting in the worker. On the next
+attachment, the old encoder gets the clean all-channel STOP and the ordinary
+full start creates exactly one correctly configured replacement. This bounds
+spawns to actual input-mode changes instead of client retry count.
+
+Normal module removal is the forced final-stop boundary regardless of the old
+`stop_on_streamoff` diagnostic knob. STOP precedes event flush and IRQ release;
+PCI bus mastering is still cleared before persistent mappings and the SPS/PPS
+cache are freed.
+
+The integrated source builds with clang/lld `W=1` against Linux
+7.2.0-1-cachyos. `git diff --check`, script syntax checks, and module-parameter
+inspection pass. Hardware validation is pending. Success requires repeated OBS
+close/open cycles and a same-mode HDMI round trip to leave the SET_VIC count at
+one while attachment and detached-discard counters advance.
+
+This prevents the known wedge during normal operation; recovering a card that
+is already mailbox-deaf remains contingent on hardware validation of its
+advertised PCI `pm` and `bus` reset methods. If both fail to reset the onboard
+ARM SoC, software cannot guarantee recovery from that pre-existing state
+without a slot power controller.
+
+---
+
+## M192 (hardware, 2026-08-25): persistent pipeline validated through three attachments, HDMI recovery, and final unload
+
+The M191 lifecycle passed its complete hardware discriminator on a fresh card
+cycle. The first OBS STREAMON sent one `SET_VIC` for a locked 1920x1080p30
+source. Two later VB2 attachments logged `no card command sent`; attachment
+count reached three while `SET_VIC sent` remained exactly one. Detached access
+units continued rotating: the status snapshot counted 102 complete H.264
+access units discarded while detached, proving the completion/ACK path stayed
+live without a userspace buffer owner.
+
+Both HDMI cable round trips entered recovery after encoder silence, reacquired
+the same 1920x1080p30 timing, and returned at clean IDRs containing SPS/PPS.
+The final status showed 926 delivered access units, 35 host-side drops, 102
+detached discards, and zero command timeouts. The drops therefore did not
+represent a card respawn or mailbox failure.
+
+After OBS closed, module removal produced the exact ownership boundary the
+design required:
+
+```
+final pipeline stop: STOP_STREAMING(all channels) ret=0 after 3 userspace
+attachment(s) and 1 SET_VIC spawn(s)
+```
+
+The script committed a power-cycle tally of one. A second unload correctly
+reported that the module was not loaded. M191 is no longer host-only: ordinary
+OBS close/reopen, detached drain/ACK, same-mode HDMI recovery, clean-IDR
+reattachment, and the one final STOP are hardware-proven together.
+
+The run also exposed a Linux 7.2 compatibility warning: delayed recovery work
+was queued on the deprecated `system_wq` alias. It did not affect this result,
+but the next source feature-probes and selects `system_dfl_wq` where available.
+
+---
+
+## M193 (host-only, 2026-08-25): zero-spawn NO SIGNAL presentation and independent lock monitoring
+
+M114 already proved the essential negative fact: when the MST3367 is entirely
+unlocked, firmware writes no raw frame and no H.264 access unit. The proposed
+plan to cache a card-generated no-source splash could therefore never work.
+The Linux state now uses a host-owned placeholder, matching what the Windows
+software stack most likely did rather than attributing its UI overlay to card
+DMA.
+
+The module embeds one 3207-byte, self-contained Annex-B access unit: AUD, High
+Profile level-4.2 1920x1080 SPS/PPS, and one IDR containing a dark NO SIGNAL
+picture. While HDMI is absent it is copied into queued VB2 buffers at a
+clamped low cadence (default two fps), with monotonic timestamps and KEYFRAME
+metadata. It requires no mailbox transaction, DMA remap, encoder process, or
+card completion. `stream_without_signal=1` now defaults on for the persistent
+H.264 path.
+
+The first no-source STREAMON takes a cheap receiver lock-byte sample and
+returns immediately in placeholder-only state. It deliberately does not send
+`SET_VIC`; the scarce spawn count remains zero until a coherent HDMI timing is
+measured. A failed deferred start is latched so the monitor cannot create a
+respawn loop. Closing/reopening userspace is the explicit retry boundary.
+
+The HDMI worker no longer infers source presence from encoded-frame silence.
+Every 500 ms by default it reads only MST3367 bank 0 register 0x55. On loss it
+activates the placeholder, permits one AUTO_POSITION re-arm, and leaves an
+existing persistent encoder draining and ACKing. On full lock it performs the
+existing complete coherent timing measurement. With no pipeline it starts the
+first one once; with a matching pipeline it waits for its next clean IDR; with
+a changed timing it keeps the placeholder active and defers one controlled
+replacement to the next userspace attachment.
+
+Placeholder and live delivery share a mutex. While the placeholder is active,
+card metadata, dependent pictures, stale IDRs, and frames seen before receiver
+validation are consumed/ACKed but cannot reach VB2. The switch occurs only at
+a receiver-proven IDR, with cached card SPS/PPS prepended if needed. Persistent
+reattachment also starts in this validation state so a source change performed
+while OBS was closed cannot be mistaken for the old mode.
+
+Status now separates placeholder IDRs and cadence misses from card H.264
+delivered/dropped/detached counts. `signal_monitor_ms` and `no_signal_fps` are
+module parameters exposed as `SIGMON` and `NOSIGFPS` by the live script. The
+workqueue selection uses a header probe: `system_dfl_wq` on kernels which
+declare it, `system_wq` on older builds.
+
+The integrated module builds cleanly with clang/lld and `W=1` against Linux
+7.2.0-1-cachyos and 6.18.42-1-cachyos-lts. The cross-build also found and
+removed one stale `static` GPIO forward declaration left by the earlier source
+split. The final on-disk module was rebuilt for the running 7.2 kernel.
+`git diff --check`, shell syntax, module parameter inspection, byte-exact
+header extraction, and repeated decode of five concatenated placeholder IDRs
+all pass. Hardware validation is pending and must begin with HDMI absent: OBS
+should receive the placeholder with zero SET_VIC, then a connected fixed source
+should spend exactly one.
+
+---
+
+## M194 (mixed hardware/host, 2026-08-25): coherent receiver lock is not proof of an H.264 producer
+
+The first M193 hardware attempt did not enter the placeholder-only path. At
+STREAMON the MST3367 reported a coherent 1920x1080p30 mode (`htot=2200`,
+`vtot=1125`, `hper=337`, `vper=299`) with R55=0x7f. The driver consequently
+sent one SET_VIC and left the placeholder inactive. The resulting card
+pipeline produced no access unit at all: status showed zero H.264 delivered,
+dropped, suppressed, or detached frames, zero placeholder IDRs, and zero
+command timeouts. OBS remained completely black.
+
+This result invalidates receiver state as a sufficient sole discriminator.
+R55 and the timing block can be fully asserted and internally coherent while
+the configured H.264 producer remains silent. It does not yet identify whether
+the receiver state was stale or whether another card-side start failure
+occurred; the preserved detailed stream-start log is still required for that
+distinction.
+
+The unload dump adds one strong negative result: all four dedicated window-1
+buffers were still byte-for-byte 0xcc poison. Each had zero written extent,
+zero sampled pages touched, and zero delivered access units. The failure was
+therefore before VB2 delivery and before H.264 decoding; no encoded producer
+ever wrote host memory. The detailed start log could not be preserved because
+`mz0380-live.sh load` clears dmesg and the new 500 ms monitor's repeated
+mailbox-I2C commands subsequently rolled the earlier lines out of the ring.
+
+The host follow-up restores producer silence as the gate for receiver access
+once a card pipeline exists. MST3367 reads are firmware-mailbox commands, and
+M74 already established that receiver transactions during capture perturb the
+stream. A healthy recent H.264 access unit therefore reschedules the worker
+without touching the receiver. Once a running pipeline has produced nothing
+for `hotplug_stall_ms`, the worker activates the host NO SIGNAL presentation,
+marks delivery as waiting for a validated IDR, and forces MST3367 AUTO_POSITION
+acquisition even if R55 still claims lock. It performs no SET_VIC, STOP, or
+encoder replacement. With no pipeline and during persistent reattachment,
+receiver polling remains enabled because it is needed to discover or validate
+the source before exposing live data.
+
+The follow-up builds cleanly against Linux 6.18 LTS and the running 7.2 kernel
+with clang/lld and `W=1`; its on-disk module has the correct 7.2 vermagic.
+Hardware validation remains pending.
+
+---
+
+## M195 (host, 2026-08-25): placeholder changed from synthetic art to the exact vendor splash
+
+The first placeholder was functionally correct but visibly not the card's
+original NO SIGNAL picture. The distinction in the existing evidence matters:
+the H.264 window emits no access unit on receiver unlock (M114), but the older
+raw standby path did expose the card's fixed splash (M126/M127b). The host must
+therefore encode a saved copy; it cannot request the picture from a silent
+H.264 producer.
+
+The original is `NOSG_LOGO_Y`, a 320x240 luma asset at tinyvenc5 ELF virtual
+address 0x6b10c / file offset 0x5b10c. The local firmware dump produced the
+previously recorded identity digest
+`dfce4efd5139298f544d23473f85a42fb7115a3c5e4ba65b71c070d59883a30b`.
+`mz0380-no-signal-generate.py` now refuses any non-matching binary, reconstructs
+the hardware-captured 1920x1080 I420 canvas (Y=0x11, U=V=0x80), blits the asset
+at its exact centred coordinates (800,420), and encodes one self-contained
+Annex-B access unit. The generated stream contains AUD/SPS/PPS/IDR and probes
+as 1920x1080 yuv420p High Profile level 4.2.
+
+The user's simultaneous report that live streaming looked laggy remains a
+separate open issue. The claimed unplugged and plugged dmesg captures were not
+present in the received message, so there is not yet evidence to distinguish a
+placeholder that failed to deactivate, repeated recovery transitions, VB2
+drops, or genuinely low live-card cadence.
+
+A read-only snapshot of the still-loaded module resolves part of that
+ambiguity. The card count was frozen at 1121 delivered H.264 access units while
+the placeholder count continued from 2272 to 2282 during an approximately
+two-second sample; the state remained `pipeline: running`, `no signal: active`,
+and `source: unlocked`. The perceived current output was therefore placeholder
+cadence, not a low-rate live encoder. The card had produced real video earlier
+and subsequently stopped; the omitted reconnect log is still needed to say
+why.
+
+The sample also found a host cadence defect. `mz0380_no_signal_activate()` was
+called on every 500 ms unlocked retry and unconditionally moved the already
+scheduled placeholder work to delay zero. That superimposed recovery retries
+on the configured two-fps presentation. Activation now schedules immediate
+work only on the inactive-to-active transition; the work item alone owns later
+cadence. Status also reports whether recovery is active and the age of the last
+card H.264 access unit.
+
+---
+
+## M196 (hardware, 2026-08-25): clean placeholder/live boundary; 30 Hz input exposes the unavoidable divisor-2 cadence
+
+The retained recovery log proves the state transition works. After a long
+unplugged interval, recovery attempt 1526 measured a coherent 1920x1080p30
+source at 4988.568762. At 4990.893041 the card supplied an IDR containing
+SPS/PPS; the driver synchronized delivery and ended the NO SIGNAL presentation
+at that exact decoder boundary. There was no SET_VIC respawn.
+
+At 5002.691573 the producer had again been silent long enough to justify a
+receiver read, and R55 was actually unlocked. The driver returned to the host
+placeholder and re-armed acquisition. The operator confirmed the HDMI cable
+remained plugged, so this is a real connected-link flap: either the source
+stopped transmitting or the MST3367 lost the link. It is not an OBS or
+placeholder pacing verdict.
+
+The live interval also explains the reported motion lag. The delivered-card
+counter advanced by approximately 153 access units over the 11.8-second live
+window, about 13 fps after transition overhead. The input was 30 fps and
+tinyvenc7's fastest valid schedule is `(input_counter % 2) == 1`, so its ceiling
+is 15 encoded fps. Divisor 1 can never leave remainder one and produces no
+H.264; divisor zero selects an inaccessible schedule bitmap. The earlier
+hardware-proven 30 encoded fps result used a 60 fps HDMI input. Diagnostics and
+the live script now state both source and predicted encoded cadence explicitly
+instead of implying that a 30 fps input remains 30 fps.
+
+The source later recovered on its own at 5533.670436 (attempt 1021), followed
+by a clean IDR and placeholder exit at 5536.199792. Two manual one-second HPD
+pulses happened only afterward, at 5547.921 and 5553.906, so they cannot be
+credited with restoring the link. They did prove the active-low line and
+receiver bit both followed deassert/assert correctly, consumed no SET_VIC, and
+did not destabilize the recovered stream. A later four-second counter sample
+advanced live delivery from 2326 to 2393 with the placeholder inactive and the
+driver's persistent spawn counter at one.
+
+`mz0380-live.sh status` incorrectly printed `SET_VIC sent: 0` during that run
+because it counted matching dmesg lines after the original start line had
+rolled out of the ring. Status now reads the driver's `enc spawns` lifetime
+counter from `/proc/mz0380-state`, retaining dmesg only as a legacy fallback.
+
+---
+
+## M197 (host, 2026-08-25): live-loader cleanup regression fixed
+
+An explicit `mz0380-live.sh unload` now removes `mz0380.ko` and hidden
+`.module-common.o` as well as ordinary objects, preventing sudo-owned build
+outputs from blocking a later non-root link. The first implementation also ran
+that cleanup during `load`, after the module had already been built and its
+path resolved; the following `insmod` consequently failed with ENOENT.
+
+`do_unload` now distinguishes the internal pre-load stop from the explicit
+user unload. The former preserves the just-built artifacts, while the latter
+performs the ownership cleanup. The corrected script passes `bash -n` and
+`git diff --check`, and the module was rebuilt warning-free with clang/lld and
+`W=1` for the running Linux 7.2 kernel. The failed load never reached the real
+module insertion or STREAMON and therefore consumed no SET_VIC spawn.
+
+---
+
+## M198 (hardware, 2026-08-25): corrected loader and post-HPD live stream validated
+
+The corrected live loader completed its smoke test, inserted the Linux 7.2
+module, and registered `/dev/video2`. Two manual one-second HPD pulses followed.
+The retained driver state afterward showed one SET_VIC spawn across three VB2
+attachments, a running attached pipeline, zero live-frame drops, an inactive
+placeholder, zero placeholder cadence misses, and fresh card H.264 activity.
+
+A direct four-second sample advanced delivered live access units from 744 to
+810 (+66) while recovery remained idle and the spawn counter stayed at one.
+This is the expected approximately 15-fps output for a 30-fps HDMI input with
+tinyvenc7 divisor 2. The pulses therefore neither respawned nor destabilized
+the encoder. Because they were issued while the link was already producing,
+this run does not establish whether HPD shortens a connected-but-unlocked
+outage.
+
+---
+
+## M199 (hardware, 2026-08-25): exact vendor NO SIGNAL and cable round-trip validated
+
+The operator visually confirmed that the host placeholder now matches the
+card's original splash: the centred segmented spinner and `NO SIGNAL` artwork
+on the original black canvas. This closes the visual mismatch from the first
+synthetic placeholder.
+
+The accompanying log proves the complete persistent cable-loss lifecycle. At
+6521.516886 the receiver lost lock and the driver activated the host H.264
+placeholder without sending a card command. It delivered 56 placeholder IDRs
+with zero cadence misses, consistent with approximately 25 seconds at two fps.
+At 6544.102026 recovery attempt 44 measured the same 1920x1080p30 mode; the
+existing encoder remained unchanged while the placeholder stayed visible. A
+clean live IDR containing SPS/PPS arrived at 6546.584270, and only then did the
+driver end the NO SIGNAL presentation.
+
+Final state remained `pipeline: running`, VB2 attached, recovery idle, with
+zero live drops and exactly one SET_VIC across three userspace attachments.
+Live delivery continued afterward (2629 access units at the later snapshot,
+with the newest card unit 15 ms old). Thus unplug, continuous original splash,
+same-mode reconnect, and decoder-safe live resumption are all hardware-
+validated without an encoder respawn.
+
+---
+
+## M200 (host, 2026-08-25): Windows-exact independent raw-bank diagnostic implemented
+
+The successful NO SIGNAL work does not close the user's 60-fps requirement.
+The current tinyvenc7 modulo path still produces at most 30 H.264 fps from a
+60-Hz input (and this last run negotiated a 30-Hz input, so it produced about
+15 fps). The next trace-backed lead remains Windows' unimplemented raw-buffer
+topology, not another divisor value.
+
+`raw_bank_probe=1` now allocates eight independent buffers exactly as the saved
+Windows HD60 Pro branch does: four for opcode 0x02 and four different buffers
+for opcode 0x08, each advertising `0x466000` bytes. Bank 0 is poisoned with
+0xa5 and bank 1 with 0x5a. The buffers use individually allocated pages behind
+contiguous IOMMU IOVAs, avoiding eight fragile order-11 allocations and their
+rounded 8-MiB backing cost. The proven H.264 window-1 ring remains separate and
+the default path is unchanged.
+
+The diagnostic registers both raw banks plus the H.264 bank before SET_VIC and
+again after the spawn, then reports each raw buffer's final written extent,
+sampled touched-page count, poison identity, and first 16 bytes alongside the
+existing final EVENT/token snapshot. A bounded 1080p60 run can therefore
+distinguish a full raw frame from the known 16-byte preview record or an
+untouched bank without changing the V4L2 delivery format.
+
+The source passes clang/lld `W=1` builds on Linux 6.18 LTS and Linux 7.2;
+`mz0380.ko` was finally rebuilt for the running 7.2 kernel. `bash -n` and
+`git diff --check` also pass. During cross-validation, a direct combined
+kbuild `clean modules` invocation temporarily replaced the external-module
+Makefile with kbuild's generated wrapper. It was stopped immediately and the
+exact pre-command working Makefile (refactored object list plus both feature
+probes) was restored and diff-checked before using the project's safe
+`objclean` target.
+
+---
+
+## M201 (hardware/host, 2026-08-25): apparent reconnect freeze was a stale transient-mode latch
+
+The first M200 hardware run did not wedge the card. It retained fresh H.264
+access units (2--38 ms old in status), zero command timeouts, one SET_VIC, and
+a clean final STOP. The reason OBS remained on NO SIGNAL is visible in the
+counters: only 120 live units reached userspace while 2186 healthy units were
+suppressed behind the placeholder.
+
+The receiver measured 1080p30 at pipeline creation, transiently reported
+1080p60 during reconnect, and then repeatedly settled back to 1080p30. The
+60-Hz sample correctly set `pipeline_reconfigure_pending`, but the recovery
+worker stopped validating timing once healthy H.264 resumed and never cleared
+the flag when the original mode returned. Every subsequent clean IDR was
+therefore deliberately suppressed forever. The card was producing; the host
+state machine made it look frozen.
+
+Recovery now keeps timing validation active while a replacement is pending.
+If the live timing matches the existing pipeline again, it cancels the stale
+replacement, logs that decision, and switches from the placeholder at the next
+clean IDR. A genuinely changed stable mode remains pending for the controlled
+next-attachment replacement. `mz0380-live.sh status` also once again prints the
+pipeline line (including `replacement pending`) by accepting the proc file's
+aligned whitespace.
+
+The raw-bank result itself was negative but bounded for the tested 30-Hz
+configuration: all four opcode-0x02 buffers contained exactly 16 changed bytes,
+while all four independent opcode-0x08 buffers remained completely poisoned
+and untouched. The run began with SET_VIC at 1080p30, so this does not settle
+whether a pipeline configured from the outset at 1080p60 exposes another path.
+
+The state-machine fix passes clang/lld `W=1` on Linux 6.18 LTS and Linux 7.2;
+the final module targets the running 7.2 kernel. Shell syntax and diff checks
+also pass.
+
+---
+
+## M202 (hardware, 2026-08-25): transient-mode cancellation validated on a 60-Hz pipeline
+
+The corrected normal path started once at 1920x1080p60 and delivered at the
+expected divisor-2 rate of approximately 30 H.264 fps. Before cable loss it had
+delivered 781 access units with zero drops, zero suppression, one attachment,
+one SET_VIC, and no command timeouts.
+
+On reconnect the receiver twice measured a transient 1080p30 mode, setting the
+controlled replacement pending as intended. The next coherent measurement
+returned to the persistent 1080p60 mode. The new path logged `cancelled
+transient replacement`, kept the existing encoder, accepted a clean SPS/PPS-
+bearing IDR 274 ms later, and ended the NO SIGNAL presentation. The later
+snapshot remained healthy: 1995 live access units delivered, zero drops, only
+27 units suppressed during the handoff, placeholder inactive, recovery idle,
+and one SET_VIC.
+
+This closes the M201 stale-latch regression. The source's 60-to-30-to-60
+negotiation is real receiver behavior, but it no longer manufactures a frozen
+placeholder or an encoder respawn.
+
+One startup diagnostic printed all three H.264 header fields as decimal
+3435973836, which is exactly `0xcccccccc`: the untouched buffer poison. A raw-
+preview event can name a window-1 slot before encoded DMA begins. The drain now
+silently leaves such a wholly untouched slot unconsumed for its later encoded
+completion; genuinely partial or malformed headers retain the existing
+ratelimited diagnostic.

@@ -113,6 +113,7 @@
 	(((MZ0380_CFG_TRACE_END - MZ0380_CFG_TRACE_START) / sizeof(u32)) + 1)
 
 struct snd_card; /* mz0380-audio.c */
+struct mz0380_dev;
 
 enum mz0380_property_experiment_result {
 	MZ0380_PROPERTY_EXPERIMENT_NONE = 0,
@@ -184,6 +185,14 @@ struct mz0380_subid {
 	u32 card;
 };
 
+/* Shared only by PCI lifecycle and procfs device enumeration. */
+extern bool allow_bus_master;
+extern struct mutex devlist;
+extern struct list_head mz0380_devlist;
+int mz0380_proc_create(void);
+void mz0380_proc_remove(void);
+void mz0380_event_watch_stop(struct mz0380_dev *dev);
+
 struct mz0380_capture_state {
 	/*
 	 * M168: no cached pixelformat. poll_drain_ms and stream_nosg are both
@@ -214,6 +223,11 @@ struct mz0380_capture_state {
 	u32 hue;
 	u32 saturation;
 	u32 sharpness;
+};
+
+struct mz0380_mode {
+	u32 width;
+	u32 height;
 };
 
 struct mz0380_property_experiment {
@@ -265,6 +279,13 @@ struct mz0380_frame_event {
 };
 
 #define MZ0380_FRAME_EVENT_FIFO_SIZE 64
+#define MZ0380_H264_PARAMETER_SETS_MAX 4096
+
+#ifdef MZ0380_HAVE_SYSTEM_DFL_WQ
+#define MZ0380_SYSTEM_WQ system_dfl_wq
+#else
+#define MZ0380_SYSTEM_WQ system_wq
+#endif
 
 struct mz0380_dev {
 	struct list_head devlist;
@@ -349,6 +370,45 @@ struct mz0380_dev {
 	} stream_bufs[MZ0380_STREAM_NR_BUFS];
 	u32 stream_head;	/* next buffer index we expect from the card */
 
+	/*
+	 * Opt-in H.264 diagnostic bank. tinyvenc7 sends raw preview DMA through
+	 * outbound window 0 (stream_bufs) and encoded output through window 1.
+	 * These must not alias: the two producers rotate independently.
+	 */
+	struct mz0380_stream_buf h264_bufs[MZ0380_STREAM_NR_BUFS];
+	/* Opt-in Windows-parity window-0 banks: op 0x02 then independent op 0x08. */
+	struct mz0380_raw_probe_buf {
+		void *va;
+		dma_addr_t dma;
+		struct page **pages;
+		u32 nr_pages;
+		size_t mapped;
+	} raw_probe_bufs[MZ0380_RAW_PROBE_NR_BUFS];
+	u8 h264_last_token;
+	bool h264_last_token_valid;
+	u64 h264_frames_delivered;
+	u64 h264_frames_dropped;
+	u64 h264_frames_discarded;
+	u64 h264_frames_suppressed;
+	u8 *h264_parameter_sets;
+	u32 h264_parameter_sets_len;
+	/* Host-owned H.264 placeholder used while the HDMI receiver is unlocked. */
+	struct delayed_work no_signal_work;
+	struct mutex h264_delivery_lock;
+	u64 no_signal_frames_delivered;
+	u64 no_signal_frames_missed;
+	bool no_signal_active;
+	/*
+	 * The receiver monitor is independent of encoder activity. This matters
+	 * when firmware keeps producing a fallback picture: frame activity alone
+	 * cannot say whether a real HDMI source is present.
+	 */
+	struct delayed_work signal_recovery_work;
+	unsigned long last_h264_frame_stamp;
+	u32 signal_recovery_attempts;
+	bool signal_recovering;
+	bool h264_waiting_for_idr;
+
 	// pattern-check: skip plain diagnostic fields on an existing struct
 	/*
 	 * M36 write-extent watch. The buffers are poisoned with 0xAA at stream
@@ -394,6 +454,17 @@ struct mz0380_dev {
 	u32 encoder_spawns;
 	u8 frame_poison_byte;
 	bool frame_poison_active;
+	/* Card-side VIC/tinyvenc lifetime, independent of a VB2 consumer. */
+	bool pipeline_running;
+	bool pipeline_reconfigure_pending;
+	u32 pipeline_width;
+	u32 pipeline_height;
+	u32 pipeline_source_width;
+	u32 pipeline_source_height;
+	u32 pipeline_source_fps;
+	bool pipeline_source_interlaced;
+	u32 pipeline_attach_count;
+	bool pipeline_start_failed;
 	bool streaming;
 
 	// pattern-check: skip two plain fields on the existing device struct
@@ -642,10 +713,25 @@ void mz0380_dma_ring_free(struct mz0380_dev *dev, struct mz0380_ring *r);
 void mz0380_dma_drain_video(struct mz0380_dev *dev);
 void mz0380_dma_drain_audio(struct mz0380_dev *dev);
 
-/* HDMI signal detect (mz0380-video.c) */
+/* HDMI signal detect and DV timings (mz0380-signal.c) */
+extern const struct v4l2_dv_timings mz0380_no_signal;
+const struct mz0380_mode *mz0380_find_mode(u32 width, u32 height);
+const struct v4l2_fract *mz0380_find_interval(
+	u32 width, u32 height, const struct v4l2_fract *wanted);
+u32 mz0380_source_fps(const struct v4l2_dv_timings *timings);
 int mz0380_query_signal(struct mz0380_dev *dev,
 			struct v4l2_dv_timings *timings);
 void mz0380_signal_event(struct mz0380_dev *dev);
+int mz0380_query_dv_timings(struct file *file, void *fh,
+			    struct v4l2_dv_timings *timings);
+int mz0380_g_dv_timings(struct file *file, void *fh,
+			struct v4l2_dv_timings *timings);
+int mz0380_s_dv_timings(struct file *file, void *fh,
+			struct v4l2_dv_timings *timings);
+int mz0380_enum_dv_timings(struct file *file, void *fh,
+			   struct v4l2_enum_dv_timings *timings);
+int mz0380_dv_timings_cap(struct file *file, void *fh,
+			  struct v4l2_dv_timings_cap *cap);
 
 // pattern-check: skip two function prototypes, procedural module, no abstraction
 /* MST3367 receiver bring-up + signal detect (mz0380-mst3367.c) */
@@ -661,6 +747,15 @@ int mz0380_mst3367_hpd_pulse(struct mz0380_dev *dev, unsigned int count,
 			     unsigned int gap_ms);	/* M48 */
 int mz0380_mst3367_read_signal(struct mz0380_dev *dev,
 			       struct v4l2_dv_timings *out);
+int mz0380_mst3367_read_lock(struct mz0380_dev *dev, bool *locked,
+			     bool rearm_acquisition);
+void mz0380_signal_recovery_init(struct mz0380_dev *dev);
+void mz0380_signal_recovery_start(struct mz0380_dev *dev);
+void mz0380_signal_recovery_stop(struct mz0380_dev *dev);
+void mz0380_no_signal_init(struct mz0380_dev *dev);
+void mz0380_no_signal_activate(struct mz0380_dev *dev, const char *reason);
+void mz0380_no_signal_deactivate(struct mz0380_dev *dev);
+void mz0380_no_signal_stop(struct mz0380_dev *dev);
 int mz0380_gpio_dump(struct mz0380_dev *dev);			/* M51b */
 int mz0380_mst3367_edidhunt(struct mz0380_dev *dev);		/* M53  */
 int mz0380_i2cbb_scan(struct mz0380_dev *dev, u8 sda, u8 scl);	/* M51 */
@@ -713,8 +808,10 @@ extern unsigned long long mz0380_dma_iova_offset;
 extern unsigned int mz0380_set_buf_stride;
 extern unsigned int mz0380_card_frame_offset;
 extern bool mz0380_probe_windows;
+extern bool mz0380_h264_probe;
 extern bool mz0380_gpio_dir_invert;
 extern unsigned int mz0380_signal_poll_ms;
+extern unsigned int mz0380_card_ready_timeout_ms;
 extern bool mz0380_force_timings;
 extern unsigned int mz0380_edidhunt_max_regs;
 extern unsigned int mz0380_edid_opcode;
@@ -744,6 +841,12 @@ extern unsigned int mz0380_mst_b5;
 extern bool mz0380_mst_b0_late;
 extern unsigned int mz0380_set_buf_opcode;
 extern unsigned int mz0380_signal_cache_ms;
+extern unsigned int mz0380_signal_query_cache_ms;
+extern bool mz0380_hotplug_recovery;
+extern unsigned int mz0380_hotplug_stall_ms;
+extern unsigned int mz0380_hotplug_retry_ms;
+extern unsigned int mz0380_signal_monitor_ms;
+extern unsigned int mz0380_no_signal_fps;
 extern unsigned int mz0380_aic_channels;
 extern unsigned int mz0380_aic_bits;
 extern unsigned int mz0380_aic_freq;
@@ -767,12 +870,14 @@ extern bool mz0380_win_start_op6;
 extern bool mz0380_win_bufs_first;
 extern unsigned int mz0380_stop_settle_ms;
 extern bool mz0380_enc_sub;
+extern unsigned int mz0380_h264_frame_divisor;
 extern unsigned int mz0380_enc_mask;
 extern unsigned int mz0380_post_mask;
 extern unsigned int mz0380_bitstream_num;
 extern bool mz0380_enc_stat_ack_on;
 extern bool mz0380_setvic_once;
 extern bool mz0380_stop_on_streamoff;
+extern bool mz0380_persistent_h264;
 extern unsigned int mz0380_post_di;
 extern bool mz0380_fake_frame_off;
 extern bool mz0380_post_proc;
@@ -780,6 +885,7 @@ extern unsigned int mz0380_post_proc_gap_ms;
 extern unsigned int mz0380_post_proc_opcode;
 extern bool mz0380_irq_intx;
 extern bool mz0380_set_buf_op8;
+extern bool mz0380_raw_bank_probe;
 extern bool mz0380_mst_win_output;
 extern unsigned int mz0380_mst_ad;
 extern bool mz0380_dma_handshake;

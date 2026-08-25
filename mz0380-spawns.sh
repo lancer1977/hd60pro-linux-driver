@@ -28,6 +28,8 @@
 # Usage
 #   ./mz0380-spawns.sh            show the running total (no root needed)
 #   sudo ./mz0380-spawns.sh commit    add the loaded module's spawns to it
+#   sudo ./mz0380-spawns.sh unloaded  mark a completed rmmod boundary
+#   sudo ./mz0380-spawns.sh add 1     repair a known missed unloaded spawn
 #   sudo ./mz0380-spawns.sh reset     start a new power cycle at zero
 #
 # `commit` is idempotent within a load and correct across loads: it adds only
@@ -116,13 +118,41 @@ commit)
 	echo "spawns this power cycle: $T  (this load has spawned $CUR)"
 	verdict "$T"
 	;;
+unloaded)
+	[ ! -r "$STATE" ] || {
+		echo "module is still loaded - commit it and rmmod before marking unloaded"
+		exit 1
+	}
+	writable_or_die
+	read_tally
+	# A future module starts its own counter at zero. Keeping L from the old
+	# module makes two consecutive one-spawn loads look like the same load.
+	L=0
+	echo "$T $L" > "$TALLY"
+	echo "spawn tally marked at module-unload boundary: $T"
+	;;
+add)
+	[ ! -r "$STATE" ] || {
+		echo "module is loaded - use commit instead"
+		exit 1
+	}
+	N=${2:-}
+	case "$N" in ''|*[!0-9]*|0) echo "usage: $0 add <positive-count>" >&2; exit 1;; esac
+	writable_or_die
+	read_tally
+	T=$(( T + N ))
+	L=0
+	echo "$T $L" > "$TALLY"
+	echo "spawn tally repaired by +$N: $T"
+	verdict "$T"
+	;;
 reset)
 	writable_or_die
 	echo "0 0" > "$TALLY"
 	echo "spawn tally reset - declaring this a fresh power cycle"
 	;;
 *)
-	echo "usage: $0 [show|commit|reset]" >&2
+	echo "usage: $0 [show|commit|unloaded|add <count>|reset]" >&2
 	exit 1
 	;;
 esac
