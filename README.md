@@ -1,188 +1,560 @@
 # mz0380 — Linux driver for Elgato Game Capture HD60 Pro
 
-PCIe capture driver for the Elgato Game Capture **HD60 Pro** family
-(YUAN MZ0380, PCI `12ab:0380` / `12ab:0381`). The card carries an ARM SoC
-running its own embedded Linux, which does HDMI receive, signal detect
-(MST3367) and encoding. This driver configures that SoC over a BAR0 mailbox
-and delivers the captured frame to userspace through V4L2.
+Experimental PCIe capture driver for the Elgato Game Capture **HD60 Pro**
+family (YUAN MZ0380, PCI `12ab:0380` / `12ab:0381`). The card contains an ARM
+SoC running its own Linux firmware. The host driver brings up the MST3367 HDMI
+receiver, controls the card through a BAR0 mailbox, maps DMA buffers, and
+exposes the result as a V4L2 capture device.
 
-## Read this first: what the device actually does
+> **Current result:** persistent 1920x1080 High Profile H.264 capture works in
+> OBS, including repeated userspace detach/attach, a host-owned NO SIGNAL
+> picture, same-mode HDMI unplug/reconnect, and clean-IDR recovery. The fastest
+> working encoder setting still outputs only half the HDMI input rate: about
+> 15 fps from 1080p30 and about 30 fps from 1080p60. **True 60-fps delivery is
+> the main remaining goal.** Audio is not implemented.
 
-**With the firmware it boots, this card is a single-shot 1080p frame grabber.**
-One correct frame per stream, then the stream ends. That is a proven bound with
-a fully traced cause, not a missing configuration step — see `RE_FINDINGS.md`
-M153/M158/M166 for the derivation, and `NEXT_SESSION_START.md` for the short
-version.
+This is reverse-engineered development code, not a mainline or production
+driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
 
-Concretely, from a plain `insmod`:
+## What works today
 
-- one 1920x1080 **planar I420** frame, 3110400 bytes, correct colour;
-- then `DQBUF` returns `-EIO` and `poll()` reports `EPOLLERR`, so applications
-  finish and exit rather than blocking forever;
-- `STREAMOFF` + `STREAMON` gets you the next frame.
+- PCI probe, BAR mapping, mailbox commands, firmware handshake and MSI.
+- MST3367 HDMI receiver initialization, signal detection and DV timings.
+- A translating-IOMMU DMA path using four independently mapped buffers.
+- Persistent 1920x1080 H.264 capture through V4L2 and OBS.
+- Correct decoder boundaries: initial delivery and reconnect wait for a clean
+  SPS/PPS-bearing IDR.
+- One card-side encoder pipeline across ordinary OBS STREAMOFF/STREAMON cycles.
+- Same-mode unplug/reconnect without a second `SET_VIC` encoder spawn.
+- A two-fps, host-owned H.264 NO SIGNAL picture during a validated HDMI-unplug
+  interval.
+- Transient timing-change cancellation when the source returns to the running
+  mode.
+- Clean final pipeline stop at module removal.
+- Legacy single-frame, planar I420 capture with the default raw profile.
+- V4L2 compliance: 148/148 tests pass; the five warnings are the unsupported
+  `DV_RX_POWER_PRESENT` indication.
+- Builds validated with clang/lld and `W=1` against Linux 6.18 LTS and 7.2.
 
-Do **not** work around this by restarting the stream per frame to fake video.
-Each restart spawns a fresh encoder on the card, and the card wedges for good
-somewhere in the 8–18 spawn range — recovery is a mains-off cold boot. See
-[Spawn budget](#spawn-budget).
+Not implemented or not yet proved:
 
-Audio is not implemented. `enable_audio` registers an inert ALSA scaffold with
-no PCM DMA behind it; leave it off.
-
-> Legacy note: this repo began as a reverse-engineering project for the Elgato
-> 4K60 Pro Mk.2 (`sc0710-*.c`). That code is preserved but no longer builds on
-> modern kernels and is excluded from the default target. Pass
-> `MZ0380_LEGACY_SC0710=1` to `make` to attempt it.
+- True 60-fps output. tinyvenc7 divisor 2 encodes every second input frame.
+  Divisor 1 and divisor 0 produce no H.264 on this firmware.
+- Audio PCM DMA. `enable_audio=1` registers only an inert ALSA scaffold.
+- Resolutions other than 1920x1080.
+- The zero-spawn placeholder path when the first STREAMON occurs with HDMI
+  already absent. It is implemented and host-validated, but still needs its
+  dedicated hardware run.
+- A genuinely changed returning HDMI mode and its controlled replacement.
+- Automatic HPD recovery for a connected-but-unlocked outage.
+- DKMS packaging, module signing, distribution packages and mainline submission.
 
 ## Supported cards
 
-| Subsys      | Variant                      |
-|-------------|------------------------------|
-| `1cfa:0003` | HD60 Pro Rev. 1              |
+The PCI function must be vendor/device `12ab:0380` or `12ab:0381` with one of
+the supported subsystem IDs:
+
+| Subsystem | Variant |
+|---|---|
+| `1cfa:0003` | HD60 Pro Rev. 1 |
 | `1cfa:0005` | HD60 Pro Rev. 2 (unreleased) |
-| `1cfa:0006` | HD60 Pro Rev. 1 + Ryzen fix  |
+| `1cfa:0006` | HD60 Pro Rev. 1 + Ryzen fix |
 | `1cfa:0010` | HD60 Pro Rev. 3 (`DEV_0381`) |
-| `12ab:05cf` | HD60 Pro Prototype           |
+| `12ab:05cf` | HD60 Pro prototype |
 
-## Firmware: nothing is uploaded
-
-**This driver does not upload firmware, and the code to do so has been removed
-from the tree.** The card boots its own onboard flash image; a host-side upload
-is unnecessary, and an attempt at one previously broke the card's userspace.
-There is no `firmware_upload` parameter — earlier revisions of this README told
-you to pass one, and `insmod` will reject it.
-
-The only file the driver ever requests is an optional ASCII sidecar,
-`/lib/firmware/mz0380/MZ0380.FW.TXT`, holding the expected version as `MM.mm`.
-It is compared against what the card reports and a mismatch produces a warning,
-nothing more. On this hardware the card reports `01.11`:
+Confirm the hardware before building:
 
 ```bash
+lspci -nn -d 12ab:0380
+lspci -nn -d 12ab:0381
+```
+
+The preserved `sc0710-*` files target the different Elgato 4K60 Pro Mk.2.
+They are excluded from the default build and do not compile on modern kernels.
+
+## Requirements
+
+### Hardware and platform
+
+- A supported HD60 Pro in a PCIe slot.
+- A 1920x1080 HDMI source. Use a source explicitly fixed at 60 Hz for the
+  30-fps H.264 checkpoint or the raw-bank 60-Hz investigation.
+- IOMMU/VT-d/AMD-Vi enabled in firmware and a **translating** Linux IOMMU
+  domain. `iommu=off`, `iommu=pt`, and identity/pass-through domains cannot
+  work with this card's high-32-bits-only outbound DMA target.
+- A way to remove slot power completely. Once the card mailbox wedges, a
+  reboot or soft power action may leave standby power present; use the PSU
+  switch or unplug mains power.
+
+The driver refuses to arm unreachable stream buffers when no translating
+domain is available. Check the boot log and the driver's mappings:
+
+```bash
+sudo dmesg | grep -iE 'iommu|amd-vi|dmar'
+sudo dmesg | grep -E 'mz0380.*mapped at IOVA|IOMMU domain|IOVA setup'
+```
+
+Successful setup prints mappings at 4-GiB-spaced IOVAs. If the driver reports
+`no IOMMU domain` or `pass-through/identity`, enable the platform IOMMU and boot
+without `iommu=off` or `iommu=pt`.
+
+### Build and userspace tools
+
+Required to build and load:
+
+- the build tree/headers for the **running** kernel at
+  `/lib/modules/$(uname -r)/build`;
+- GNU Make and a kernel-compatible C toolchain;
+- root access for module loading;
+- the in-kernel V4L2/videobuf2 modules used by the loader.
+
+The Makefile uses clang and `ld.lld` automatically when both are installed,
+which is needed for kernels built with clang-only flags. Otherwise it uses the
+kernel build system's default compiler.
+
+Useful userspace packages:
+
+- `v4l-utils` for `v4l2-ctl` and `v4l2-compliance`;
+- OBS Studio for the validated live workflow;
+- FFmpeg/ffprobe/ffplay for recording and inspecting elementary H.264;
+- `pciutils` for `lspci`.
+
+If Secure Boot enforces signed modules, an unsigned `mz0380.ko` will be rejected
+with `Key was rejected by service`. Sign/enrol the module using your
+distribution's normal process or disable enforcement before trying to load it.
+
+## Firmware: do not upload anything
+
+**The driver does not upload firmware. Do not restore or use the deleted
+firmware-upload path.** The card boots its onboard flash image, and an earlier
+host upload attempt broke the card's userspace.
+
+The only requested file is an optional ASCII version sidecar:
+
+```text
+/lib/firmware/mz0380/MZ0380.FW.TXT
+```
+
+It contains the expected version in `MM.mm` form. A mismatch only warns; an
+absent file skips the check. The tested card reports `01.11`:
+
+```bash
+sudo install -d /lib/firmware/mz0380
 echo 01.11 | sudo tee /lib/firmware/mz0380/MZ0380.FW.TXT
 ```
 
-Without it the check is skipped and the driver runs normally.
+`MZ0380.HD.HEX` is neither needed nor read. There is no `firmware_upload`
+module parameter, and passing it makes `insmod` fail with an unknown parameter.
 
 ## Build
 
+Build for the running kernel as an ordinary user:
+
+```bash
+make kernels
+make
+modinfo ./mz0380.ko | head
+```
+
+Other supported build operations:
+
+```bash
+make KVER=<installed-kernel-version>  # cross-build for one installed kernel
+make all-kernels                     # save all builds under ko/
+make objclean                        # clean top-level kbuild products
+make clean                           # normal clean; preserves ko/
+make distclean                       # clean and remove ko/
+make legacy                          # attempt the unsupported sc0710 build
+```
+
+If `/lib/modules/$(uname -r)/build` is missing, no out-of-tree module can be
+built for or loaded into that running kernel. Install matching headers, or
+reboot into an installed kernel whose headers are present. A `.ko` built for a
+different kernel will fail with `Invalid module format`; check its vermagic:
+
+```bash
+uname -r
+modinfo -F vermagic ./mz0380.ko
+```
+
+## Recommended persistent H.264 workflow
+
+The module's historical bare defaults intentionally preserve the old raw
+single-frame baseline. For working live capture, use the exact validated H.264
+profile below. The wrapper builds the module, runs a zero-spawn load/unload
+smoke test, loads dependencies, inserts the driver, waits for the V4L2 node,
+and leaves it loaded for OBS:
+
 ```bash
 make
+
+sudo env \
+  VICFW=7 H264PROBE=1 POLLDRAIN=0 \
+  WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
+  H264DIVISOR=2 PERSIST=1 \
+  ./mz0380-live.sh load
 ```
 
-Needs `linux-headers-$(uname -r)`. `make kernels` lists which installed kernels
-are buildable and which one `make` will use; `make KVER=<ver>` cross-builds for
-another; `make all-kernels` builds every buildable kernel into `ko/`.
+What the profile selections do:
 
-The tree supports both 6.x and 7.x. The only source difference is vb2's
-`wait_prepare`/`wait_finish` ops, detected by grepping `videobuf2-v4l2.h`
-rather than by version number.
+| Loader variable | Module parameter | Purpose |
+|---|---|---|
+| `VICFW=7` | `vic_fw=7` | Select continuous tinyvenc7 instead of single-shot tinyvenc5. |
+| `H264PROBE=1` | `h264_probe=1` | Allocate the independent Windows-style H.264 window-1 ring and advertise H.264. |
+| `POLLDRAIN=0` | `poll_drain_ms=0` | Disable the legacy raw-frame polling path. |
+| `WINSEQ=1` | `win_seq=1` | Use the Windows capture-start order. |
+| `OP6=1` | `win_start_op6=1` | Send the additional start doorbell required by this path. |
+| `POSTMASK=0` | `post_mask=0` | Avoid the mask that truncates DMA to 16 bytes. |
+| `FASTKILL=0` | `vic_fast_kill=0` | Request orderly card-side encoder teardown. |
+| `H264DIVISOR=2` | `h264_frame_divisor=2` | Fastest valid tinyvenc7 cadence: one output for two inputs. |
+| `PERSIST=1` | `persistent_h264=1` | Keep one pipeline alive across userspace detach/attach. |
 
-## Load and capture
+Several values in the command are also current parameter defaults, but spelling
+out the complete validated profile prevents a future default change from
+silently changing a hardware test.
 
-The shipping defaults are the known-good capture configuration — DMA, the V4L2
-node, the firmware handshake and the 20 ms poll-drain are all on. A bare
-`insmod` captures:
+The loader prints the actual `/dev/videoN`; do not assume it is
+`/dev/video0`. Check the live state at any time:
 
 ```bash
-sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm
-sudo insmod ./mz0380.ko
-v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=/tmp/frame.i420
+sudo ./mz0380-live.sh status
+cat /proc/mz0380-state
+sudo ./mz0380-live.sh watch      # Ctrl-C stops watching, not the module
 ```
 
-The frame is planar I420 at 1920x1080:
+A healthy active state should show all of the following:
+
+- `source: 1920x1080p @ 30 fps` or `@ 60 fps`;
+- `pixelformat: H264` in `/proc/mz0380-state`;
+- a running pipeline and attached VB2 consumer;
+- increasing H.264 delivered counters;
+- zero command timeouts;
+- normally one `SET_VIC`/encoder spawn for the pipeline lifetime.
+
+The reported encoded estimate is approximately input rate divided by two.
+Thus 1080p30 produces about 15 H.264 access units per second and 1080p60 about
+30. This is expected current behavior, not an OBS frame-rate setting problem.
+
+### OBS setup
+
+1. Add **Video Capture Device (V4L2)** and select the `/dev/videoN` printed by
+   the loader (`mz0380 H.264`).
+2. Use the device's advertised 1920x1080 format and H.264 input.
+3. Turn off **Deactivate when not showing**.
+4. Turn off **Use Buffering** for lower preview latency.
+5. Keep one source instance. During a bounded hardware discriminator, do not
+   reopen/apply Properties or let OBS retry a failed source in a loop.
+
+With `persistent_h264=1`, closing/reopening the ordinary same-mode OBS source
+attaches to the existing pipeline rather than issuing another `SET_VIC`. A real
+mode change queues one controlled encoder replacement at the next attachment.
+
+### HDMI loss and NO SIGNAL behavior
+
+The current implementation behaves as follows. The unplug/same-mode reconnect
+path is hardware-validated; initial STREAMON with HDMI already absent and a
+genuinely changed returning mode are still explicit validation items below.
+
+- If STREAMON begins without HDMI lock, the driver immediately serves the
+  embedded host H.264 NO SIGNAL IDR at two fps and sends no `SET_VIC` or
+  pipeline-start command. A stable lock then starts the card pipeline once.
+- If HDMI disappears during live capture, the card pipeline stays alive and
+  DMA completions continue to be drained and acknowledged while the
+  placeholder is presented.
+- A same-mode reconnect keeps `SET_VIC` at one and returns to live video only
+  at a clean SPS/PPS-bearing IDR.
+- A genuinely changed mode keeps the placeholder active, queues a V4L2 source
+  change, and performs one controlled replacement on the next attachment.
+- Healthy H.264 delivery does not poll the receiver mailbox. After 1500 ms of
+  producer silence, recovery starts and receiver checks run at 500-ms intervals.
+
+Status exposes placeholder IDRs, cadence misses, recovery state, suppressed
+live units and pending replacement state. `SIGMON=<ms>`, `NOSIGFPS=<1..10>`,
+and `EXTRA="hotplug_stall_ms=<ms>"` are available for bounded tests; keep the
+validated defaults for ordinary use.
+
+### Capture H.264 without OBS
+
+After loading the recommended profile, substitute the printed node below:
 
 ```bash
-ffplay -f rawvideo -pixel_format yuv420p -video_size 1920x1080 /tmp/frame.i420
+timeout 10s v4l2-ctl -d /dev/videoN \
+  --stream-mmap=4 --stream-to=/tmp/mz0380.h264
+ffprobe /tmp/mz0380.h264
+ffplay -fflags nobuffer -flags low_delay /tmp/mz0380.h264
 ```
 
-Decoding it as NV12 gives magenta/green interleave banding — the byte count is
-identical and only the chroma layout differs, so nothing errors, it just looks
-wrong.
-
-`make load-streaming` does the load; `make capture` runs the full validation
-harness, which reloads the module, waits for an HDMI lock, captures and scores
-the result:
+Finally close OBS or any other user of the node, then unload exactly once:
 
 ```bash
-sudo ./mz0380-m55-real-capture.sh 1 45
+sudo ./mz0380-live.sh unload
 ```
 
-The host needs a translating IOMMU domain: the card's outbound window is
-high-32-bits-only, so each stream buffer is mapped at its own 4 GiB-aligned
-IOVA.
+The expected final log contains one successful `final pipeline stop` boundary.
+The explicit unload also records the spawn tally and removes root-owned build
+products that could obstruct a later non-root build.
 
-## Is the card healthy?
+## Encoder spawn budget
 
-Two seconds, no HDMI source needed, no encoder spawned. Run it first whenever
-anything looks wrong:
+`SET_VIC` creates a new encoder process on the card. Historical testing wedges
+the card's mailbox somewhere around **8–18 encoder spawns per real power
+cycle**. The visible failure may look like loss of HDMI because the mailbox can
+no longer bring up the receiver, even though PCI configuration and BAR reads
+still look normal.
 
-```bash
-sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc v4l2-dv-timings snd-pcm; sudo insmod ./mz0380.ko; sudo dmesg | grep -a "CMD_INIT\|handshake" | tail -3; sudo rmmod mz0380
-```
-
-- healthy: `CMD_INIT answered on attempt 1 (status=0xdddddddd)`
-- wedged: `CMD_INIT got no answer (-110)` and `the mailbox is deaf`
-
-A wedged card still enumerates on PCIe with sane BAR reads — what is dead is the
-card's own mailbox service. Because the handshake never completes the receiver
-is never brought up, so the visible symptom is "no HDMI timing locked", which
-reads exactly like a dead source and is not one. Power-cycle; don't chase the
-source.
-
-## Spawn budget
-
-Every stream start forks a fresh encoder on the card, and the card wedges
-somewhere in the 8–18 spawn range per power cycle. The budget is therefore the
-number that decides whether the next run is safe:
+Persistent H.264 exists partly to avoid this: ordinary V4L2 detach/attach and
+same-mode HDMI recovery reuse one pipeline. Still, inspect the tally before
+experiments:
 
 ```bash
 ./mz0380-spawns.sh
 ```
 
-It accumulates across module reloads in `/run`, which a tmpfs clears at boot —
-the same event that resets the card. `mz0380-m55-real-capture.sh` banks each
-run's spawns automatically.
+The tally is stored in `/run`, and loading scripts commit their per-module
+count before unload. A warm reboot may clear `/run` without removing PCIe slot
+power, so only reset the tally after a known full power removal:
+
+```bash
+sudo ./mz0380-spawns.sh reset
+```
+
+Do not fake video by repeatedly restarting the legacy one-frame stream. Do not
+loop reloads, OBS source retries, or mode replacements. Once the tally is in
+the historical 8–18 range, a further spawning run is a gamble.
+
+## Card health check
+
+This takes about two seconds, requires no HDMI source, and does not STREAMON or
+spawn an encoder:
+
+```bash
+sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc \
+  v4l2-dv-timings snd-pcm
+sudo insmod ./mz0380.ko
+sudo dmesg | grep -aE 'CMD_INIT|handshake' | tail -3
+sudo rmmod mz0380
+```
+
+Healthy:
+
+```text
+CMD_INIT answered on attempt 1 (status=0xdddddddd)
+```
+
+Wedged:
+
+```text
+CMD_INIT got no answer (-110)
+the mailbox is deaf
+```
+
+If wedged, stop testing and remove mains power. Do not investigate EDID, the
+HDMI source or PCI BAR values until the mailbox answers again.
+
+## Legacy one-frame raw capture
+
+A bare `insmod` uses `vic_fw=5`, `h264_probe=0` and the 20-ms poll-drain path.
+It is useful as a known raw control, but it is not continuous video:
+
+```bash
+sudo modprobe -a videodev videobuf2-v4l2 videobuf2-vmalloc \
+  v4l2-dv-timings snd-pcm
+sudo insmod ./mz0380.ko
+v4l2-ctl -d /dev/videoN --stream-mmap --stream-count=1 \
+  --stream-to=/tmp/frame.i420
+ffplay -f rawvideo -pixel_format yuv420p -video_size 1920x1080 \
+  /tmp/frame.i420
+sudo rmmod mz0380
+```
+
+The result is one correct 1920x1080 planar I420 frame (3,110,400 bytes). The
+queue then ends with `-EIO`/`EPOLLERR` instead of blocking forever. Decoding it
+as NV12 produces magenta/green interleave banding because NV12 has the same
+byte count but a different chroma layout.
+
+The validation harness reloads the module, waits for HDMI lock, captures and
+scores this raw control, then unloads:
+
+```bash
+sudo ./mz0380-m55-real-capture.sh 1 45
+```
+
+Each raw STREAMON sends `SET_VIC`; use the harness sparingly and count spawns.
+`make load`, `make load-streaming`, `make capture`, and `make capture-h264` are
+legacy/raw helpers, not the recommended persistent H.264 workflow.
+
+## Troubleshooting
+
+### No `/dev/video*` node
+
+Inspect the driver log first:
+
+```bash
+sudo dmesg | grep mz0380 | tail -80
+lspci -nnk -d 12ab:
+```
+
+Common causes are an unsupported subsystem ID, missing V4L2 dependencies, a
+firmware-handshake timeout, an IOMMU setup failure, module signature rejection,
+or a module built for another kernel.
+
+### HDMI is connected but status says unlocked
+
+First distinguish a receiver/source problem from a deaf card:
+
+```bash
+sudo ./mz0380-live.sh status
+sudo dmesg | grep -aE 'CMD_INIT|ret=-110|MST3367 signal' | tail -30
+```
+
+Any mailbox timeout points back to card health and slot power. With no timeout,
+confirm the source is actually fixed at 1920x1080p30 or p60 and allow the
+receiver to settle. Do not automate HPD pulses: they have only been proved not
+to break healthy capture, not to shorten a connected-but-unlocked outage.
+
+### OBS is black, frozen or laggy
+
+- Verify `H264PROBE=1`, `VICFW=7` and `POLLDRAIN=0` were present in the load
+  banner.
+- Check that H.264 delivered counters increase and command timeouts remain zero.
+- A 30-Hz source yielding about 15 encoded fps is the known divisor-2 limit.
+- If NO SIGNAL is active, inspect `recovery`, `source`, suppressed units and
+  pending replacement in `/proc/mz0380-state`.
+- Remove duplicate OBS capture sources and disable buffering.
+- Do not repeatedly reopen Properties while diagnosing an encoder failure.
+
+### Module will not unload
+
+Use the wrapper, which terminates users holding the V4L2 node:
+
+```bash
+sudo ./mz0380-live.sh unload
+cat /sys/module/mz0380/initstate 2>/dev/null
+```
+
+If the state is `going`, the kernel module is stuck in its removal path and
+another `rmmod` cannot repair it. Remove mains power before the next session.
+
+### A root-run harness broke the next build
+
+The explicit live-script unload normally removes root-owned generated files.
+If a test was interrupted, inspect ownership, then run `make clean` with the
+appropriate privileges before rebuilding as your normal user.
 
 ## Diagnostics
 
-| Path                      | What                                    |
-|---------------------------|-----------------------------------------|
-| `/proc/mz0380`            | device list + BAR map                   |
-| `/proc/mz0380-state`      | live state, format, IRQ and spawn counts |
-| `/proc/mz0380-snapshot`   | targeted register snapshot (5 profiles) |
-| `/proc/mz0380-control`    | SDK-grouped control surface             |
-| `/proc/mz0380-experiment` | bounded register probe + property write |
+| Interface | Contents |
+|---|---|
+| `/proc/mz0380` | Devices, board identity, BAR map and V4L2 node. |
+| `/proc/mz0380-state` | Signal, format, source rate, pipeline, H.264, placeholder, IRQ, timeout and spawn counters. |
+| `/proc/mz0380-snapshot` | Targeted register snapshots in five profiles. |
+| `/proc/mz0380-control` | SDK-grouped control surface. |
+| `/proc/mz0380-experiment` | Bounded register probes and property writes. |
 
-`modinfo ./mz0380.ko` documents all module parameters; most are
-reverse-engineering levers with a milestone reference in their help text, and
-the defaults are the configuration every successful capture used.
+Useful commands:
 
-## Status
+```bash
+cat /proc/mz0380-state
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/videoN --all
+v4l2-ctl -d /dev/videoN --query-dv-timings
+modinfo ./mz0380.ko
+sudo dmesg | grep mz0380 | tail -100
+```
 
-- [x] PCI probe, BAR map, mailbox command path, firmware handshake
-- [x] MST3367 receiver bring-up, HDMI detect, DV timings, CSC
-- [x] Four-buffer SET_BUF path, MSI event FIFO, vb2 delivery
-- [x] Real 1080p capture, correct colour, from a plain `insmod`
-- [x] V4L2 node describes itself correctly (format, frame sizes, input status)
-- [x] The one-frame bound is reported as end-of-stream rather than a hang
-- [x] `v4l2-compliance` clean (148/148; 5 warnings are `DV_RX_POWER_PRESENT`,
-      which this card cannot answer - M173)
-- [ ] Capture verified at resolutions other than 1080p
-- [ ] ALSA PCM DMA
-- [ ] Mainline `linux-media` submission
+Most module parameters are reverse-engineering controls, not user-facing
+tuning. `modinfo ./mz0380.ko` documents their defaults and milestone references.
+Use the validated profile unless a documented experiment explicitly requires a
+different value.
 
-Continuous video is **not** on this list. It needs a different `ep.ko` or a
-different `tinyvenc5` on the card, and putting either there is out of scope by
-standing rule — `NEXT_SESSION_START.md` records both routes and the specific
-blocker for each.
+## Main remaining task: true 60-fps capture
 
-## Documentation
+The current H.264 route cannot produce 60 encoded fps:
 
-| File                     | What                                              |
-|--------------------------|---------------------------------------------------|
-| `NEXT_SESSION_START.md`  | current state, what is closed, what to do next    |
-| `RE_FINDINGS.md`         | full reverse-engineering history, milestone by milestone |
-| `MZ0380_SDK_CONTROL_PATH.md` | the card-side SDK control path                |
+- tinyvenc7 divisor 2 is the fastest working mode and encodes every second
+  input frame;
+- divisor 1 has an unreachable modulo predicate and emits no H.264;
+- divisor 0 selects an unconfigured schedule and also emits no H.264.
+
+The next bounded discriminator is `RAWBANKS=1`. It allocates independent,
+Windows-style opcode-`0x02` and opcode-`0x08` banks with four distinct
+`0x466000` buffers per bank, poisons them differently, and reports write
+extents at stop. Run it **only after a real power cycle and only with `SET_VIC`
+confirmed as 1920x1080p60 from the beginning**:
+
+```bash
+sudo env \
+  VICFW=7 H264PROBE=1 POLLDRAIN=0 \
+  WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
+  H264DIVISOR=2 PERSIST=1 RAWBANKS=1 \
+  ./mz0380-live.sh load
+```
+
+Open OBS once, then verify the source before interpreting anything:
+
+```bash
+sudo ./mz0380-live.sh status
+grep '^  source' /proc/mz0380-state
+```
+
+It must say `source: 1920x1080p @ 60 fps`. Let capture run for about ten
+seconds, close OBS, unload once, and preserve the discriminator log:
+
+```bash
+sudo ./mz0380-live.sh unload
+sudo dmesg | grep -E \
+  'raw-bank probe|raw bank[01]|stream stop: EVENT|final pipeline stop|SET_VIC' \
+  | tail -160
+```
+
+Interpretation:
+
+- a frame-sized write extent in either bank identifies a raw 60-Hz path to
+  implement for V4L2;
+- a 16-byte extent in both banks closes that lead and returns the investigation
+  to firmware/static analysis for another all-frame mode;
+- zero means that bank was untouched.
+
+Do not use the simultaneous H.264 preview as the discriminator result; it is
+still divisor-2 and therefore about 30 fps from a 60-Hz input. The earlier
+RAWBANKS run began at 1080p30 and found 16 bytes in each opcode-`0x02` buffer
+and no opcode-`0x08` writes, so it did not settle the 60-Hz question.
+
+## Remaining validation checklist
+
+The primary persistent OBS lifecycle is hardware-validated. Remaining work is:
+
+1. Power-cycle the PSU to start from a known encoder-spawn budget.
+2. Start OBS with HDMI already absent and prove placeholder-only operation has
+   `pipeline: stopped` and `SET_VIC sent: 0`.
+3. Run the RAWBANKS discriminator above with `SET_VIC` confirmed at 1080p60
+   from the start.
+4. If a bank has frame-sized writes, implement that raw 60-Hz path for V4L2.
+   If both banks contain only 16 bytes or zeros, close this lead and resume
+   firmware/static analysis for another all-frame schedule.
+5. Return with a genuinely different HDMI mode and validate the single
+   controlled replacement on the next userspace attachment.
+6. Test one manual HPD pulse during a real connected-but-unlocked outage before
+   considering any automatic HPD recovery.
+7. Close OBS, unload once, and retain the final STOP and raw-bank logs.
+
+Do not open/apply OBS Properties during the raw-bank discriminator. Do not
+deliberately exhaust the spawn budget to test recovery from a deaf card.
+
+## Documentation map
+
+| File | Purpose |
+|---|---|
+| `NEXT_SESSION_START.md` | Detailed current handoff, latest hardware evidence and exact next experiment. |
+| `RE_FINDINGS.md` | Full reverse-engineering history, milestone by milestone. |
+| `MZ0380_SDK_CONTROL_PATH.md` | Card-side SDK control path and command model. |
+| `mz0380-live.sh` | Recommended live loader/status/watch/unload workflow. |
+| `mz0380-spawns.sh` | Cross-reload encoder-spawn accounting. |
+| `mz0380-m55-real-capture.sh` | Legacy raw control-capture harness. |
+
+The handoff contains older, explicitly superseded investigation sections for
+historical context. Prefer its topmost current section and this README over old
+intermediate conclusions.
 
 ## License
 
