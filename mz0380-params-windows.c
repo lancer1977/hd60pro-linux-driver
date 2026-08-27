@@ -75,18 +75,18 @@ MODULE_PARM_DESC(enc_sub,
 		 "M82: also send SET_ENC_PARAMS for the sub stream (main_or_sub=1) (def:1)");
 
 /*
- * tinyvenc7 reuses SET_ENC_PARAMS' nominal minimum-QP byte as the divisor in
- *     (input_frame_counter % divisor) == 1
- * before it calls TK_H264Enc_ProcessOneFrame. Windows sends 5 because it runs
- * tinyvenc5, where the byte is only a QP bound; carrying that value over to
- * tinyvenc7 limits a 60 Hz source to 12 fps. Divisor 2 is the fastest working
- * value. One can never leave remainder 1, and zero selects an unconfigured
- * 128-bit schedule bitmap, so both values produce no H.264.
+ * M204: tinyvenc7's own SET_ENC_PARAMS printf identifies payload byte 20 as
+ * `skip`, not QP-min. Non-zero values drive (input_counter % skip) == 1.
+ * Zero selects a 128-bit schedule that h264_param_processing() itself fills
+ * via tiny_calculate_skip_fps(input_fps, 0); that bitmap selects every input
+ * frame. M205 hardware-validates value 0 at approximately 60 encoded fps from
+ * a 60-Hz input, so it is now the default. Value 2 remains the proven 30-fps
+ * fallback; value 1 can never leave remainder one.
  */
-unsigned int mz0380_h264_frame_divisor = 2;
+unsigned int mz0380_h264_frame_divisor;
 module_param_named(h264_frame_divisor, mz0380_h264_frame_divisor, uint, 0644);
 MODULE_PARM_DESC(h264_frame_divisor,
-		 "tinyvenc7 H.264 input-frame divisor, valid 2..255 (2 = 30 fps from a 60 Hz source; def:2)");
+		 "tinyvenc7 H.264 frame schedule: 0=all-frame bitmap (def, hardware-proven 60 fps at 60 Hz), 2..255=modulo skip; 1 invalid");
 
 /*
  * SET_ENC_PARAMS validity mask. We send bits 0/1/6 (fps, gop, bitrate) and

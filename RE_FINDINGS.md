@@ -10181,7 +10181,13 @@ not by argument.
 
 ---
 
-## M165 (static, 2026-08-24): the frame-interval knob is opcode 0x32, and **ep.ko does not forward it** - the fw=7 full-frame path is not host-reachable
+## M165 (static, 2026-08-24, **superseded by M204**): the frame-interval knob is opcode 0x32, and **ep.ko does not forward it** - the fw=7 full-frame path is not host-reachable
+
+**Correction:** M165's direct-writer census missed calls to
+`tiny_calculate_skip_fps()` and `tiny_calculate_avg_fps()`. Those helpers write
+the schedule bitmaps indirectly from the already-forwarded opcodes `0x31` and
+`0x2d`; opcode `0x32` is not required for the all-frame H.264 schedule. Keep
+the material below as the historical chain, not as the current conclusion.
 
 M164's chain completes, and it ends in a wall. Recording it fully, because the
 wall is the result.
@@ -11309,7 +11315,11 @@ the duplicate sources left one owner and produced the picture.
 
 ---
 
-## M178 (static/source, 2026-08-24): the 12 fps limiter is tinyvenc7 reusing Windows's QP-min byte as a frame divisor
+## M178 (static/source, 2026-08-24, **field interpretation superseded by M204**): the 12 fps limiter is tinyvenc7 reusing Windows's QP-min byte as a frame divisor
+
+M204 preserves the measured modulo result but corrects the field name and zero
+mode: command byte 20 is `skip`, not QP-min, and zero selects a bitmap which
+SET_ENC processing populates locally rather than an inaccessible empty bitmap.
 
 OBS negotiated 60 fps, but the first run converged near 12 fps. The driver
 delivered 910 and dropped only 2, and tinyvenc7 continued producing preview
@@ -11453,7 +11463,7 @@ spend another spawn.
 
 ---
 
-## M182 (Windows trace/static, 2026-08-25): Windows does not select an all-frame H.264 schedule; its raw buffer topology is the real unimplemented difference
+## M182 (Windows trace/static, 2026-08-25, **H.264 conclusion superseded by M204**): Windows does not select an all-frame H.264 schedule; its raw buffer topology is the real unimplemented difference
 
 The complete saved Windows collection was revisited specifically for the 60 fps
 requirement. The 1080p60 transitions in
@@ -12110,7 +12120,7 @@ card H.264 access unit.
 
 ---
 
-## M196 (hardware, 2026-08-25): clean placeholder/live boundary; 30 Hz input exposes the unavoidable divisor-2 cadence
+## M196 (hardware, 2026-08-25, **zero-mode conclusion superseded by M204**): clean placeholder/live boundary; 30 Hz input exposes the divisor-2 cadence
 
 The retained recovery log proves the state transition works. After a long
 unplugged interval, recovery attempt 1526 measured a coherent 1920x1080p30
@@ -12307,3 +12317,273 @@ preview event can name a window-1 slot before encoded DMA begins. The drain now
 silently leaves such a wholly untouched slot unconsumed for its later encoded
 completion; genuinely partial or malformed headers retain the existing
 ratelimited diagnostic.
+
+---
+
+## M203 (hardware, 2026-08-26): independent raw-bank lead closed at a confirmed 1080p60 SET_VIC
+
+The required bounded M200 discriminator has now run with the encoder configured
+at 1920x1080p60 from the outset. The receiver reported coherent 2200x1125
+timings and R55=0x7f, and SET_VIC explicitly logged
+`input=1920x1080p@60`. The simultaneous divisor-2 H.264 control remained
+healthy: the later live snapshot showed 949 delivered access units, zero
+drops, an inactive placeholder, fresh producer activity, one attachment, one
+SET_VIC, and no command timeouts. Module removal completed one successful final
+STOP with `fifo_drops=0`.
+
+Neither Windows-style raw bank carried a frame. All four opcode-0x02 bank-0
+buffers changed over exactly `0x10` bytes and retained poison beyond that
+16-byte preview/status record. All four independent opcode-0x08 bank-1 buffers
+had extent zero, zero sampled pages touched, and their 0x5a poison remained
+byte-exact at the head. This reproduces the earlier 30-Hz shape under the
+previously missing 60-Hz precondition.
+
+The independent opcode-0x02/opcode-0x08 topology is therefore not a hidden raw
+60-fps video path for this firmware configuration. Do not spend further encoder
+spawns repeating RAWBANKS. True 60-fps delivery remains unresolved and returns
+to static firmware/Windows-driver analysis for a different output path or
+all-frame mode. The validated user-facing path remains divisor-2 H.264: about
+30 encoded fps from this 60-fps HDMI input.
+
+---
+
+## M204 (static/source, 2026-08-26): H.264's all-frame bitmap is reachable through SET_ENC_PARAMS
+
+M165/M178 made two linked interpretation errors. First, the bitmap writer
+census searched for direct stores and missed calls to the two exported helper
+functions. Second, SET_ENC_PARAMS payload bytes 20 and 21 were named `qp_min`
+and `qp_max` in the host driver even though tinyvenc7's own command printf
+names them `skip` and `avg`.
+
+The relevant tinyvenc7 chain is now complete:
+
+1. SET_ENC_PARAMS mask bits 7/8 copy command bytes 20/21 to stream offsets
+   `+0x18/+0x19` as skip/average frame-rate controls.
+2. When both values are zero, `h264_param_processing()` at `0xd4e8` calls
+   `tiny_calculate_skip_fps(input_fps, 0, stream+0x30, stream+0x38, false)`.
+3. The helper at `0x13c2c` sets bit positions `0, skip+1, 2*(skip+1), ...` below
+   `input_fps`. With skip zero and a 60-Hz input this is bits 0 through 59: one
+   selected bit for every input frame.
+4. `vcap_handler` at `0x12668` uses the old modulo path only when
+   `stream+0x18` is non-zero. With zero it reads the 128-bit bitmap at
+   `stream+0x30..+0x3f`; a selected bit reaches
+   `TK_H264Enc_ProcessOneFrame`.
+
+No opcode `0x32`, alternate `ep.ko`, Windows installer, or card firmware upload
+is needed. The current hardware-proven value `h264_frame_divisor=2` is in fact
+`skip=2`, explaining the measured 30 fps. Value one remains invalid because
+`counter % 1` can never equal one. Value zero is now admitted as an opt-in
+all-frame diagnostic and clears both skip and avg. V4L2 and `/proc` reporting
+describe it as source-rate output; the proven default remains two until the
+card confirms the prediction.
+
+The next bounded hardware run is therefore one normal H.264 load, with
+RAWBANKS omitted and `H264DIVISOR=0`. At a confirmed 1080p60 source, open
+exactly one OBS V4L2 source for roughly ten seconds, then close OBS and unload
+once. Success is approximately 60 delivered access units per second with no
+producer-paced drops or command timeouts. Failure is still informative and
+must preserve the final SET_ENC, state, STOP, and H.264 cadence lines.
+
+---
+
+## M205 (hardware/source, 2026-08-26): the all-frame bitmap delivers true 1080p60 H.264
+
+The bounded M204 test succeeded. SET_VIC started one tinyvenc7 process at a
+coherent 1920x1080p60 input (`htot=2200`, `vtot=1125`, `hper=674`, `vper=599`,
+`R55=0x7f`). Both SET_ENC_PARAMS transactions explicitly logged
+`skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap` and completed without a
+timeout.
+
+The live snapshots were healthy:
+
+- 909 delivered and 9 dropped at the first sample;
+- 1,663 delivered and the same 9 dropped at the second sample;
+- one userspace attachment and one SET_VIC throughout;
+- placeholder inactive, recovery idle, and fresh H.264 activity 2--5 ms old;
+- zero command timeouts.
+
+At final removal the pipeline had run for approximately 73 seconds and
+reported 4,339 frame events, about 59--60 events per second. It stopped once
+with `fifo_drops=0` and a clean STOP response. The nine H.264 drops occurred in
+two short bursts whose logs explicitly say `no queued vb2 buffer`; the producer
+continued at frame cadence and the count did not grow afterward. They are
+userspace buffer-availability gaps, not an encoder ceiling.
+
+This closes the true-60-fps requirement. No raw-bank route, opcode `0x32`,
+alternate `ep.ko`, Elgato Windows installer, or firmware upload is involved.
+SET_ENC's zero `skip/avg` values make tinyvenc7 use the schedule it constructs
+locally, selecting every 60-Hz input frame. The module parameter default and
+recommended loader profile are now `h264_frame_divisor=0`/`H264DIVISOR=0`.
+Value 2 remains a validated 30-fps fallback; value 1 remains invalid.
+
+---
+
+## M206 (hardware/product requirement, 2026-08-26): long 60-fps run passes; broad camera compatibility remains open
+
+A second all-frame run independently sustained the result. SET_VIC again
+started at confirmed 1920x1080p60, both SET_ENC transactions carried
+`skip=0, avg=0`, and final stop reported 16,754 frame events over approximately
+279.7 seconds: about 59.9 events per second. The persistent pipeline served two
+userspace attachments with one SET_VIC spawn, then stopped cleanly with zero
+FIFO drops. This is stronger duration and reattachment validation for M205.
+
+The user records an additional Windows-parity requirement: Elgato's Windows
+driver appears as a camera that can be selected broadly across applications.
+The Linux module does register a standard V4L2 `/dev/videoN`, but the working
+live profile advertises compressed H.264. OBS accepts it directly; webcam-only
+applications that require raw YUYV/NV12 are not guaranteed to enumerate or
+open it. That is a compatibility gap, not a failure of the validated capture
+transport.
+
+The immediate bridge is one OBS V4L2 source feeding OBS Virtual Camera through
+Linux `v4l2loopback`. Native parity requires either a safe raw hardware output
+path or a maintained userspace H.264-decode/virtual-camera service. H.264
+decoding must not be added to the kernel driver.
+
+---
+
+## M207 (product architecture correction, 2026-08-26): Windows parity means native negotiated raw and encoded formats
+
+The user rejects a mandatory OBS/FFmpeg loopback bridge as the product design,
+correctly. Re-reading the saved live DirectShow probe makes the target
+unambiguous: both Windows output pins advertise YUY2, YV12, NV12, RGB24, RGB32,
+main H.264, and 960x540 substream H.264. `GetFormat` reported YUY2 1920x1080 at
+30 fps as the current type, and YUY2 capabilities include 50 and 59.94 fps.
+The card configuration independently documents hardware output format 1 as
+YUV420 and 2 as YUV422. RGB24/32 remain likely host conversions.
+
+Therefore `h264_probe` and the one-format `mz0380_current_pixelformat()` model
+are reverse-engineering scaffolding, not the final interface. The production
+Linux shape is:
+
+1. PCI modalias loads the installed module at boot; probe initializes the card
+   and registers stable V4L2/ALSA interfaces without starting or selecting a
+   video codec.
+2. `VIDIOC_ENUM_FMT` exposes only hardware paths that have been validated.
+3. `VIDIOC_TRY_FMT`/`VIDIOC_S_FMT` stores YUYV/NV12/YV12/H.264 selection while
+   the queue is idle.
+4. STREAMON programs the corresponding raw or encoded card/DMA path. H.264
+   controls are meaningful only for an encoded selection.
+5. STREAMOFF stops or persistently detaches according to that selected path;
+   module removal owns the final card stop.
+
+Do not advertise YUYV prematurely. M203 proved that the current tinyvenc7
+sequence writes only 16-byte records to the candidate raw bank even though
+Windows' YUY2 sample is 4,147,200 bytes. Identify the Windows pin-selection and
+raw delivery path before deciding whether YUY2 is native DMA or a host
+conversion. Once a continuous raw source is known, implement native V4L2
+negotiation and retire `h264_probe` from the user-facing workflow. A loopback
+bridge remains an optional workaround only; it is not Windows parity.
+
+---
+
+## M208 (Windows `.sys` static, 2026-08-26): format choice is per pin, and Windows performs raw conversion
+
+The retail driver's camera interface has now been followed from its KS filter
+descriptor into the live callbacks. The filter descriptor at `0x1402f5890`
+contains two `0x88`-byte video pin descriptors. Both point at the same table at
+`0x1402f69c0` and each advertises `0x140` (320) data ranges. Their shared
+intersection handler is `0x14021d880`; the pin dispatch uses create callback
+`0x14021c4a0` and state callback `0x14021d7f0`.
+
+The create callback parses the negotiated width, height, frame interval, bit
+depth and compression FourCC from the application's media type. It stores raw
+formats in the base stream-slot group. A 24-bit H.264/HEVC selection uses the
+base slot plus eight, while X264/X265 uses the base slot plus sixteen. It also
+allocates width/height-sized working surfaces for raw selections. Thus the
+Windows binary independently confirms the product architecture in M207: codec
+and pixel format are chosen when an application opens/configures a pin, not at
+driver load.
+
+The base raw delivery routine at `0x140280a98` is a large host-side processing
+path. It branches on 12-, 16-, 24- and 32-bit output and contains explicit YV12
+(`0x32315659`) and NV12 (`0x3231564e`) handling, scaling, plane copies and packed
+output conversion helpers. Therefore the DirectShow default of YUY2 does **not**
+establish that PCIe DMA delivers packed YUY2. Windows can advertise YUY2 after
+converting a planar native surface inside its kernel driver.
+
+This refines, rather than removes, the raw-path blocker. Linux has already
+received one complete 1920x1080 planar I420 frame (`3,110,400` bytes) through
+the older tinyvenc5 route, but that producer does not rotate continuously. The
+M203 tinyvenc7 diagnostic found 16-byte records in opcode `0x02` and no writes
+in opcode `0x08`; it did not establish where Windows obtains the continuously
+rotating planar surfaces consumed by its raw handler. The next static target is
+the producer/source-buffer selection inside `0x140280a98` and the corresponding
+Windows buffer-bank state, not an assumed one-command switch to packed YUY2.
+
+Do not expose a fake YUYV capability yet. First prove a continuous native raw
+surface and its actual layout. Then V4L2 can advertise that native format and,
+only if needed for broad camera compatibility, add a deliberate conversion
+path. H.264 remains a separate negotiated choice and must not be selected by
+module insertion.
+
+---
+
+## M209 (Windows `.sys` static, 2026-08-26): raw DMA is an eight-slot planar I420/YUV422 ring in op02/op08
+
+The source selection inside `0x140280a98` is now closed for this board. The
+routine does not read the opcode-`0x04` or opcode-`0x05` allocations, nor a
+hidden scratch surface. For the `12ab:0380`, subsystem `1cfa:0006` path it
+uses the first byte of the incoming completion/sample record as a slot token.
+When all eight large buffers exist it computes `token % 8`; otherwise it uses
+`token % 4`. Slots zero through seven select these CPU virtual addresses:
+
+| token | CPU VA field | physical-address field | registration |
+|---:|---:|---:|---|
+| 0--3 | context `+0x1190..+0x11a8` | `+0x190..+0x1c0` | opcode `0x02`, four `0x466000` buffers |
+| 4--7 | context `+0x11b0..+0x11c8` | `+0x1d0..+0x200` | opcode `0x08`, four independent `0x466000` buffers |
+
+`0x14028f278` allocates those CPU and physical-address pairs together with
+`MmAllocateContiguousMemorySpecifyCache` and `MmGetPhysicalAddress`.
+Registration at `0x14027b62b..0x14027b925` forwards the same physical fields
+to op02 and op08. The opcode-`0x04` buffers are the next allocation group
+(CPU VAs beginning at context `+0x1290`, physical fields `+0x390`) and opcode
+`0x05` is the group after that (`+0x1390` / `+0x590`). Both are allocated at
+`0x34bd00`, but neither group is a source for this board's base raw callback.
+
+Each selected op02/op08 slot contains all three native planes contiguously.
+Let `W` be the shared capture state's width, `H` its active height plus enabled
+VBI lines, and `S = align(W, 16) * H`. The routine derives:
+
+```
+Y = slot + 0
+U = slot + S
+V = slot + S + (fw == 6 ? S / 2 : S / 4)
+```
+
+The source order is Y/U/V, not Y/V/U. The equal-size YV12 output branch proves
+the distinction: it copies the second source chroma pointer (`V`) into YV12's
+first chroma plane, then the first source chroma pointer (`U`) into the second.
+The NV12 branch passes the same U-then-V pair to its interleaver. When the
+shared SET_VIC `fw` field is six, each chroma plane is `S/2` (planar 4:2:2,
+total `2*S`). For every other `fw`, including the Windows 1080p60 choice seven,
+each chroma plane is `S/4` (planar 4:2:0/I420, total `3*S/2`). Windows therefore
+converts native planar DMA to advertised YUY2 in host code; packed YUY2 is not
+the PCIe source layout.
+
+The registered `0x466000` is maximum capacity, not the expected active write
+extent. With the bounded test fixed at 1920x1080p60, `fw=7`, and VBI disabled,
+`S=0x1fa400`: Y is `0x1fa400` bytes, U is `0x7e900`, V is `0x7e900`, and the
+frame ends at `0x2f7600` (3,110,400 bytes). This exactly matches the complete
+I420 frame Linux previously received. For reference, `fw=6` at the same active
+geometry would end at `0x3f4800`. The larger allocations also accommodate
+stride/VBI variants; they must not be mistaken for the per-frame byte count.
+
+The next hardware discriminator is consequently distinct from M203. Add one
+opt-in, H.264-disabled raw-start diagnostic that activates the base raw stream
+selection, registers eight independently poisoned `0x466000` slots through
+op02/op08, keeps VBI zero, sends the confirmed 1080p60 `fw=7` SET_VIC, and does
+not register or consume the encoded op04 path. Spend one start only and bound
+observation to two seconds or eight completions, whichever comes first.
+Success requires repeated completion tokens selecting the op02/op08 ring and
+at least eight consecutive `0x2f7600` planar writes with the Y/U/V boundaries
+above; one full frame is not continuous capture. Repeating the M203 result
+(`0x10` only in op02 and no op08 writes) under this raw-only start closes this
+ring for the Linux command sequence. Any other extent is retained once with
+its token and plane-boundary samples, then the run stops. Do not spend that
+start until the raw-only diagnostic is implemented and dual-kernel build
+checked.
+
+This resolves the static questions but does not yet authorize advertising a
+raw V4L2 format. Native format negotiation remains gated on repeated full
+frames from the bounded raw-only run.

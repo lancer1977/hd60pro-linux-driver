@@ -19,6 +19,7 @@
 void mz0380_drain_work_fn(struct work_struct *w);
 void mz0380_enc_stat_ack(struct mz0380_dev *dev);
 void mz0380_frame_buffer_repoison(struct mz0380_dev *dev, u32 idx);
+void mz0380_raw_probe_buffer_repoison(struct mz0380_dev *dev, u32 idx);
 void mz0380_poll_drain_start(struct mz0380_dev *dev);
 void mz0380_poll_drain_stop(struct mz0380_dev *dev);
 void mz0380_extent_watch_stop(struct mz0380_dev *dev);
@@ -41,5 +42,7 @@ u64 mz0380_frame_poison_q(const struct mz0380_dev *dev);
 void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose);
 int mz0380_infer_frame_length(struct mz0380_dev *dev, u32 idx,
 			      size_t *length);
+int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
+				  size_t *length);
 
 #endif

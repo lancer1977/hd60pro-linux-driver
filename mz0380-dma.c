@@ -481,11 +481,8 @@ int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 	int ret;
 
 	if (mz0380_raw_bank_probe) {
-		ret = mz0380_raw_probe_program_bufs(dev);
-		if (ret)
-			return ret;
-		/* M200 is deliberately an H.264-side diagnostic, not a new V4L2 path. */
-		return mz0380_h264_program_bufs(dev);
+		/* M209 is raw-only: op 0x04 must never be part of this test. */
+		return mz0380_raw_probe_program_bufs(dev);
 	}
 
 	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
@@ -781,8 +778,8 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 	int ret;
 
 	if (mz0380_raw_bank_probe &&
-	    (!mz0380_h264_probe || !mz0380_dma_iova_remap)) {
-		pr_err("%s: raw_bank_probe requires h264_probe=1 and dma_iova_remap=1\n",
+	    (mz0380_h264_probe || !mz0380_dma_iova_remap)) {
+		pr_err("%s: raw_bank_probe is raw-only and requires h264_probe=0 plus dma_iova_remap=1\n",
 		       dev->name);
 		return -EINVAL;
 	}
@@ -824,7 +821,7 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 			mz0380_stream_bufs_free(dev);
 			return ret;
 		}
-		pr_info("%s: M200 raw-bank diagnostic enabled: two independent four-buffer banks x 0x%x bytes (op 0x02 + op 0x08)\n",
+		pr_info("%s: M209 raw-only discriminator enabled: two independent four-buffer banks x 0x%x bytes (op 0x02 + op 0x08, no op 0x04)\n",
 			dev->name, MZ0380_RAW_PROBE_BUF_SIZE);
 	}
 
@@ -937,7 +934,9 @@ void mz0380_handle_event_snapshot(struct mz0380_dev *dev, u32 event)
 			  dev->frame_event_head == dev->frame_event_tail;
 		if (!ack_now) {
 			dev->frame_event_ack_deferred = true;
-			if ((snapshot.token & 7) < MZ0380_STREAM_NR_BUFS)
+			if ((snapshot.token & 7) <
+			    (mz0380_raw_bank_probe ? MZ0380_RAW_PROBE_NR_BUFS :
+			     MZ0380_STREAM_NR_BUFS))
 				dev->frame_event_drop_tokens |=
 					BIT(snapshot.token & 7);
 		}
@@ -961,6 +960,7 @@ EXPORT_SYMBOL_GPL(mz0380_handle_event_snapshot);
 void mz0380_frame_events_start(struct mz0380_dev *dev)
 {
 	unsigned long flags;
+	unsigned int i;
 
 	if (!dev->irq_requested)
 		return;
@@ -982,6 +982,17 @@ void mz0380_frame_events_start(struct mz0380_dev *dev)
 	dev->h264_frames_discarded = 0;
 	dev->h264_frames_suppressed = 0;
 	dev->h264_parameter_sets_len = 0;
+	dev->raw_probe_events = 0;
+	dev->raw_probe_full_frames = 0;
+	dev->raw_probe_bad_extents = 0;
+	dev->raw_probe_consecutive_full = 0;
+	dev->raw_probe_slots_seen = 0;
+	dev->raw_probe_success_reported = false;
+	for (i = 0; i < MZ0380_RAW_PROBE_NR_BUFS; i++) {
+		dev->raw_probe_bufs[i].last_extent = 0;
+		dev->raw_probe_bufs[i].completions = 0;
+		dev->raw_probe_bufs[i].delivered = 0;
+	}
 	dev->frame_events_accepting = true;
 	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
 }
@@ -1008,7 +1019,9 @@ void mz0380_dma_flush_events(struct mz0380_dev *dev)
 	while (dev->frame_event_tail != dev->frame_event_head) {
 		u32 token = dev->frame_events[dev->frame_event_tail].token & 7;
 
-		if (token < MZ0380_STREAM_NR_BUFS)
+		if (token < (mz0380_raw_bank_probe ?
+			     MZ0380_RAW_PROBE_NR_BUFS :
+			     MZ0380_STREAM_NR_BUFS))
 			dev->frame_event_drop_tokens |= BIT(token);
 		dev->frame_event_tail = (dev->frame_event_tail + 1) %
 					MZ0380_FRAME_EVENT_FIFO_SIZE;

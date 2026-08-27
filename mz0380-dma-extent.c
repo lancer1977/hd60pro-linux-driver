@@ -68,6 +68,56 @@ void mz0380_frame_buffers_poison_start(struct mz0380_dev *dev)
 		dev->name, dev->frame_poison_byte);
 }
 
+int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
+				  size_t *length)
+{
+	const struct mz0380_raw_probe_buf *b;
+	const u32 *dwords;
+	u32 poison;
+	size_t i;
+
+	*length = 0;
+	if (idx >= MZ0380_RAW_PROBE_NR_BUFS)
+		return -EINVAL;
+	b = &dev->raw_probe_bufs[idx];
+	if (!b->va)
+		return -EINVAL;
+
+	poison = 0x01010101u *
+		(idx < MZ0380_STREAM_NR_BUFS ?
+		 MZ0380_RAW_PROBE_BANK0_POISON :
+		 MZ0380_RAW_PROBE_BANK1_POISON);
+	dwords = b->va;
+	dma_rmb();
+	for (i = MZ0380_RAW_PROBE_BUF_SIZE / sizeof(*dwords); i; i--) {
+		if (READ_ONCE(dwords[i - 1]) == poison)
+			continue;
+		*length = i * sizeof(*dwords);
+		if (*length == MZ0380_RAW_PROBE_BUF_SIZE)
+			return -ENOSPC;
+		return 0;
+	}
+
+	return -ENODATA;
+}
+
+void mz0380_raw_probe_buffer_repoison(struct mz0380_dev *dev, u32 idx)
+{
+	struct mz0380_raw_probe_buf *b;
+	u8 poison;
+
+	if (idx >= MZ0380_RAW_PROBE_NR_BUFS)
+		return;
+	b = &dev->raw_probe_bufs[idx];
+	if (!b->va)
+		return;
+	poison = idx < MZ0380_STREAM_NR_BUFS ?
+		 MZ0380_RAW_PROBE_BANK0_POISON :
+		 MZ0380_RAW_PROBE_BANK1_POISON;
+	memset(b->va, poison, MZ0380_RAW_PROBE_BUF_SIZE);
+	dma_wmb();
+}
+
 /*
  * Track how far into each poisoned buffer the card has written, including
  * zeros. Forward-incremental scan: everything below extent_last is known
@@ -295,13 +345,14 @@ void mz0380_raw_probe_bufs_dump(struct mz0380_dev *dev, const char *tag)
 			if (READ_ONCE(p[off]) != poison)
 				touched++;
 
-		pr_info("%s: %s raw bank%u op0x%02x buf[%u] @%pad extent=0x%zx (%zu bytes), %zu/%lu sampled pages touched, poison=0x%02x, head=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		pr_info("%s: %s raw bank%u op0x%02x buf[%u] @%pad extent=0x%zx (%zu bytes), %zu/%lu sampled pages touched, poison=0x%02x, completions=%u delivered=%u last_completion_extent=0x%zx, head=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 			dev->name, tag, i / MZ0380_STREAM_NR_BUFS,
 			i < MZ0380_STREAM_NR_BUFS ? MZ0380_CMD_SET_BUF_2 :
 				MZ0380_CMD_SET_BUF_8,
 			i % MZ0380_STREAM_NR_BUFS, &b->dma,
 			extent, extent, touched,
 			MZ0380_RAW_PROBE_BUF_SIZE / PAGE_SIZE, poison,
+			b->completions, b->delivered, b->last_extent,
 			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
 			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
 	}

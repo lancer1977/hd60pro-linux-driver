@@ -789,12 +789,12 @@ MODULE_PARM_DESC(set_buf_op8,
 		 "M92: also send SET_BUF op 0x08 after op 0x02, as Windows always does (def:0)");
 
 /*
- * M200: the old op8 knob aliases the first four addresses.  Windows instead
+ * M209: the old op8 knob aliases the first four addresses.  Windows instead
  * owns eight buffers: op2 slots 1..4 and four independent op8 slots 5..8,
- * each advertised as 0x466000 bytes.  Keep this expensive topology opt-in
- * until one bounded 60 Hz run says whether either bank carries raw frames.
+ * each advertised as 0x466000 bytes.  This is now an isolated raw-only V4L2
+ * discriminator: H.264 window 1/op04 is deliberately forbidden.
  */
 bool mz0380_raw_bank_probe;
 module_param_named(raw_bank_probe, mz0380_raw_bank_probe, bool, 0644);
 MODULE_PARM_DESC(raw_bank_probe,
-		 "M200: allocate and poison Windows-exact independent op02/op08 raw banks (requires h264_probe + IOVA remap; def:0)");
+		 "M209: raw-only Windows-exact independent op02/op08 banks (requires h264_probe=0 + IOVA remap; forbids op04; def:0)");

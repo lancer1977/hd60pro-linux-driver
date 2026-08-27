@@ -383,7 +383,16 @@ struct mz0380_dev {
 		struct page **pages;
 		u32 nr_pages;
 		size_t mapped;
+		size_t last_extent;
+		u32 completions;
+		u32 delivered;
 	} raw_probe_bufs[MZ0380_RAW_PROBE_NR_BUFS];
+	u64 raw_probe_events;
+	u64 raw_probe_full_frames;
+	u64 raw_probe_bad_extents;
+	u32 raw_probe_consecutive_full;
+	u8 raw_probe_slots_seen;
+	bool raw_probe_success_reported;
 	u8 h264_last_token;
 	bool h264_last_token_valid;
 	u64 h264_frames_delivered;

@@ -1,8 +1,47 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-25. Full history in **RE_FINDINGS.md**. This file is the
+_Last updated 2026-08-26. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
+
+## Immediate task: implement one raw-only discriminator; do not run it yet
+
+M209 closes the Windows raw callback's source statically. On this HD60 Pro
+branch, `0x140280a98` selects `token % 8` from the eight large buffers:
+tokens 0--3 are opcode `0x02` (`context +0x1190..+0x11a8`) and tokens 4--7
+are the independent opcode `0x08` bank (`+0x11b0..+0x11c8`). Opcode `0x04`
+and `0x05` point at later allocation groups and are not the raw callback's
+source.
+
+Each selected slot is native contiguous planar Y/U/V. At 1080p60 Windows uses
+`fw=7`, so with VBI disabled the exact layout is:
+
+```
+Y: +0x000000 .. +0x1fa3ff  (1920 * 1080)
+U: +0x1fa400 .. +0x278cff  (Y / 4)
+V: +0x278d00 .. +0x2f75ff  (Y / 4)
+```
+
+The frame write is therefore `0x2f7600` / 3,110,400 bytes even though every
+slot is registered at the maximum `0x466000`. The YV12 branch explicitly swaps
+the native U/V pointers into YV12 order, and the packed-output branches convert
+those planar surfaces in the Windows host driver. Windows does not DMA packed
+YUY2 into these banks.
+
+The one next experiment is not another H.264 `RAWBANKS=1` run. First implement
+and dual-kernel build-check an opt-in raw-only start: base raw selection,
+H.264/op04 disabled, eight independently poisoned `0x466000` op02/op08 slots,
+confirmed 1080p60 `fw=7`, and VBI zero. The eventual hardware run is bounded
+to one start and two seconds or eight completions. Continuous success means at
+least eight consecutive token-selected `0x2f7600` Y/U/V writes; a single full
+frame is only the already-known tinyvenc5 result. Do not spend the start while
+the diagnostic is unbuilt, and do not advertise YUYV/NV12/YV12 until it passes.
+
+The product architecture remains unchanged: installed PCI modalias autoload,
+generic V4L2 registration at probe, application-owned format negotiation, and
+raw or H.264 setup only at STREAMON. There is no mandatory loopback and no
+kernel H.264 decoder. Windows files remain reverse-engineering references, not
+Linux firmware or runtime dependencies.
 
 ## Current development build: hybrid NO SIGNAL recovery (host-only follow-up)
 
@@ -121,44 +160,49 @@ one-spawn delivery are all proven. Remaining discriminators are narrower:
 
 1. On a fresh load begun with HDMI already absent, confirm placeholder-only
    STREAMON keeps the card pipeline stopped and spends zero SET_VIC.
-2. If available, test a fixed 1080p60 source and confirm the predicted ~30
-   encoded fps; 1080p30 is already explained and validated at ~15 fps.
-3. Return with a genuinely changed HDMI mode and validate the controlled single
+2. Return with a genuinely changed HDMI mode and validate the controlled single
    replacement at the next attachment.
-4. Test one HPD pulse only during a real connected-but-unlocked outage before
+3. Test one HPD pulse only during a real connected-but-unlocked outage before
    considering any automated HPD recovery.
-5. At the end of the current run, close OBS, unload once, and retain the single
+4. At the end of the current run, close OBS, unload once, and retain the single
    final pipeline STOP log.
 
-True 60-fps delivery remains the main unresolved requirement. M200 implements
-the next bounded discriminator behind `RAWBANKS=1`: Windows-exact independent
-opcode-0x02 and opcode-0x08 banks, four distinct `0x466000` buffers each, with
-different poison bytes and stop-time extent reports. The default H.264 path is
-unchanged. Run it only with a source confirmed as 1920x1080p60; a 30-Hz source
-cannot settle the 60-fps question.
+True 60-fps H.264 delivery is now validated. M205 ran the M204
+`H264DIVISOR=0` schedule at a confirmed 1920x1080p60 input. Both SET_ENC calls
+landed with `skip=0, avg=0`; status advanced from 909 to 1663 delivered access
+units while the pipeline stayed on one SET_VIC, and the final counters reached
+4,339 frame events over approximately 73 seconds. That is about 59--60 fps.
+There were zero FIFO drops, zero command timeouts, and a clean final STOP.
+
+The nine H.264 drops were short `no queued vb2 buffer` intervals and did not
+limit the producer. Value 0 is now the module and recommended-profile default;
+value 2 remains the proven 30-fps fallback.
+
+Windows presents this device as a generally usable camera and the captured
+DirectShow enumeration proves both pins offer YUY2/YV12/NV12 as well as H.264;
+YUY2 is the current/default format. Linux must match this with native V4L2
+`ENUM_FMT`/`S_FMT` negotiation. Module load should register the hardware, not
+select H.264 through `h264_probe`. Configure the selected raw or encoded DMA
+path only at STREAMON. A loopback decoder is optional, not the target design,
+and an H.264 decoder must not be added to the kernel module.
+
+The M200 independent raw-bank lead is still closed under the required
+condition. SET_VIC started at confirmed 1920x1080p60; opcode-0x02 received only
+16-byte records and opcode-0x08 remained untouched. Do not repeat that
+H.264-selected RAWBANKS sequence; M209's raw-only test is a different start.
+
+The normal persistent H.264 load is now:
 
 ```bash
 sudo env \
   VICFW=7 H264PROBE=1 POLLDRAIN=0 \
   WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
-  H264DIVISOR=2 PERSIST=1 RAWBANKS=1 \
+  H264DIVISOR=0 PERSIST=1 \
   ./mz0380-live.sh load
 ```
 
-Open OBS once, confirm `status` says `source: 1920x1080p @ 60 fps`, let it run
-for about ten seconds, close OBS, and unload. Preserve:
-
-```bash
-sudo dmesg | grep -E \
-  'raw-bank probe|raw bank[01]|stream stop: EVENT|final pipeline stop|SET_VIC' | \
-  tail -160
-```
-
-An extent spanning a frame-sized region in either bank identifies the raw
-60-Hz path. An extent of 16 bytes in both banks closes the independent-bank
-lead; zero means that bank was untouched. Do not interpret the simultaneous
-divisor-2 H.264 preview as the test result—it remains about 30 fps even with a
-60-Hz input.
+Use exactly one OBS V4L2 source, keep buffering disabled, and avoid applying
+Properties unnecessarily because a restart can spend another encoder spawn.
 
 The first RAWBANKS run started its encoder at 1080p30, so it was not the needed
 60-Hz discriminator. It found exactly 16 bytes in each opcode-0x02 buffer and
@@ -182,9 +226,9 @@ That normal-path validation now passes. SET_VIC began at 1080p60; reconnect
 briefly measured 1080p30 twice, then returned to persistent 1080p60. The driver
 cancelled the transient replacement and ended the placeholder 274 ms later at
 a clean SPS/PPS-bearing IDR. Live state afterward was 1995 delivered, zero
-dropped, placeholder inactive, recovery idle, and still one SET_VIC. The
-remaining streaming goal is true 60-fps output; current divisor-2 H.264 remains
-~30 fps from this confirmed 60-Hz input.
+dropped, placeholder inactive, recovery idle, and still one SET_VIC. That run
+used the older divisor-2 profile. M205 later validated the all-frame profile at
+approximately 60 fps from the same 60-Hz input class.
 
 The reconnect log now proves the placeholder-to-live boundary itself works:
 1080p30 was validated at timestamp 4988.568, a clean IDR arrived at 4990.893,
@@ -364,12 +408,11 @@ no-signal presentation, but the receiver/live path appears able to relock and
 resume after a source swap. Confirm whether that recovery used the same encoder
 process by checking that `SET_VIC sent` did not increase before unloading.
 
-The saved Windows 1080p60 trace has now been compared with the working Linux
-sequence. It contains `fw=7`, `fps=60`, and two `SET_ENC_PARAMS` calls (main and
-sub), **both with `qp_min=5`**. The Windows driver never sends opcode `0x32` in
-its structurally enumerated 38-opcode set. Therefore the trace contains no
-hidden host command that selects tinyvenc7's all-frame H.264 schedule: if this
-same H.264 stream is consumed, its known `counter % 5 == 1` gate is 12 fps.
+The saved Windows 1080p60 trace contains `fw=7`, `fps=60`, and two
+`SET_ENC_PARAMS` calls. M204 corrects the earlier field name: tinyvenc7 calls
+payload bytes 20/21 `skip`/`avg`; they are not the final QP bounds printed
+later in the command. Opcode `0x32` is absent but irrelevant because the
+already-forwarded SET_ENC handler generates its own schedule bitmap.
 
 The concrete Windows/Linux difference is instead in the capture-buffer banks.
 For this exact HD60 Pro board branch, Windows registers:
@@ -379,29 +422,23 @@ For this exact HD60 Pro board branch, Windows registers:
 - opcode `0x04`: four `0x34bd00`-byte buffers;
 - opcode `0x05`: four `0x34bd00`-byte buffers.
 
-Linux currently gives opcode `0x02` only four 4 MiB buffers; its optional
-opcode-`0x08` support aliases those same four addresses, and the live mode
-repurposes opcode `0x04` as the dedicated `0x097f00` H.264 ring. This is now the
-best trace-backed lead for the card's Windows 60 fps capture path.
+Linux's opt-in M200 diagnostic reproduced the independent `0x02`/`0x08`
+topology and tested it at a confirmed 1080p60 SET_VIC. M203 closed this lead:
+opcode `0x02` wrote only 16 bytes per buffer and `0x08` wrote nothing.
 
-### Next 60 fps work
+### Historical 60 fps plan (completed by M205/M206)
 
-Do not retry `H264DIVISOR=1`; its modulo condition is provably unreachable. Do
-not spend a spawn sending host opcode `0x32`; stock `ep.ko` forwards zero bytes
-for it and Windows does not send it either. First implement an opt-in diagnostic
-that reproduces Windows' **independent** opcode-`0x02`/`0x08` raw banks and
-their exact `0x466000` advertised size, without aliasing the H.264 buffers.
-Build-check it, then use one bounded hardware spawn to poison and inspect both
-banks while tinyvenc7 runs at a 60 Hz input. The result must distinguish full
-raw frames from 16-byte preview records in each bank before any V4L2 format is
-changed.
+Do not retry `H264DIVISOR=1`, opcode `0x32`, or the H.264-selected M203
+RAWBANKS sequence. The bounded test at this checkpoint was `H264DIVISOR=0` on
+the ordinary H.264 path. It cleared SET_ENC `skip` and `avg`, and M205/M206
+subsequently validated the resulting all-frame schedule in hardware.
 
 If unloading/reloading first, close OBS before `sudo ./mz0380-live.sh unload`.
 That command commits the current load's spawn count before `rmmod`; a module
 reload does **not** reset the card's physical spawn budget. Only removing slot
 power does. Reopening OBS after the reload will spend at least the next spawn.
 
-## Authoritative resume point: continuous H.264 works (2026-08-24 23:50)
+## Historical checkpoint: continuous H.264 works (2026-08-24 23:50; superseded by M205 for cadence)
 
 Continuous HDMI H.264 capture now works. The older sections saying every route
 is closed predate M177/M178 in `RE_FINDINGS.md`.
@@ -414,10 +451,10 @@ is closed predate M177/M178 in `RE_FINDINGS.md`.
   delivers V4L2 H.264 continuously.
 - A bounded test decoded 77 live 1920x1080 High Profile frames. OBS later
   received 910 frames with only 2 startup drops and displayed the live image.
-- The measured 10-12 fps is explained statically: tinyvenc7 also uses the
-  nominal QP-min byte (Windows value 5) as `(input counter % N) == 1`, hence
-  60/5 = 12. The driver now defaults `h264_frame_divisor=2`, the fastest valid
-  value, predicting 30 fps. Values 0 and 1 produce no H.264 on this firmware.
+- The measured 10-12 fps came from tinyvenc7's SET_ENC `skip=5` byte and its
+  `(input counter % N) == 1` gate, hence 60/5 = 12. The driver defaults to the
+  proven `skip=2` result (30 fps). M204 shows that zero selects a firmware-
+  generated all-frame bitmap; only value one is intrinsically invalid.
 - Hardware testing proved the new divisor produces 30 Hz (1975 OBS frames in
   69.3 seconds including startup).
 - The corrected-cadence build is now hardware-verified. `v4l2-ctl
@@ -457,24 +494,16 @@ hidden source owning `/dev/video0` while the visible source failed with EBUSY.
 
 ### User requirement for the next session: restore 60 fps
 
-Do **not** treat 30 fps as the card's final ceiling. The card is expected to
-work at 60 fps. What is proved is narrower: the current tinyvenc7 **divisor
-mode** can produce at most 30 fps because divisor 2 is the fastest valid value
-and divisor 1 emits none. This only rules out getting 60 by lowering that one
-byte again; it does not rule out a different encoder mode or Windows sequence.
+Do **not** treat 30 fps as the card's final ceiling. What is proved is narrower:
+tinyvenc7's non-zero **divisor mode** tops out at 30 fps because divisor 2 is
+the fastest valid value and divisor 1 emits none. M204 now identifies zero as
+the distinct all-frame bitmap mode and implements it as an opt-in test. The
+next session should validate that exact mode once, not resume the older
+opcode/raw-bank search.
 
-The next session must determine how the Windows stack selects all-frame H.264
-output. Start with the supplied Windows collection at
-`/run/media/wolffyx/Work/hd60-trace/collect-2026-08-19` and compare its complete
-60 Hz start/configuration sequence with ours. Revisit, rather than assume
-unreachable, the divisor-0 schedule path, opcode `0x32`, alternate command
-transport, main/sub-stream configuration, and any firmware/config state set
-before `SET_ENC_PARAMS`. Do not spend hardware spawns until a specific
-trace-backed difference has been identified.
-
-Continuous capture, correct 30 fps reporting, and the low-latency OBS setting
-are proved checkpoints. Remaining goals are true 60 fps and then any residual
-latency optimization.
+Continuous capture, the older 30-fps fallback, and the low-latency OBS setting
+were proved at this checkpoint. M205 later closed true 60 fps; residual
+latency optimization remains separate.
 
 ## Where the driver is
 

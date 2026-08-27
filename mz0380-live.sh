@@ -237,8 +237,13 @@ load)
 	echo
 	if [ "${H264PROBE:-0}" = 1 ]; then
 		echo " H.264 window-1 capture is enabled. It delivers valid 1920x1080"
-		echo " High Profile H.264. tinyvenc7's fastest valid divisor is 2:"
-		echo " a 60 fps HDMI input encodes at ~30 fps; a 30 fps input at ~15 fps."
+		if [ "${H264DIVISOR:-0}" = 0 ]; then
+			echo " High Profile H.264. Validated all-frame bitmap mode is selected:"
+			echo " a 60 fps HDMI input encodes at approximately 60 fps."
+		else
+			echo " High Profile H.264. Non-zero skip/divisor mode is selected;"
+			echo " divisor 2 produces approximately 30 fps from a 60 Hz input."
+		fi
 	else
 		echo " Expect ONE frame, then a frozen preview, showing the card's own"
 		echo " monochrome NO SIGNAL splash. That is the default raw path."

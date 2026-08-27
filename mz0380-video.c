@@ -152,10 +152,12 @@ mz0380_default_interval_for_size(u32 width, u32 height)
 }
 
 /*
- * tinyvenc7's H.264 producer emits one access unit per input-frame divisor,
- * not at the VIC/source cadence. Keep capture.timeperframe describing the
- * source (SET_VIC still needs that), but report the encoded cadence to V4L2.
- * A non-reduced fraction such as 2/60 is valid and preserves odd source rates.
+ * Non-zero tinyvenc7 skip values emit one access unit per input-frame
+ * divisor. M204's zero mode selects an all-frame schedule bitmap instead,
+ * and M205 hardware-validates that mode at the source cadence.
+ * Keep capture.timeperframe describing the source (SET_VIC still needs that),
+ * but report the selected encoded cadence to V4L2. A non-reduced fraction
+ * such as 2/60 is valid and preserves odd source rates.
  */
 static struct v4l2_fract mz0380_reported_interval(struct mz0380_dev *dev)
 {
@@ -166,12 +168,12 @@ static struct v4l2_fract mz0380_reported_interval(struct mz0380_dev *dev)
 	if (!mz0380_h264_probe)
 		return interval;
 
-	if (divisor < 2 || divisor > U8_MAX)
+	if (divisor == 1 || divisor > U8_MAX)
 		divisor = 2;
 	if (!source_fps)
 		source_fps = 60;
 
-	interval.numerator = divisor;
+	interval.numerator = divisor ?: 1;
 	interval.denominator = source_fps;
 	return interval;
 }
@@ -269,6 +271,8 @@ u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
 {
 	u32 size;
 
+	if (mz0380_raw_bank_probe)
+		return MZ0380_RAW_PROBE_FRAME_SIZE;
 	if (mz0380_h264_probe)
 		return MZ0380_H264_SET_BUF_SIZE - 4096;
 	if (mz0380_stream_nosg)
@@ -322,6 +326,8 @@ u32 mz0380_current_sizeimage(struct mz0380_dev *dev)
  */
 u32 mz0380_current_pixelformat(void)
 {
+	if (mz0380_raw_bank_probe)
+		return V4L2_PIX_FMT_YUV420;
 	if (mz0380_h264_probe)
 		return V4L2_PIX_FMT_H264;
 	if (mz0380_stream_nosg)
@@ -342,7 +348,7 @@ static void mz0380_fill_pix_format(struct mz0380_dev *dev,
 		pix->width = MZ0380_NOSG_NV12_WIDTH;
 		pix->height = MZ0380_NOSG_NV12_HEIGHT;
 		pix->bytesperline = MZ0380_NOSG_NV12_WIDTH;
-	} else if (mz0380_poll_drain_ms) {
+	} else if (mz0380_raw_bank_probe || mz0380_poll_drain_ms) {
 		/* M111: real geometry, raw payload. */
 		pix->width = dev->capture.width;
 		pix->height = dev->capture.height;
@@ -403,6 +409,10 @@ static int mz0380_enum_fmt_vid_cap(struct file *file, void *priv,
 	if (mz0380_stream_nosg) {
 		f->flags = 0;
 		strscpy(f->description, "NV12 raw (fake-frame path)",
+			sizeof(f->description));
+	} else if (mz0380_raw_bank_probe) {
+		f->flags = 0;
+		strscpy(f->description, "I420 raw (M209 op02/op08 discriminator)",
 			sizeof(f->description));
 	} else if (mz0380_poll_drain_ms) {
 		f->flags = 0;

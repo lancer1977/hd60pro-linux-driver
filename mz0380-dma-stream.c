@@ -10,7 +10,7 @@ static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps,
 	u32 enc[10] = { 0 };
 	u32 gop = dev->capture.gop_size;
 	u32 bitrate = dev->capture.bitrate;
-	u32 quality = 0, qp_min = 0, qp_max = 0;
+	u32 quality = 0, frame_skip = 0, frame_avg = 0;
 	u32 frame_divisor = 0;
 	bool fallback = false;
 	int ret;
@@ -45,20 +45,24 @@ static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps,
 		bitrate = main_or_sub ? 4000000 : 4194304;
 		quality = 24;
 		/*
-		 * tinyvenc7 (unlike Windows' tinyvenc5) also reads this
-		 * nominal QP-min byte as the H.264 input-frame divisor. Five
-		 * was the measured 12 fps limiter. Divisor 2 is the firmware's
-		 * fastest valid value: counter % 1 can never equal one, while
-		 * zero selects the inaccessible opcode-0x32 schedule bitmap.
+		 * M204 corrects the old QP interpretation: tinyvenc7's own
+		 * SET_ENC printf names payload bytes 20 and 21 `skip` and `avg`.
+		 * A non-zero skip byte is used directly by the vcap modulo gate;
+		 * zero selects the 128-bit schedule which h264_param_processing()
+		 * fills locally. Its default tiny_calculate_skip_fps(fps, 0)
+		 * result has every input-frame bit set. M205 validates that zero
+		 * mode at approximately 60 encoded fps from 60-Hz input, making it
+		 * the normal default. Divisor/skip 2 remains the proven 30-fps
+		 * fallback. One remains invalid because counter % 1 never has
+		 * remainder one.
 		 */
 		frame_divisor = mz0380_h264_frame_divisor;
-		if (frame_divisor < 2 || frame_divisor > U8_MAX) {
+		if (frame_divisor == 1 || frame_divisor > U8_MAX) {
 			pr_warn("%s: h264_frame_divisor=%u is invalid for tinyvenc7; using 2\n",
 				dev->name, frame_divisor);
 			frame_divisor = 2;
 		}
-		qp_min = frame_divisor;
-		qp_max = 51;
+		frame_skip = frame_divisor;
 	} else {
 		enc[0] = mz0380_enc_mask ?: (MZ0380_ENC_VALID_FPS |
 					     MZ0380_ENC_VALID_GOP |
@@ -69,15 +73,16 @@ static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps,
 	/* quality, profile, entropy, mode */
 	enc[2] = quality;
 	enc[3] = bitrate;
-	/* qp_min, qp_max, skip, avg; aspect/resolution/crop stay zero. */
-	enc[4] = qp_min | (qp_max << 8);
+	/* tinyvenc7 payload bytes 20/21 are skip/avg; later fields stay zero. */
+	enc[4] = frame_skip | (frame_avg << 8);
 
 	/* Match Windows' EVENT-wait path; timeout 0 would permit mailbox reuse. */
 	ret = mz0380_send_command(dev, MZ0380_CMD_SET_ENC_PARAMS, enc,
 				  ARRAY_SIZE(enc), NULL, 5000);
-	pr_info("%s: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x%04x, %s ch0, fps=%u, gop=%u, quality=%u, bitrate=%u, qp=%u..%u, tinyvenc7 frame divisor=%u%s) ret=%d\n",
+	pr_info("%s: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x%04x, %s ch0, fps=%u, gop=%u, quality=%u, bitrate=%u, skip=%u, avg=%u, tinyvenc7 schedule=%s%s) ret=%d\n",
 		dev->name, enc[0], main_or_sub ? "sub" : "main", fps, gop,
-		quality, bitrate, qp_min, qp_max, frame_divisor,
+		quality, bitrate, frame_skip, frame_avg,
+		frame_divisor ? "modulo" : "all-frame bitmap",
 		fallback ? ", conservative fallback applied" : "", ret);
 	return ret;
 }
@@ -304,6 +309,22 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	params[8] = mz0380_vic_nosg;
 
 	/*
+	 * M209 is intentionally one narrow experiment.  The 0x2f7600 oracle is
+	 * valid only for the retail 1080p60 tinyvenc7 geometry with no VBI.  Refuse
+	 * a different source instead of turning a different byte count into a
+	 * false op02/op08 result.
+	 */
+	if (mz0380_raw_bank_probe &&
+	    (mz0380_stream_nosg || fw != 7 || fps != 60 || interlaced ||
+	     in_w != 1920 || in_h != 1080 || out_w != 1920 || out_h != 1080 ||
+	     vic_in_w != 1920 || vic_in_h != 1080)) {
+		pr_err("%s: M209 raw_bank_probe requires live progressive 1920x1080@60, fw=7, 1920x1080 VIC/output geometry and VBI=0 (got input=%ux%u%s@%u fw=%u vic=%ux%u output=%ux%u nosg=%u)\n",
+		       dev->name, in_w, in_h, interlaced ? "i" : "p", fps, fw,
+		       vic_in_w, vic_in_h, out_w, out_h, mz0380_stream_nosg);
+		return -EINVAL;
+	}
+
+	/*
 	 * M82: Windows precedes EVERY reconfiguration with a stop, and its
 	 * "[FIRMWARE RESET]" log line is exactly that - opcode 0x07 with
 	 * word[2] = 0xFFFFFFFF ("all channels"), count 3, flag 1
@@ -381,11 +402,12 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 		 * never landed" - method rule 9, in a line that has been short
 		 * of these two bytes all along.
 		 */
-		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u vic_in=%ux%u fk=%u int_mode=%u -> H.264 output=%ux%u, bitstreams=%u) ret=%d\n",
+		pr_info("%s: stream start: SET_VIC(input=%ux%u%s@%u fw=%u in_fmt=%u out_fmt=%u vic_in=%ux%u fk=%u int_mode=%u -> %s output=%ux%u, bitstreams=%u) ret=%d\n",
 			dev->name, in_w, in_h, interlaced ? "i" : "p",
 			fps, fw, in_fmt, out_fmt, vic_in_w, vic_in_h,
 			mz0380_vic_fast_kill & 0xff,
 			mz0380_vic_int_mode & 0xff,
+			mz0380_raw_bank_probe ? "M209 raw-only" : "H.264",
 			out_w, out_h,
 			mz0380_bitstream_num & 0xffu, ret);
 vic_done:
@@ -415,7 +437,8 @@ vic_done:
 	 * owned encoded bank after the spawn as well. This command does not wake
 	 * the encoder and therefore cannot race an encoded DMA.
 	 */
-	if (mz0380_h264_probe && mz0380_win_seq && mz0380_win_bufs_first) {
+	if ((mz0380_h264_probe || mz0380_raw_bank_probe) &&
+	    mz0380_win_seq && mz0380_win_bufs_first) {
 		ret = mz0380_raw_bank_probe ?
 			mz0380_stream_program_bufs(dev) :
 			mz0380_h264_program_bufs(dev);
@@ -423,7 +446,7 @@ vic_done:
 			goto err_events;
 		pr_info("%s: %s re-registered after SET_VIC spawn\n",
 			dev->name, mz0380_raw_bank_probe ?
-			"raw op02/op08 banks and H.264 window1" :
+			"raw-only op02/op08 banks (no op04)" :
 			"H.264 window1");
 	}
 
@@ -438,7 +461,8 @@ vic_done:
 	 * M82: in the Windows order the encoder commands come AFTER SET_AIC,
 	 * so this runs further down instead.
 	 */
-	if (!mz0380_win_seq && !mz0380_stream_nosg) {
+	if (!mz0380_win_seq && !mz0380_stream_nosg &&
+	    !mz0380_raw_bank_probe) {
 		ret = mz0380_stream_configure_encoder(dev, fps, 0);
 		if (ret)
 			goto err_events;
@@ -466,9 +490,14 @@ vic_done:
 			goto err_events;
 		}
 	}
-	if (!mz0380_stream_nosg)
-		pr_info("%s: SET_BUF(op 0x%02x) provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8\n",
-			dev->name, mz0380_set_buf_opcode);
+	if (!mz0380_stream_nosg) {
+		if (mz0380_raw_bank_probe)
+			pr_info("%s: M209 SET_BUF topology provides eight independent raw buffers: token%%8 0..3 -> op02 bank, 4..7 -> op08 bank; op04 is disabled\n",
+				dev->name);
+		else
+			pr_info("%s: SET_BUF(op 0x%02x) provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8\n",
+				dev->name, mz0380_set_buf_opcode);
+	}
 
 	/*
 	 * Real H.264 needs an owned poison suffix for bounded length inference.
@@ -476,7 +505,8 @@ vic_done:
 	 * use the completion FIFO or inferred-length path.
 	 */
 	if (!mz0380_stream_nosg) {
-		mz0380_frame_buffers_poison_start(dev);
+		if (!mz0380_raw_bank_probe)
+			mz0380_frame_buffers_poison_start(dev);
 		/* Accept completions only after every token has a poison baseline. */
 		mz0380_frame_events_start(dev);
 	} else if (mz0380_buf_poison) {
@@ -562,7 +592,8 @@ vic_done:
 	 * same wake op 0x06 performs, so this sequence is itself the kick and
 	 * Windows never sends 0x06 on the capture path.
 	 */
-	if (mz0380_win_seq && !mz0380_stream_nosg) {
+	if (mz0380_win_seq && !mz0380_stream_nosg &&
+	    !mz0380_raw_bank_probe) {
 		ret = mz0380_stream_configure_encoder(dev, fps, 0);
 		if (ret)
 			goto err_events;
@@ -586,6 +617,7 @@ vic_done:
 	 * default baseline is byte-identical to before.
 	 */
 	if (!mz0380_win_seq && !mz0380_stream_nosg &&
+	    !mz0380_raw_bank_probe &&
 	    (mz0380_fake_frame_off || mz0380_post_proc)) {
 		ret = mz0380_stream_post_proc(dev, fps);
 		if (ret)
@@ -645,7 +677,8 @@ vic_done:
 	 * Frame arrival is confirmed downstream by the MSI/outbound-ATU path, not
 	 * by a command ack.
 	 */
-	if (!mz0380_win_seq || mz0380_win_start_op6) {
+	if (mz0380_raw_bank_probe || !mz0380_win_seq ||
+	    mz0380_win_start_op6) {
 		ret = mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
 					  NULL, 0, NULL, 0);
 		pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
@@ -774,6 +807,14 @@ void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 				dev->name,
 				(unsigned long long)dev->h264_frames_delivered,
 				(unsigned long long)dev->h264_frames_dropped);
+		if (mz0380_raw_bank_probe)
+			pr_info("%s: M209 raw V4L2 totals: events=%llu exact_frames=%llu bad_extents=%llu consecutive_exact=%u slots_seen=0x%02x\n",
+				dev->name,
+				(unsigned long long)dev->raw_probe_events,
+				(unsigned long long)dev->raw_probe_full_frames,
+				(unsigned long long)dev->raw_probe_bad_extents,
+				dev->raw_probe_consecutive_full,
+				dev->raw_probe_slots_seen);
 		WRITE_ONCE(dev->frame_poison_active, false);
 	}
 }

@@ -414,6 +414,109 @@ mz0380_drain_h264_snapshot(struct mz0380_dev *dev,
 }
 
 static void
+mz0380_drain_raw_probe_snapshot(struct mz0380_dev *dev,
+				const struct mz0380_frame_event *snapshot)
+{
+	struct mz0380_raw_probe_buf *raw;
+	struct mz0380_vb_buffer *vbuf;
+	unsigned long flags;
+	u32 idx = snapshot->token & 7;
+	size_t len = 0;
+	int ret;
+
+	raw = &dev->raw_probe_bufs[idx];
+	dev->raw_probe_events++;
+	dev->raw_probe_slots_seen |= BIT(idx);
+	raw->completions++;
+
+	ret = mz0380_raw_probe_infer_length(dev, idx, &len);
+	raw->last_extent = len;
+	if (ret || len != MZ0380_RAW_PROBE_FRAME_SIZE) {
+		dev->raw_probe_bad_extents++;
+		dev->raw_probe_consecutive_full = 0;
+		pr_info_ratelimited("%s: M209 raw completion #%llu token=%08x -> bank%u/op0x%02x slot%u extent=0x%zx (expected exactly 0x%x, ret=%d); slot left un-poisoned for an in-flight DMA\n",
+				    dev->name,
+				    (unsigned long long)dev->raw_probe_events,
+				    snapshot->token,
+				    idx / MZ0380_STREAM_NR_BUFS,
+				    idx < MZ0380_STREAM_NR_BUFS ?
+					MZ0380_CMD_SET_BUF_2 : MZ0380_CMD_SET_BUF_8,
+				    idx % MZ0380_STREAM_NR_BUFS, len,
+				    MZ0380_RAW_PROBE_FRAME_SIZE, ret);
+		goto report;
+	}
+
+	dev->raw_probe_full_frames++;
+	dev->raw_probe_consecutive_full++;
+	pr_info("%s: M209 raw completion #%llu FULL: token=%08x -> bank%u/op0x%02x slot%u wrote exactly 0x%x bytes (consecutive=%u, slots_seen=0x%02x)\n",
+		dev->name, (unsigned long long)dev->raw_probe_events,
+		snapshot->token, idx / MZ0380_STREAM_NR_BUFS,
+		idx < MZ0380_STREAM_NR_BUFS ?
+			MZ0380_CMD_SET_BUF_2 : MZ0380_CMD_SET_BUF_8,
+		idx % MZ0380_STREAM_NR_BUFS, MZ0380_RAW_PROBE_FRAME_SIZE,
+		dev->raw_probe_consecutive_full, dev->raw_probe_slots_seen);
+
+	if (!READ_ONCE(dev->streaming))
+		goto repoison;
+
+	spin_lock_irqsave(&dev->buf_lock, flags);
+	vbuf = list_first_entry_or_null(&dev->buf_list,
+					struct mz0380_vb_buffer, list);
+	if (vbuf)
+		list_del(&vbuf->list);
+	spin_unlock_irqrestore(&dev->buf_lock, flags);
+	if (!vbuf) {
+		pr_info_ratelimited("%s: M209 full raw slot %u has no queued vb2 buffer; dropped and re-poisoned\n",
+				    dev->name, idx);
+		goto repoison;
+	}
+
+	{
+		void *dst = vb2_plane_vaddr(&vbuf->vb.vb2_buf, 0);
+		size_t plane = vb2_plane_size(&vbuf->vb.vb2_buf, 0);
+
+		if (!dst || plane < MZ0380_RAW_PROBE_FRAME_SIZE) {
+			pr_warn("%s: M209 raw frame does not fit vb2 plane %zu\n",
+				dev->name, plane);
+			vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, 0);
+			vb2_buffer_done(&vbuf->vb.vb2_buf,
+					VB2_BUF_STATE_ERROR);
+			goto repoison;
+		}
+		dma_rmb();
+		memcpy(dst, raw->va, MZ0380_RAW_PROBE_FRAME_SIZE);
+		vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0,
+				      MZ0380_RAW_PROBE_FRAME_SIZE);
+	}
+
+	vbuf->vb.vb2_buf.timestamp = snapshot->timestamp_ns;
+	vbuf->vb.field = mz0380_current_field(dev);
+	vbuf->vb.sequence = dev->video_sequence++;
+	raw->delivered++;
+	vb2_buffer_done(&vbuf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+
+repoison:
+	mz0380_raw_probe_buffer_repoison(dev, idx);
+report:
+	if (dev->raw_probe_events == MZ0380_RAW_PROBE_NR_BUFS)
+		pr_info("%s: M209 raw discriminator first-eight summary: events=%llu exact_frames=%llu bad_extents=%llu consecutive_exact=%u slots_seen=0x%02x\n",
+			dev->name,
+			(unsigned long long)dev->raw_probe_events,
+			(unsigned long long)dev->raw_probe_full_frames,
+			(unsigned long long)dev->raw_probe_bad_extents,
+			dev->raw_probe_consecutive_full,
+			dev->raw_probe_slots_seen);
+	if (!dev->raw_probe_success_reported &&
+	    dev->raw_probe_consecutive_full >= MZ0380_RAW_PROBE_NR_BUFS &&
+	    dev->raw_probe_slots_seen == GENMASK(MZ0380_RAW_PROBE_NR_BUFS - 1, 0)) {
+		dev->raw_probe_success_reported = true;
+		pr_info("%s: M209 raw discriminator SUCCESS: eight consecutive exact 0x%x writes covered all op02/op08 slots (slots_seen=0x%02x)\n",
+			dev->name, MZ0380_RAW_PROBE_FRAME_SIZE,
+			dev->raw_probe_slots_seen);
+	}
+}
+
+static void
 mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 			    const struct mz0380_frame_event *snapshot)
 {
@@ -423,6 +526,11 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 	u8 *payload;
 	size_t len;
 	int ret;
+
+	if (mz0380_raw_bank_probe) {
+		mz0380_drain_raw_probe_snapshot(dev, snapshot);
+		return;
+	}
 
 	if (mz0380_h264_probe) {
 		mz0380_drain_h264_snapshot(dev, snapshot);
@@ -767,7 +875,7 @@ void mz0380_poll_drain_start(struct mz0380_dev *dev)
 	struct task_struct *task;
 
 	if (!mz0380_poll_drain_ms || dev->poll_task || mz0380_stream_nosg ||
-	    mz0380_h264_probe)
+	    mz0380_h264_probe || mz0380_raw_bank_probe)
 		return;
 
 	task = kthread_run(mz0380_poll_drain_thread, dev,
@@ -824,9 +932,16 @@ void mz0380_dma_drain_video(struct mz0380_dev *dev)
 		dev->frame_event_drop_tokens = 0;
 		spin_unlock_irqrestore(&dev->frame_event_lock, flags);
 
-		for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++)
-			if (drop_tokens & BIT(i))
-				mz0380_frame_buffer_repoison(dev, i);
+		for (i = 0; i < (mz0380_raw_bank_probe ?
+					MZ0380_RAW_PROBE_NR_BUFS :
+					MZ0380_STREAM_NR_BUFS); i++) {
+			if (drop_tokens & BIT(i)) {
+				if (mz0380_raw_bank_probe)
+					mz0380_raw_probe_buffer_repoison(dev, i);
+				else
+					mz0380_frame_buffer_repoison(dev, i);
+			}
+		}
 		handled |= ack_deferred || drop_tokens;
 
 		/*

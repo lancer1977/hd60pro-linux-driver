@@ -8,10 +8,10 @@ exposes the result as a V4L2 capture device.
 
 > **Current result:** persistent 1920x1080 High Profile H.264 capture works in
 > OBS, including repeated userspace detach/attach, a host-owned NO SIGNAL
-> picture, same-mode HDMI unplug/reconnect, and clean-IDR recovery. The fastest
-> working encoder setting still outputs only half the HDMI input rate: about
-> 15 fps from 1080p30 and about 30 fps from 1080p60. **True 60-fps delivery is
-> the main remaining goal.** Audio is not implemented.
+> picture, same-mode HDMI unplug/reconnect, and clean-IDR recovery. The
+> all-frame scheduler is hardware-validated at approximately 60 encoded fps
+> from a confirmed 1080p60 input, with one encoder spawn and a clean final
+> stop. Audio is not implemented.
 
 This is reverse-engineered development code, not a mainline or production
 driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
@@ -38,10 +38,11 @@ driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
 
 Not implemented or not yet proved:
 
-- True 60-fps output. tinyvenc7 divisor 2 encodes every second input frame.
-  Divisor 1 and divisor 0 produce no H.264 on this firmware.
 - Audio PCM DMA. `enable_audio=1` registers only an inert ALSA scaffold.
 - Resolutions other than 1920x1080.
+- Native webcam-style compatibility with every camera application. The live
+  V4L2 node currently advertises compressed H.264; applications that require
+  raw YUYV/NV12 camera frames may not list or accept it.
 - The zero-spawn placeholder path when the first STREAMON occurs with HDMI
   already absent. It is implemented and host-validated, but still needs its
   dedicated hardware run.
@@ -129,6 +130,38 @@ distribution's normal process or disable enforcement before trying to load it.
 firmware-upload path.** The card boots its onboard flash image, and an earlier
 host upload attempt broke the card's userspace.
 
+### What is needed after a PC power cycle
+
+The Elgato download is **not a runtime or build dependency**. You do not need
+the Windows installer `.exe`, its `.sys` driver, an extracted
+`MZ0380.HD.HEX`, or an extracted `tinyvenc` binary to build, load, or use this
+Linux driver. The card contains its own ARM/Linux firmware and encoder binaries
+in onboard flash and boots them by itself whenever the card receives power.
+The host module only handshakes with that already-running firmware and then
+controls capture through the PCIe mailbox.
+
+A real mains/PSU power removal restarts the card firmware and clears a wedged
+card-side encoder state. It does not make the Linux kernel module persist: this
+project has no DKMS package, boot-time service, or automatic module-loading
+setup yet. After Linux boots, load the module again with the recommended
+profile:
+
+```bash
+sudo env \
+  VICFW=7 H264PROBE=1 POLLDRAIN=0 \
+  WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
+  H264DIVISOR=0 PERSIST=1 \
+  ./mz0380-live.sh load
+```
+
+The loader builds `mz0380.ko` for the running kernel when matching kernel
+headers are available, then inserts it and prints the `/dev/videoN` device.
+Re-extraction from the Elgato installer is never part of this process. The
+checked-in `mz0380-no-signal-data.h` already contains the generated host-side
+NO SIGNAL H.264 frame; the local `tinyvenc5` dump mentioned by its generator is
+needed only if a developer deliberately regenerates that file, not for a
+normal build or at runtime.
+
 The only requested file is an optional ASCII version sidecar:
 
 ```text
@@ -191,7 +224,7 @@ make
 sudo env \
   VICFW=7 H264PROBE=1 POLLDRAIN=0 \
   WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
-  H264DIVISOR=2 PERSIST=1 \
+  H264DIVISOR=0 PERSIST=1 \
   ./mz0380-live.sh load
 ```
 
@@ -206,7 +239,7 @@ What the profile selections do:
 | `OP6=1` | `win_start_op6=1` | Send the additional start doorbell required by this path. |
 | `POSTMASK=0` | `post_mask=0` | Avoid the mask that truncates DMA to 16 bytes. |
 | `FASTKILL=0` | `vic_fast_kill=0` | Request orderly card-side encoder teardown. |
-| `H264DIVISOR=2` | `h264_frame_divisor=2` | Fastest valid tinyvenc7 cadence: one output for two inputs. |
+| `H264DIVISOR=0` | `h264_frame_divisor=0` | Select the hardware-validated all-frame bitmap: approximately 60 encoded fps from 60-Hz input. |
 | `PERSIST=1` | `persistent_h264=1` | Keep one pipeline alive across userspace detach/attach. |
 
 Several values in the command are also current parameter defaults, but spelling
@@ -231,9 +264,49 @@ A healthy active state should show all of the following:
 - zero command timeouts;
 - normally one `SET_VIC`/encoder spawn for the pipeline lifetime.
 
-The reported encoded estimate is approximately input rate divided by two.
-Thus 1080p30 produces about 15 H.264 access units per second and 1080p60 about
-30. This is expected current behavior, not an OBS frame-rate setting problem.
+### Camera-application compatibility
+
+On Windows, Elgato's driver presents the HD60 Pro as a camera source that can
+be selected directly in camera-aware applications. Matching that experience
+is a project requirement, and it must be implemented as native V4L2 format
+negotiation rather than as a mandatory OBS/FFmpeg virtual-camera bridge.
+
+The saved live DirectShow enumeration proves that both Windows capture pins
+advertise YUY2, YV12, NV12, RGB24, RGB32, main H.264, and 960x540 substream
+H.264. YUY2 is the current/default type there and is offered at 1920x1080 at
+30, 50, and 59.94 fps. Static analysis of the Windows `.sys` now also confirms
+that its camera filter has two video pins sharing 320 data-range descriptors.
+Its pin-create callback records the application's bit depth and FourCC, keeps
+raw streams in one slot group, and assigns H.264 and X264 to separate groups.
+This selection happens when an application opens a pin, not when the Windows
+driver loads.
+
+The Linux driver currently registers a standard `/dev/videoN`, but it exposes
+only one format chosen globally by reverse-engineering module parameters.
+That is temporary scaffolding. Loading the module should only probe the PCI
+device, initialize signal detection, and register its V4L2/ALSA interfaces. An
+application must then select YUYV/NV12/YV12/H.264 through `VIDIOC_S_FMT`, with
+the matching card DMA path configured only at STREAMON. H.264 must not be
+forced merely because the module loaded.
+
+Do not advertise a raw format before its continuous full-frame path works: the
+bounded M203 raw-bank test received only 16-byte records, while the older
+tinyvenc5 path produced one complete 3,110,400-byte planar I420 frame and then
+stalled. The Windows raw delivery callback contains extensive format conversion
+and scaling, including YV12/NV12 branches. Static analysis now identifies its
+native source exactly: an eight-slot op02/op08 ring, with each slot containing
+contiguous planar Y/U/V. At 1920x1080p60 (`fw=7`, VBI disabled), the active
+write is I420-sized `0x2f7600` / 3,110,400 bytes: Y `0x1fa400`, then U and V
+`0x7e900` each. Windows converts that native planar surface to YUY2 in its host
+driver. This still does not prove that the card rotates full frames under the
+Linux start sequence, so raw formats remain unadvertised until the raw-only
+bounded discriminator produces repeated complete writes. A virtual-camera
+decoder may be useful as an optional workaround, but it is not the intended
+driver architecture. H.264 software decoding still does not belong in kernel
+space.
+
+With the validated all-frame H.264 schedule, 1080p60 produces approximately
+60 H.264 access units per second. Divisor 2 remains an optional 30-fps fallback.
 
 ### OBS setup
 
@@ -467,79 +540,52 @@ tuning. `modinfo ./mz0380.ko` documents their defaults and milestone references.
 Use the validated profile unless a documented experiment explicitly requires a
 different value.
 
-## Main remaining task: true 60-fps capture
+## True 60-fps H.264 capture is validated
 
-The current H.264 route cannot produce 60 encoded fps:
+`h264_frame_divisor` is historically named: the SET_ENC_PARAMS byte is really
+tinyvenc7's `skip` field. Value 0 selects a 128-bit bitmap which tinyvenc7
+itself fills with one bit for every input frame. M205 validated this mode at a
+confirmed 1920x1080p60 input: 4,339 frame events over approximately 73 seconds,
+about 59--60 fps, with one SET_VIC, zero FIFO drops, zero command timeouts, and
+a clean final STOP. The nine H.264 drops were two short intervals with no
+queued userspace buffer, not an encoder cadence limit.
 
-- tinyvenc7 divisor 2 is the fastest working mode and encodes every second
-  input frame;
-- divisor 1 has an unreachable modulo predicate and emits no H.264;
-- divisor 0 selects an unconfigured schedule and also emits no H.264.
+M206 repeated the all-frame path for approximately 279.7 seconds: 16,754 frame
+events (about 59.9 fps), two userspace attachments on one persistent encoder
+spawn, zero FIFO drops, and another clean final STOP.
 
-The next bounded discriminator is `RAWBANKS=1`. It allocates independent,
-Windows-style opcode-`0x02` and opcode-`0x08` banks with four distinct
-`0x466000` buffers per bank, poisons them differently, and reports write
-extents at stop. Run it **only after a real power cycle and only with `SET_VIC`
-confirmed as 1920x1080p60 from the beginning**:
+Value 0 is now the module and recommended-profile default. Value 2 remains a
+working 30-fps fallback, while value 1 is invalid because its modulo predicate
+can never have remainder one. The all-frame path does not require opcode
+`0x32`, the Elgato Windows package, or replacement card firmware.
 
-```bash
-sudo env \
-  VICFW=7 H264PROBE=1 POLLDRAIN=0 \
-  WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
-  H264DIVISOR=2 PERSIST=1 RAWBANKS=1 \
-  ./mz0380-live.sh load
-```
+The Windows-style independent `RAWBANKS=1` discriminator is closed for the
+H.264-selected M203 start at confirmed 1920x1080p60. Each opcode-`0x02` buffer
+received only 16 bytes and every independent opcode-`0x08` buffer remained
+untouched. Static analysis later proved those are nevertheless the exact
+buffers consumed by Windows' raw callback; what M203 lacked was a raw pin/base-
+slot start, not another bank. Do not repeat the same H.264-selected experiment.
+The next distinct test must disable H.264/op04, activate the raw base selection,
+and look for repeated `0x2f7600` planar Y/U/V writes across the op02/op08 ring.
 
-Open OBS once, then verify the source before interpreting anything:
-
-```bash
-sudo ./mz0380-live.sh status
-grep '^  source' /proc/mz0380-state
-```
-
-It must say `source: 1920x1080p @ 60 fps`. Let capture run for about ten
-seconds, close OBS, unload once, and preserve the discriminator log:
-
-```bash
-sudo ./mz0380-live.sh unload
-sudo dmesg | grep -E \
-  'raw-bank probe|raw bank[01]|stream stop: EVENT|final pipeline stop|SET_VIC' \
-  | tail -160
-```
-
-Interpretation:
-
-- a frame-sized write extent in either bank identifies a raw 60-Hz path to
-  implement for V4L2;
-- a 16-byte extent in both banks closes that lead and returns the investigation
-  to firmware/static analysis for another all-frame mode;
-- zero means that bank was untouched.
-
-Do not use the simultaneous H.264 preview as the discriminator result; it is
-still divisor-2 and therefore about 30 fps from a 60-Hz input. The earlier
-RAWBANKS run began at 1080p30 and found 16 bytes in each opcode-`0x02` buffer
-and no opcode-`0x08` writes, so it did not settle the 60-Hz question.
+`raw_bank_probe` remains an opt-in historical diagnostic and is not part of
+normal capture. It must be refactored and dual-kernel build-checked for the
+raw-only start before spending one bounded hardware run.
 
 ## Remaining validation checklist
 
 The primary persistent OBS lifecycle is hardware-validated. Remaining work is:
 
-1. Power-cycle the PSU to start from a known encoder-spawn budget.
-2. Start OBS with HDMI already absent and prove placeholder-only operation has
+1. Start OBS with HDMI already absent and prove placeholder-only operation has
    `pipeline: stopped` and `SET_VIC sent: 0`.
-3. Run the RAWBANKS discriminator above with `SET_VIC` confirmed at 1080p60
-   from the start.
-4. If a bank has frame-sized writes, implement that raw 60-Hz path for V4L2.
-   If both banks contain only 16 bytes or zeros, close this lead and resume
-   firmware/static analysis for another all-frame schedule.
-5. Return with a genuinely different HDMI mode and validate the single
+2. Return with a genuinely different HDMI mode and validate the single
    controlled replacement on the next userspace attachment.
-6. Test one manual HPD pulse during a real connected-but-unlocked outage before
+3. Test one manual HPD pulse during a real connected-but-unlocked outage before
    considering any automatic HPD recovery.
-7. Close OBS, unload once, and retain the final STOP and raw-bank logs.
+4. Close OBS, unload once, and retain the final STOP log.
 
-Do not open/apply OBS Properties during the raw-bank discriminator. Do not
-deliberately exhaust the spawn budget to test recovery from a deaf card.
+Do not deliberately exhaust the spawn budget to test recovery from a deaf
+card.
 
 ## Documentation map
 

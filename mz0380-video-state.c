@@ -97,10 +97,12 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 				      max_t(u32, dev->capture.timeperframe.numerator, 1));
 	encoded_source_fps = READ_ONCE(dev->pipeline_source_fps) ?:
 			     READ_ONCE(dev->capture.source_fps);
-	frame_divisor = clamp_t(u32, mz0380_h264_frame_divisor, 2, U8_MAX);
+	frame_divisor = mz0380_h264_frame_divisor;
+	if (frame_divisor == 1 || frame_divisor > U8_MAX)
+		frame_divisor = 2;
 	if (mz0380_h264_probe && encoded_source_fps)
 		encoded_fps_milli = DIV_ROUND_CLOSEST(encoded_source_fps * 1000,
-						       frame_divisor);
+						       frame_divisor ?: 1);
 
 	if (!mz0380_enable_video) {
 		seq_puts(m,
@@ -151,10 +153,18 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 		   dev->capture.width, dev->capture.height);
 	seq_printf(m, "  frame rate : %u.%03u fps\n",
 		   fps_milli / 1000, fps_milli % 1000);
-	if (encoded_fps_milli)
-		seq_printf(m, "  encoded rate: ~%u.%03u fps (%u fps input / tinyvenc7 divisor %u)\n",
-			   encoded_fps_milli / 1000, encoded_fps_milli % 1000,
-			   encoded_source_fps, frame_divisor);
+	if (encoded_fps_milli) {
+		if (frame_divisor)
+			seq_printf(m, "  encoded rate: ~%u.%03u fps (%u fps input / tinyvenc7 divisor %u)\n",
+				   encoded_fps_milli / 1000,
+				   encoded_fps_milli % 1000,
+				   encoded_source_fps, frame_divisor);
+		else
+			seq_printf(m, "  encoded rate: ~%u.%03u fps (%u fps input / tinyvenc7 all-frame bitmap)\n",
+				   encoded_fps_milli / 1000,
+				   encoded_fps_milli % 1000,
+				   encoded_source_fps);
+	}
 	if (dev->capture.source_width && dev->capture.source_height)
 		seq_printf(m, "  source     : %ux%u%c @ %u fps (SET_VIC input geometry)\n",
 			   dev->capture.source_width,
