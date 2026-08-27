@@ -43,8 +43,18 @@ M209 built it - eight independently poisoned `op 0x02`/`op 0x08` buffers, no
 x2 plus `POST_PROC` byte-identically to the H.264 path. Bound it the same way:
 one start, two seconds or eight completions.
 
-It is implemented and dual-kernel build-checked; the start is unspent. Run it
-once, on a confirmed live 1080p60 source, and do not retry in a loop:
+It is implemented and dual-kernel build-checked; the start is unspent. Two
+attempts on 2026-08-27 were rejected by the guard because the camera source had
+settled at 1080p30 (`hper=337 vper=299` against 1080p60's `674`/`59x`); both
+stopped before any card command, so `SET_VIC` stayed at zero and the budget was
+untouched. Confirm the source first - this is a live receiver read and sends no
+`SET_VIC`, so it is free to repeat:
+
+```
+sudo ./mz0380-source-check.sh
+```
+
+Only once that prints PASS, spend the start - once, no retry loop:
 
 ```
 sudo ./mz0380-m210-raw-enc-tail.sh

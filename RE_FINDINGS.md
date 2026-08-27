@@ -12695,3 +12695,42 @@ live H.264 stream - which the current mutual-exclusion check in
 `mz0380-dma.c` forbids and would have to be relaxed for that experiment only.
 
 Budget: this run spent one SET_VIC spawn of the 8-18 per-power-cycle range.
+
+---
+
+## M210 attempts 1 and 2 (2026-08-27): rejected at the guard, source was 1080p30
+
+Two M210 starts were attempted and neither reached the card. The raw-only
+STREAMON guard rejected both before any command was sent:
+
+```
+MST3367 signal: 1920x1080p (htot=2200 vtot=1125 hper=337 vper=299 hact=1920 R55=0x7f)
+live input 1920x1080p@30 -> encoder output 1920x1080@30
+M209 raw_bank_probe requires live progressive 1920x1080@60, fw=7, ...
+                              (got input=1920x1080p@30 fw=7 vic=1920x1080 output=1920x1080 nosg=0)
+dma_start failed (-22)
+```
+
+`SET_VIC` stayed at zero in both runs, so the encoder spawn budget was
+untouched (tally 2) and the M210 question remains open.
+
+The measurement is not a torn sample. `hperiod` is the line rate and `vperiod`
+is Hz x10, so 1080p60 reads `hper=674 vper=59x` (67.4 kHz, 59.9 Hz) and these
+runs read exactly half: 33.7 kHz and 29.9 Hz, against a correct `vtot=1125`.
+33.7 kHz / 1125 lines = 29.96 Hz - self-consistent 1080p30. Both runs produced
+byte-identical numbers. The source, a camera, had settled at 1080p30.
+
+The pushed EDID is not the cause. `edid-decode` on
+`mz0380-edid-hd60pro.txt` reports `DTD 1: 1920x1080 60.000000 Hz 148.5 MHz` as
+the preferred timing and VIC 16 as native; VIC 34 (1080p30) is merely also
+advertised, as it is on any CEA-861 1080p EDID.
+
+The operational lesson is the second one this session. `mz0380-live.sh status`
+cannot answer "is the source 60 Hz right now" - it greps for a past
+`MST3367 signal` line, and the receiver is only measured at STREAMON, so on a
+fresh load the section is empty and reads like a healthy no-op.
+`mz0380-source-check.sh` now answers it directly: it loads plainly, reads the
+receiver live through `QUERY_DV_TIMINGS` (`mz0380_query_signal()` serves that
+while the pipeline is stopped, so no `SET_VIC` is sent), decodes the vperiod
+units, and exits nonzero unless the source is 1920x1080p60. Gate every bounded
+run on it.
