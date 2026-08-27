@@ -12734,3 +12734,33 @@ receiver live through `QUERY_DV_TIMINGS` (`mz0380_query_signal()` serves that
 while the pipeline is stopped, so no `SET_VIC` is sent), decodes the vperiod
 units, and exits nonzero unless the source is 1920x1080p60. Gate every bounded
 run on it.
+
+### Attempt 3 and the 1080p30 opt-in
+
+A third attempt was rejected identically. The source rate was then confirmed
+independently of our own receiver arithmetic: `QUERY_DV_TIMINGS` on the node
+reports `Pixelclock: 74250000 Hz (30.00 frames per second)` and
+`CTA-861 VIC: 34`, and VIC 34 is 1080p30 by definition. The camera is genuinely
+at 30 Hz, and the MST3367 host-unit decode (`hper=337 vper=299`) was correct.
+`SET_VIC` stayed at zero across all three attempts; the budget is still 2.
+
+Rather than leave the experiment blocked on a source that will not move,
+`raw_probe_allow_30` (`FPS30=1` through `mz0380-m210-raw-enc-tail.sh`, `RAW30`
+through `mz0380-live.sh`) permits the bounded discriminators to run on a
+progressive 1080p30 source. This is sound for this specific oracle and unsound
+to generalise from, so both halves are worth stating:
+
+* the `0x2f7600` extent is pure geometry - `1920 * 1080 * 3 / 2` - and does not
+  depend on refresh at all;
+* `fw` selects the chroma layout, not the rate: M209 established six means
+  planar 4:2:2 (`S/2` per plane) and every other value, seven included, means
+  planar 4:2:0 (`S/4` per plane), and M79 ties `fw == 7` to the tinyvenc7 spawn;
+* the run is bounded by completions and by a wall-clock window, and eight
+  completions at 30 Hz still fit the two-second window comfortably.
+
+What it does not establish is Windows parity: Windows was observed at 1080p60,
+and a 30 Hz result cannot be reported as reproducing the retail configuration.
+The knob therefore defaults off, the driver logs an explicit warning into the
+same dmesg the run is scored from, and the harness prints the deviation before
+loading and the measured source rate in its result block. If the banks fill at
+30 Hz, the follow-up is a 60 Hz confirmation run, not a conclusion.

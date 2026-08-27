@@ -822,3 +822,24 @@ bool mz0380_raw_probe_enc_tail;
 module_param_named(raw_probe_enc_tail, mz0380_raw_probe_enc_tail, bool, 0644);
 MODULE_PARM_DESC(raw_probe_enc_tail,
 		 "M210: with raw_bank_probe, send the Windows encoder tail (SET_ENC_PARAMS x2 + SET_PREVIEW_PARAMS) and suppress op06 (def:0)");
+
+/*
+ * The bounded raw discriminators pin themselves to the retail 1080p60
+ * configuration because the 0x2f7600 oracle must not be scored against a
+ * different byte count.  A 1080p30 source does not change that byte count:
+ * the frame extent is pure geometry (1920 * 1080 * 3 / 2), and `fw` selects
+ * the chroma layout rather than the refresh - M209 established that six means
+ * planar 4:2:2 (S/2 per plane) and every other value, seven included, means
+ * planar 4:2:0 (S/4 per plane).  Only cadence differs, and the run is bounded
+ * by completions rather than by wall-clock frames.
+ *
+ * So 1080p30 is a legitimate host for the same experiment, but it is still a
+ * deviation from the Windows-confirmed configuration and must never be entered
+ * silently: a run scored at 30 Hz has to be readable as such afterwards.  This
+ * knob is that opt-in, and taking it logs a warning into the same dmesg the
+ * run is scored from.
+ */
+bool mz0380_raw_probe_allow_30;
+module_param_named(raw_probe_allow_30, mz0380_raw_probe_allow_30, bool, 0644);
+MODULE_PARM_DESC(raw_probe_allow_30,
+		 "Permit the bounded raw discriminators to run on a progressive 1080p30 source; a documented deviation from the Windows-confirmed 1080p60 (def:0)");

@@ -146,6 +146,7 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	bool interlaced = dev->capture.source_interlaced;
 	u32 fps = dev->capture.source_fps ?:
 		  mz0380_timings_fps(&dev->detected_timings);
+	bool fps_ok;
 	/*
 	 * byte6 "fw": encoder selector (M71) AND cfg output-format selector
 	 * (M79: vcm writes "output format" = 2/YUY2 when fw == 6, else 1/YV12;
@@ -314,15 +315,21 @@ int mz0380_dma_start(struct mz0380_dev *dev)
 	 * a different source instead of turning a different byte count into a
 	 * false op02/op08 result.
 	 */
+	fps_ok = fps == 60 || (mz0380_raw_probe_allow_30 && fps == 30);
 	if (mz0380_raw_bank_probe &&
-	    (mz0380_stream_nosg || fw != 7 || fps != 60 || interlaced ||
+	    (mz0380_stream_nosg || fw != 7 || !fps_ok || interlaced ||
 	     in_w != 1920 || in_h != 1080 || out_w != 1920 || out_h != 1080 ||
 	     vic_in_w != 1920 || vic_in_h != 1080)) {
-		pr_err("%s: M209 raw_bank_probe requires live progressive 1920x1080@60, fw=7, 1920x1080 VIC/output geometry and VBI=0 (got input=%ux%u%s@%u fw=%u vic=%ux%u output=%ux%u nosg=%u)\n",
-		       dev->name, in_w, in_h, interlaced ? "i" : "p", fps, fw,
+		pr_err("%s: M209 raw_bank_probe requires live progressive 1920x1080@%s, fw=7, 1920x1080 VIC/output geometry and VBI=0 (got input=%ux%u%s@%u fw=%u vic=%ux%u output=%ux%u nosg=%u)\n",
+		       dev->name,
+		       mz0380_raw_probe_allow_30 ? "60 or @30" : "60",
+		       in_w, in_h, interlaced ? "i" : "p", fps, fw,
 		       vic_in_w, vic_in_h, out_w, out_h, mz0380_stream_nosg);
 		return -EINVAL;
 	}
+	if (mz0380_raw_bank_probe && fps == 30)
+		pr_warn("%s: raw discriminator is running on a 1080p30 source, a deviation from the Windows-confirmed 1080p60; the 0x%x extent oracle is geometry-only and remains valid, but score this run as 30 Hz\n",
+			dev->name, MZ0380_RAW_PROBE_FRAME_SIZE);
 
 	/*
 	 * M82: Windows precedes EVERY reconfiguration with a stop, and its

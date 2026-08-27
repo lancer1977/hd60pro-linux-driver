@@ -22,6 +22,10 @@ cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 command -v v4l2-ctl >/dev/null || { echo "v4l2-ctl is required"; exit 1; }
 
+# FPS30=1 permits the run on a progressive 1080p30 source.  The 0x2f7600
+# extent oracle is geometry-only and stays valid there, but it is a deviation
+# from the Windows-confirmed 1080p60 and the driver logs a warning for it, so
+# the run stays readable as a 30 Hz run afterwards.
 KEEPLOADED=${KEEPLOADED:-0}
 CAPTURE_LOG=$(mktemp /tmp/mz0380-m210-v4l2.XXXXXX.log) || exit 1
 RAW_OUT=$(mktemp /tmp/mz0380-m210.XXXXXX.i420) || exit 1
@@ -74,9 +78,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+if [ "${FPS30:-0}" = 1 ]; then
+	echo "NOTE: FPS30=1 - this run will accept a 1080p30 source, which is a"
+	echo "      deviation from the Windows-confirmed 1080p60.  Score it as 30 Hz."
+fi
 echo "Loading the M210 topology (raw sinks + encoder tail; load starts nothing)..."
-H264PROBE=0 RAWBANKS=1 RAWTAIL=1 POLLDRAIN=0 VICFW=7 WINSEQ=1 WINBUFS=1 \
-	OP6=0 PERSIST=0 NOSG=0 ./mz0380-live.sh load || exit 1
+H264PROBE=0 RAWBANKS=1 RAWTAIL=1 RAW30="${FPS30:-0}" POLLDRAIN=0 VICFW=7 \
+	WINSEQ=1 WINBUFS=1 OP6=0 PERSIST=0 NOSG=0 ./mz0380-live.sh load || exit 1
 
 NODE=""
 for name_file in /sys/class/video4linux/video*/name; do
@@ -142,6 +150,7 @@ echo "  op04 count    : $OP04_COUNT (required: 0)"
 echo "  SET_ENC count : $ENC_COUNT (required: 2)"
 echo "  POST_PROC cnt : $POST_COUNT (required: 1)"
 echo "  op06 count    : $OP06_COUNT (required: 0, Windows omits it with the tail)"
+echo "  source rate   : $(dmesg | sed -n 's/.*live input \(1920x1080[pi]@[0-9]*\).*/\1/p' | tail -1)"
 echo "  raw capture   : $RAW_OUT ($(stat -c %s "$RAW_OUT") bytes)"
 echo "  v4l2-ctl log  : $CAPTURE_LOG"
 echo "  kernel log    : $DMESG_OUT"

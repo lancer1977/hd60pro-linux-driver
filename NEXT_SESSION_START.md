@@ -61,6 +61,21 @@ sudo ./mz0380-m210-raw-enc-tail.sh
 sudo ./mz0380-spawns.sh add 1
 ```
 
+A third attempt on 2026-08-27 confirmed the source rate independently of our
+receiver arithmetic - `QUERY_DV_TIMINGS` reports `74250000 Hz (30.00 fps)` and
+`CTA-861 VIC: 34`, which is 1080p30 by definition - so the camera really is at
+30 Hz. If it cannot be moved to 60, `FPS30=1` permits the run:
+
+```
+sudo FPS30=1 ./mz0380-m210-raw-enc-tail.sh
+```
+
+The `0x2f7600` oracle is geometry-only and stays valid at 30 Hz, and `fw`
+selects chroma layout rather than refresh, so the discriminator is sound there.
+It is still a deviation from the Windows-confirmed 1080p60: the driver warns
+into the run's own dmesg, the harness prints the measured source rate, and a
+positive result at 30 Hz needs a 60 Hz confirmation run before it is parity.
+
 The knob is `raw_probe_enc_tail` (`RAWTAIL=1` through `mz0380-live.sh`); it is
 rejected at setup unless `raw_bank_probe=1` is set with it. Because Windows
 omits `op 0x06` once the tail is present, so does this path - the harness
