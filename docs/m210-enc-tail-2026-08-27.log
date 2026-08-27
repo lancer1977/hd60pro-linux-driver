@@ -1,0 +1,97 @@
+[30032.110810] mz0380 driver version 0.1.0 loaded
+[30032.110934] 0000:04:00.0: dma_handshake: bus mastering enabled pre-firmware
+[30032.110936] mz0380 device found at 0000:04:00.0, rev: 0, irq: 40, latency: 0
+[30032.110938] 0000:04:00.0: probe mode: bus master initially disabled
+[30032.110964] mz0380[0]: subsystem: 1cfa:0006, board: Elgato Game Capture HD60 Pro [card=1,autodetected]
+[30032.110967] mz0380[0]: bar0 @ 0xfc200000 [0x100000 bytes], bar5 @ 0xfc300000 [0x1000 bytes]
+[30032.112104] mz0380[0]: EVENT=0x00000800 during command 0x1 (cmd-done), acked
+[30032.117109] mz0380[0]: CMD_INIT answered on attempt 1 after 6ms (status=0xdddddddd)
+[30032.219245] mz0380[0]: board reports running firmware 1.11 (status=0xaaaaaaaa)
+[30032.219250] mz0380[0]: card runs firmware 1.11 (no upload attempted)
+[30032.219260] mz0380[0]: interrupt: legacy INTx, irq 40 (Windows uses INTx)
+[30032.219282] mz0380[0]: IRQ 40 ready (INTx)
+[30032.219434] mz0380[0]: stream buf[0] phys=0x0000000eaec00000 mapped at IOVA 0x100000000 (high32=0x00000001, low32=0)
+[30032.219586] mz0380[0]: stream buf[1] phys=0x0000000e90800000 mapped at IOVA 0x200000000 (high32=0x00000002, low32=0)
+[30032.219737] mz0380[0]: stream buf[2] phys=0x0000000a22800000 mapped at IOVA 0x300000000 (high32=0x00000003, low32=0)
+[30032.219888] mz0380[0]: stream buf[3] phys=0x0000000a5b800000 mapped at IOVA 0x400000000 (high32=0x00000004, low32=0)
+[30032.220648] mz0380[0]: raw-bank probe bank0 buf[0] mapped at IOVA 0x900000000 (1126 pages)
+[30032.221302] mz0380[0]: raw-bank probe bank0 buf[1] mapped at IOVA 0xa00000000 (1126 pages)
+[30032.221836] mz0380[0]: raw-bank probe bank0 buf[2] mapped at IOVA 0xb00000000 (1126 pages)
+[30032.222450] mz0380[0]: raw-bank probe bank0 buf[3] mapped at IOVA 0xc00000000 (1126 pages)
+[30032.222962] mz0380[0]: raw-bank probe bank1 buf[0] mapped at IOVA 0xd00000000 (1126 pages)
+[30032.223552] mz0380[0]: raw-bank probe bank1 buf[1] mapped at IOVA 0xe00000000 (1126 pages)
+[30032.224057] mz0380[0]: raw-bank probe bank1 buf[2] mapped at IOVA 0xf00000000 (1126 pages)
+[30032.224627] mz0380[0]: raw-bank probe bank1 buf[3] mapped at IOVA 0x1000000000 (1126 pages)
+[30032.224629] mz0380[0]: M209 raw-only discriminator enabled: two independent four-buffer banks x 0x466000 bytes (op 0x02 + op 0x08, no op 0x04)
+[30032.224630] mz0380[0]: 4 stream buffers x 4096 KiB (buf0 @ 0x0000000100000000)
+[30032.224637] mz0380[0]: synced cached input from BAR5[0x0040][2:0] = 0 (HDMI) during probe
+[30032.224640] mz0380[0]: synced cached quality from BAR5[0x0060] = 0 (raw=00000000) during probe
+[30032.224643] mz0380[0]: BAR5 GOP field returned 0 (raw=00000000), outside the V4L2 range [1..300] - keeping the cached value; the register is unwritten, not zero during probe
+[30032.224647] mz0380[0]: BAR5 bitrate field returned 0 (raw=00000000), outside the V4L2 range [262144..12582912] - keeping the cached value; the register is unwritten, not zero during probe
+[30032.224650] mz0380[0]: synced cached B-frames from BAR5[0x0088] = 0 (raw=00000000) during probe
+[30032.224653] mz0380[0]: synced cached QP step from BAR5[0x0084] = 0 (raw=00000000) during probe
+[30032.224656] mz0380[0]: BAR5 record-mode field returned out-of-range value 3 (raw=00000007) during probe
+[30032.224846] mz0380[0]: property 201 input-select request 0 (HDMI) via HD60 Pro bring- -> hardware write applied
+[30032.224848] mz0380[0]: property 201 BAR5 write reg=0x0040 mask=0x00000007 shift=0 before=00000000 programmed=00000000 readback=00000000
+[30032.600255] mz0380[0]: MST3367 silent after reset (dir_invert=0) - retrying with the opposite GPIO_DIR sense
+[30032.867757] mz0380[0]: MST3367 answering with dir_invert=1 - GPIO direction polarity now known
+[30033.065247] mz0380[0]: RxVideoInit: 0xae |= 0x04 -> reads back 04
+[30033.906088] mz0380[0]: HPD deasserted -> pin1 reads 1, BANK0[0xb7]=0x02
+[30034.291252] mz0380[0]: EDID read-back failed (ret=0, first bytes a0 00 20 00) - nothing is holding the EDID at 0xa0
+[30034.297226] mz0380[0]: EDID pushed (256 bytes, opcode 0x1f, wait 100ms) - the source is the oracle: a camera switches to HDMI out once it can read one
+[30034.438563] mz0380[0]: HPD asserted -> pin1 reads 0, BANK0[0xb7]=0x00
+[30034.438569] mz0380[0]: MST3367 receiver brought up (reset released, init applied)
+[30034.438660] mz0380[0]: registered video0 (H.264 capture, streaming=armed)
+[30034.842722] mz0380[0]: MST3367 signal: 1920x1080p [host units] (htot=2200 vtot=1125 hper=337 vper=299 hact=1920 R55=0x7f)
+[30034.844903] mz0380 0000:04:00.0: live input 1920x1080p@30 -> encoder output 1920x1080@30
+[30034.844908] mz0380[0]: raw discriminator is running on a 1080p30 source, a deviation from the Windows-confirmed 1080p60; the 0x2f7600 extent oracle is geometry-only and remains valid, but score this run as 30 Hz
+[30034.844916] mz0380[0]: stream start: pre-STOP(op 0x07, all channels) ret=0, settling 1900 ms
+[30036.787368] mz0380[0]: raw-bank probe op 0x02 bank0 buf[0] target=0x0000000900000000 -> slot {00000009, 00000000}
+[30036.787567] mz0380[0]: raw-bank probe op 0x02 bank0 buf[1] target=0x0000000a00000000 -> slot {0000000a, 00000000}
+[30036.787882] mz0380[0]: raw-bank probe op 0x02 bank0 buf[2] target=0x0000000b00000000 -> slot {0000000b, 00000000}
+[30036.788441] mz0380[0]: raw-bank probe op 0x02 bank0 buf[3] target=0x0000000c00000000 -> slot {0000000c, 00000000}
+[30036.794487] mz0380[0]: raw-bank probe registered bank0 with op 0x02, four independent 0x466000-byte buffers, poison=0xa5 ret=0
+[30036.794693] mz0380[0]: raw-bank probe op 0x08 bank1 buf[0] target=0x0000000d00000000 -> slot {0000000d, 00000000}
+[30036.794918] mz0380[0]: raw-bank probe op 0x08 bank1 buf[1] target=0x0000000e00000000 -> slot {0000000e, 00000000}
+[30036.795118] mz0380[0]: raw-bank probe op 0x08 bank1 buf[2] target=0x0000000f00000000 -> slot {0000000f, 00000000}
+[30036.795318] mz0380[0]: raw-bank probe op 0x08 bank1 buf[3] target=0x0000001000000000 -> slot {00000010, 00000000}
+[30036.801170] mz0380[0]: raw-bank probe registered bank1 with op 0x08, four independent 0x466000-byte buffers, poison=0x5a ret=0
+[30037.411031] mz0380[0]: stream start: SET_VIC(input=1920x1080p@30 fw=7 in_fmt=6 out_fmt=0 vic_in=1920x1080 fk=0 int_mode=0 -> M209 raw-only output=1920x1080, bitstreams=1) ret=0
+[30037.411207] mz0380[0]: raw-bank probe op 0x02 bank0 buf[0] target=0x0000000900000000 -> slot {00000009, 00000000}
+[30037.411372] mz0380[0]: raw-bank probe op 0x02 bank0 buf[1] target=0x0000000a00000000 -> slot {0000000a, 00000000}
+[30037.411536] mz0380[0]: raw-bank probe op 0x02 bank0 buf[2] target=0x0000000b00000000 -> slot {0000000b, 00000000}
+[30037.411699] mz0380[0]: raw-bank probe op 0x02 bank0 buf[3] target=0x0000000c00000000 -> slot {0000000c, 00000000}
+[30037.417663] mz0380[0]: raw-bank probe registered bank0 with op 0x02, four independent 0x466000-byte buffers, poison=0xa5 ret=0
+[30037.417827] mz0380[0]: raw-bank probe op 0x08 bank1 buf[0] target=0x0000000d00000000 -> slot {0000000d, 00000000}
+[30037.417990] mz0380[0]: raw-bank probe op 0x08 bank1 buf[1] target=0x0000000e00000000 -> slot {0000000e, 00000000}
+[30037.418157] mz0380[0]: raw-bank probe op 0x08 bank1 buf[2] target=0x0000000f00000000 -> slot {0000000f, 00000000}
+[30037.418322] mz0380[0]: raw-bank probe op 0x08 bank1 buf[3] target=0x0000001000000000 -> slot {00000010, 00000000}
+[30037.424508] mz0380[0]: raw-bank probe registered bank1 with op 0x08, four independent 0x466000-byte buffers, poison=0x5a ret=0
+[30037.424511] mz0380[0]: raw-only op02/op08 banks (no op04) re-registered after SET_VIC spawn
+[30037.424513] mz0380[0]: M209 SET_BUF topology provides eight independent raw buffers: token%8 0..3 -> op02 bank, 4..7 -> op08 bank; op04 is disabled
+[30037.430663] mz0380[0]: stream start: SET_AIC(on=1, 2 ch, 16 bit, 48000 Hz, 256 frames x 4 periods) ret=0
+[30037.586637] mz0380[0]: output stage [before START]: R55=ff LOCKED | B0: ab=15 ad=05 ae=20 b0=21 b1=c0 b2=00 b3=00 b4=54 b5=0c b7=00 51=89 | B2: 01=61 02=f5 07=04
+[30037.586643] mz0380[0]: link [before START]: B1 01=8c 34=40 -> HDMI, HDCP absent | B2 0b=5a 0c=00 0e=90 48=d2, input colorspace YUV444
+[30037.592683] mz0380[0]: MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2, cached)
+[30037.592687] mz0380[0]: M210: sending the Windows encoder tail on the raw-only sink topology; M209 proved op 0x06 alone leaves the producer dead
+[30037.601077] mz0380[0]: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x3fff, main ch0, fps=30, gop=32, quality=24, bitrate=4194304, skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap) ret=0
+[30037.607154] mz0380[0]: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x3fff, sub ch0, fps=30, gop=30, quality=24, bitrate=4000000, skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap) ret=0
+[30037.613088] mz0380[0]: stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x00, fps=30, die_en=1, fake_frame_off=1) ret=0
+[30037.613099] mz0380[0]: stream start: frame-token sentinel a5a5a5a5 seeded into BAR0 40/44/48/4c; readback a5a5a5a5/a5a5a5a5/a5a5a5a5/a5a5a5a5
+[30041.419097] mz0380[0]: final pipeline stop: STOP_STREAMING(all channels) ret=0 after 1 userspace attachment(s) and 1 SET_VIC spawn(s)
+[30041.419114] mz0380[0]: stream stop: EVENT[0x30]=00000000 token[0x40]=a5a5a5a5 0x44=a5a5a5a5 0x48=a5a5a5a5 0x4c=a5a5a5a5 enc[0x50]=00000000 irq_total=11 frame_events=0 fifo_drops=0
+[30041.575117] mz0380[0]: output stage [at stop]: R55=7f LOCKED | B0: ab=15 ad=05 ae=20 b0=21 b1=c0 b2=00 b3=00 b4=54 b5=0c b7=00 51=89 | B2: 01=61 02=f5 07=04
+[30041.575124] mz0380[0]: link [at stop]: B1 01=8c 34=40 -> HDMI, HDCP absent | B2 0b=5a 0c=00 0e=10 48=d2, input colorspace YUV444
+[30041.575138] mz0380[0]: stop buf[0] @0x0000000100000000 head=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | 1024/1024 sampled pages touched, last @0x3ff000 | 0 frame(s) delivered from it
+[30041.575154] mz0380[0]: stop buf[1] @0x0000000200000000 head=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | 1024/1024 sampled pages touched, last @0x3ff000 | 0 frame(s) delivered from it
+[30041.575168] mz0380[0]: stop buf[2] @0x0000000300000000 head=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | 1024/1024 sampled pages touched, last @0x3ff000 | 0 frame(s) delivered from it
+[30041.575181] mz0380[0]: stop buf[3] @0x0000000400000000 head=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 | 1024/1024 sampled pages touched, last @0x3ff000 | 0 frame(s) delivered from it
+[30041.575903] mz0380[0]: stop raw bank0 op0x02 buf[0] @0x0000000900000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5
+[30041.576615] mz0380[0]: stop raw bank0 op0x02 buf[1] @0x0000000a00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5
+[30041.577321] mz0380[0]: stop raw bank0 op0x02 buf[2] @0x0000000b00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5
+[30041.578019] mz0380[0]: stop raw bank0 op0x02 buf[3] @0x0000000c00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5 a5
+[30041.578736] mz0380[0]: stop raw bank1 op0x08 buf[0] @0x0000000d00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[30041.579446] mz0380[0]: stop raw bank1 op0x08 buf[1] @0x0000000e00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[30041.580161] mz0380[0]: stop raw bank1 op0x08 buf[2] @0x0000000f00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[30041.580863] mz0380[0]: stop raw bank1 op0x08 buf[3] @0x0000001000000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[30041.580867] mz0380[0]: M209 raw V4L2 totals: events=0 exact_frames=0 bad_extents=0 consecutive_exact=0 slots_seen=0x00

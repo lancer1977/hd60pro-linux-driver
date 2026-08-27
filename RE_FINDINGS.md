@@ -12764,3 +12764,65 @@ The knob therefore defaults off, the driver logs an explicit warning into the
 same dmesg the run is scored from, and the harness prints the deviation before
 loading and the measured source rate in its result block. If the banks fill at
 30 Hz, the follow-up is a 60 Hz confirmation run, not a conclusion.
+
+---
+
+## M210 hardware result (2026-08-27): the encoder tail does not start it either
+
+M210 was spent once, on a 1080p30 source under the documented `FPS30=1`
+deviation. Full log: `docs/m210-enc-tail-2026-08-27.log`. Everything the run
+required was present:
+
+```
+SET_VIC 1, SET_ENC_PARAMS 2, SET_PREVIEW_PARAMS 1, op06 0, source 1920x1080p@30
+M209 raw V4L2 totals: events=0 exact_frames=0 bad_extents=0 slots_seen=0x00
+stop raw bank0/1 buf[0..3]: extent=0x0, 0/1126 sampled pages touched, completions=0
+```
+
+So the Windows encoder tail is not what starts the producer, and neither is
+`op 0x06`. Both hypotheses are dead, and the negative is as total as M209's:
+not one byte was written into any of the eight slots.
+
+That leaves exactly one structural difference between these runs and the
+encoded path that delivers 60 fps today: **`op 0x04` was never registered**.
+The reasoning in the M209 entry - that a missing sink cannot suppress
+generation into the sinks that do exist - is therefore wrong for this firmware.
+The behaviour is consistent with tinyvenc validating its complete output set
+before it starts anything, which also matches what Windows does on every start:
+it registers `op 0x02`, `op 0x08` and `op 0x04` together.
+
+### M211: implemented, build-checked, unspent
+
+`raw_bank_observe` (`RAWOBS` through `mz0380-live.sh`,
+`mz0380-m211-raw-observe.sh` to run it) inverts the experiment. Instead of
+replacing the encoded path it rides it: `h264_probe=1` exactly as the working
+60 fps configuration, `op 0x04` registered and consumed as usual, and the eight
+`0x466000` raw buffers registered through `op 0x02`/`op 0x08`, poisoned, and
+read back at stop. The raw banks take the `op 0x02` slots, so the legacy
+stream-buffer registration is skipped rather than layered underneath them -
+which is Windows' own topology.
+
+It is deliberately passive: V4L2 still negotiates H.264, completion routing and
+delivery are untouched, and nothing about the run can perturb the encoded path
+it is measuring. `raw_bank_observe` requires `h264_probe=1` and
+`dma_iova_remap=1` and refuses to coexist with `raw_bank_probe`, so the two
+experiments cannot be confused for one another.
+
+The oracle is the poison. Any `op 0x02`/`op 0x08` slot with a non-zero extent
+after a live encoded capture proves the raw surface exists as a by-product of
+the configured encoder pipeline. Eight pristine slots after confirmed encoded
+delivery proves the opposite - the ring is not the Linux raw source at all -
+and the next step after that is static work in the Windows binary rather than
+another start.
+
+Both kernels build warning-free. The start is unspent.
+
+### Spawn accounting correction
+
+`mz0380-live.sh` already commits the tally itself: `do_unload()` runs
+`./mz0380-spawns.sh commit` before `rmmod` and `unloaded` after it. The manual
+`./mz0380-spawns.sh add 1` recommended after the M209 and M210 runs therefore
+double-counted them. `encoder_spawns++` sits on the SET_VIC fire, so the three
+guard-rejected attempts cost nothing at all. The tally read 7 after the M210
+run against roughly 4 real spawns; treat it as a conservative over-count and
+reset it after the next mains-off cycle rather than trusting the number.

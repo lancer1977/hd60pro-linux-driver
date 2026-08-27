@@ -321,7 +321,7 @@ void mz0380_raw_probe_bufs_dump(struct mz0380_dev *dev, const char *tag)
 {
 	unsigned int i;
 
-	if (!mz0380_raw_bank_probe)
+	if (!mz0380_raw_bank_probe && !mz0380_raw_bank_observe)
 		return;
 
 	dma_rmb();

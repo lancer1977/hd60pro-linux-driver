@@ -446,7 +446,7 @@ vic_done:
 	 */
 	if ((mz0380_h264_probe || mz0380_raw_bank_probe) &&
 	    mz0380_win_seq && mz0380_win_bufs_first) {
-		ret = mz0380_raw_bank_probe ?
+		ret = (mz0380_raw_bank_probe || mz0380_raw_bank_observe) ?
 			mz0380_stream_program_bufs(dev) :
 			mz0380_h264_program_bufs(dev);
 		if (ret)
@@ -454,6 +454,8 @@ vic_done:
 		pr_info("%s: %s re-registered after SET_VIC spawn\n",
 			dev->name, mz0380_raw_bank_probe ?
 			"raw-only op02/op08 banks (no op04)" :
+			mz0380_raw_bank_observe ?
+			"op02/op08 raw banks and the op04 encoded window" :
 			"H.264 window1");
 	}
 

@@ -4,107 +4,60 @@ _Last updated 2026-08-27. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: run M210 once (raw banks WITH the encoder tail)
+## Immediate task: run M211 once, after a mains-off power cycle
 
-M209 was implemented and spent once on hardware, 2026-08-27, on a fresh power
-cycle against a live 1080p60 source. Full log: `docs/m209-raw-only-2026-08-27.log`.
-It is answered - do not re-run it.
+M209 and M210 are both spent and both answered. Neither started the card's
+producer, and neither wrote a single byte into the eight `op 0x02`/`op 0x08`
+slots. Logs: `docs/m209-raw-only-2026-08-27.log`,
+`docs/m210-enc-tail-2026-08-27.log`.
 
-The topology was exactly right and the result was a clean, total negative. One
-`SET_VIC` (`fw=7 in_fmt=6 out_fmt=0`, `ret=0`), both banks registered and
-re-registered after the spawn, no `op 0x04` anywhere, `START_STREAMING(op 0x06)`
-fired `ret=0` - and then nothing at all for 810 seconds:
+M209 sent `op 0x06` on the raw-only topology: `irq_total=8 frame_events=0`, the
+seeded BAR0 sentinel untouched, `enc[0x50]=0`. M210 added the whole Windows
+encoder tail - `SET_VIC 1, SET_ENC_PARAMS 2, SET_PREVIEW_PARAMS 1, op06 0` -
+and the result was byte-identical: `events=0 slots_seen=0x00`, every slot
+`extent=0x0` with `0/1126 sampled pages touched`.
+
+One structural difference remains against the encoded path that delivers 60 fps
+today: those runs never registered `op 0x04`. So the earlier reasoning was
+wrong - for this firmware a missing sink evidently does stop the producer,
+which is consistent with tinyvenc validating its complete output set before
+starting, and with Windows registering `op 0x02`, `op 0x08` and `op 0x04`
+together on every start.
+
+M211 inverts the experiment: ride the working encoded path and watch the raw
+banks passively. `raw_bank_observe` registers the eight `0x466000` buffers
+through `op 0x02`/`op 0x08` alongside the live `op 0x04` window, poisons them,
+and reads their extents back at stop. V4L2 still negotiates H.264 and
+completion routing is untouched, so nothing about the observation can perturb
+what it measures. It is implemented, dual-kernel build-checked, and unspent.
 
 ```
-irq_total=8 frame_events=0 fifo_drops=0
-token[0x40]=a5a5a5a5 0x44=a5a5a5a5 0x48=a5a5a5a5 0x4c=a5a5a5a5  enc[0x50]=00000000
-M209 raw V4L2 totals: events=0 exact_frames=0 bad_extents=0 slots_seen=0x00
+sudo ./mz0380-m211-raw-observe.sh
 ```
 
-All eight slots ended `extent=0x0`, `0/1126 sampled pages touched`, poison
-intact. The `irq_total=8` is the setup acknowledgements only. The receiver was
-live the whole time (`R55=0x7f LOCKED`, HDMI, YUV444).
+Any slot with a non-zero extent after confirmed encoded delivery means the raw
+surface is a by-product of the configured encoder pipeline, and native V4L2
+negotiation can be built on it. Eight pristine slots after real encoded frames
+means the `op 0x02`/`op 0x08` ring is not the Linux raw source, and the step
+after that is static work in the Windows binary, not another start.
 
-That is not "the wrong bank". The card never wrote a frame token into the
-seeded BAR0 `0x40..0x4c` sentinel and `enc[0x50]` stayed zero, so **the producer
-never ran**. `op 0x06` alone does not start this firmware's producer.
+**Power-cycle first.** The tally read 7 at the end of 2026-08-27 against
+roughly 4 real spawns - `mz0380-live.sh` commits the tally itself in
+`do_unload()`, so the manual `./mz0380-spawns.sh add 1` after each run
+double-counted. Do not add it manually again. After a mains-off cycle:
 
-Raw-only differs from the working H.264 path in two ways, and only one can
-explain a dead producer: `op 0x04` is not registered (a missing *sink*, which
-cannot suppress generation into the sinks that do exist), and the Windows
-encoder tail is skipped - `mz0380-dma-stream.c` guards `SET_ENC_PARAMS` x2 and
-`POST_PROC` on `!mz0380_raw_bank_probe`. The working 60 fps H.264 path sends
-that tail, and so did the older tinyvenc5 sequence that once produced a single
-complete I420 frame.
+```
+sudo ./mz0380-spawns.sh reset
+```
 
-M210 is therefore one variable: keep the raw-only sink topology exactly as
-M209 built it - eight independently poisoned `op 0x02`/`op 0x08` buffers, no
-`op 0x04`, confirmed 1080p60 `fw=7`, VBI zero - and restore `SET_ENC_PARAMS`
-x2 plus `POST_PROC` byte-identically to the H.264 path. Bound it the same way:
-one start, two seconds or eight completions.
-
-It is implemented and dual-kernel build-checked; the start is unspent. Two
-attempts on 2026-08-27 were rejected by the guard because the camera source had
-settled at 1080p30 (`hper=337 vper=299` against 1080p60's `674`/`59x`); both
-stopped before any card command, so `SET_VIC` stayed at zero and the budget was
-untouched. Confirm the source first - this is a live receiver read and sends no
-`SET_VIC`, so it is free to repeat:
+Source state: the camera currently outputs 1080p30 (`QUERY_DV_TIMINGS` reports
+`74250000 Hz (30.00 fps)`, `CTA-861 VIC: 34`). M211 has no refresh guard - the
+encoded path runs at any rate - so it needs no `FPS30`. Check the source
+whenever a rate-sensitive run is planned; it is free and sends no `SET_VIC`:
 
 ```
 sudo ./mz0380-source-check.sh
 ```
-
-Only once that prints PASS, spend the start - once, no retry loop:
-
-```
-sudo ./mz0380-m210-raw-enc-tail.sh
-sudo ./mz0380-spawns.sh add 1
-```
-
-A third attempt on 2026-08-27 confirmed the source rate independently of our
-receiver arithmetic - `QUERY_DV_TIMINGS` reports `74250000 Hz (30.00 fps)` and
-`CTA-861 VIC: 34`, which is 1080p30 by definition - so the camera really is at
-30 Hz. If it cannot be moved to 60, `FPS30=1` permits the run:
-
-```
-sudo FPS30=1 ./mz0380-m210-raw-enc-tail.sh
-```
-
-The `0x2f7600` oracle is geometry-only and stays valid at 30 Hz, and `fw`
-selects chroma layout rather than refresh, so the discriminator is sound there.
-It is still a deviation from the Windows-confirmed 1080p60: the driver warns
-into the run's own dmesg, the harness prints the measured source rate, and a
-positive result at 30 Hz needs a 60 Hz confirmation run before it is parity.
-
-The knob is `raw_probe_enc_tail` (`RAWTAIL=1` through `mz0380-live.sh`); it is
-rejected at setup unless `raw_bank_probe=1` is set with it. Because Windows
-omits `op 0x06` once the tail is present, so does this path - the harness
-deadline anchors on `SET_PREVIEW_PARAMS`, and its oracle requires one
-`SET_VIC`, zero `op 0x04`, two `SET_ENC_PARAMS`, one `SET_PREVIEW_PARAMS` and
-zero op06. The driver's raw-completion success line still reads `M209 raw
-discriminator SUCCESS`; that is the shared oracle, not a stale label.
-
-If the banks fill, the raw surface is a by-product of the configured encoder
-pipeline and native V4L2 negotiation can be built on it. If they stay poisoned
-with the tail present, the producer needs the `op 0x04` sink to exist at all,
-and the run after that registers all three windows and watches the raw banks
-alongside a live H.264 stream - which the mutual-exclusion check in
-`mz0380-dma.c` currently forbids and would have to be relaxed for that
-experiment only.
-
-Budget: M209 spent one SET_VIC spawn. The card wedges somewhere in the 8-18
-spawn range per power cycle and `mz0380-spawns.sh` tracks the tally in `/run`,
-which the harness cannot commit because it unloads on its own - repair it with
-`sudo ./mz0380-spawns.sh add 1` after each bounded run.
-
-Harness state: `mz0380-m209-raw-only.sh` no longer hangs. The M209 run wedged
-the script, not the card - `v4l2-ctl` blocked in `DQBUF` on a stream that
-produced nothing and the unbounded `wait` in the cleanup trap held for 13.5
-minutes. Reaping now escalates INT -> TERM -> KILL with a 1.5 s bound per
-signal, warns if the process survives SIGKILL (D-state inside the driver),
-writes `dmesg` to `/tmp/mz0380-m209-dmesg.txt`, chmods all artifacts
-world-readable before teardown, and wraps the unload in `timeout 30`. Reuse
-that shape for M210.
 
 The product architecture remains unchanged: installed PCI modalias autoload,
 generic V4L2 registration at probe, application-owned format negotiation, and

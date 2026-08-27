@@ -485,6 +485,19 @@ int mz0380_stream_program_bufs(struct mz0380_dev *dev)
 		return mz0380_raw_probe_program_bufs(dev);
 	}
 
+	/*
+	 * M211 registers what Windows registers: the raw banks through op02/op08
+	 * AND the encoded window through op04. The raw banks take the op02 slots,
+	 * so the legacy stream-buffer registration below is skipped rather than
+	 * layered underneath them.
+	 */
+	if (mz0380_raw_bank_observe) {
+		ret = mz0380_raw_probe_program_bufs(dev);
+		if (ret)
+			return ret;
+		return mz0380_h264_program_bufs(dev);
+	}
+
 	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
 	/*
 	 * M92: word[3] is a buffer SIZE IN BYTES, not a stride. The Windows
@@ -795,6 +808,19 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 		return -EINVAL;
 	}
 
+	/*
+	 * M211 rides the working encoded path instead of replacing it, so it
+	 * needs the opposite preconditions to M209: op04 present, raw-only
+	 * absent.
+	 */
+	if (mz0380_raw_bank_observe &&
+	    (mz0380_raw_bank_probe || !mz0380_h264_probe ||
+	     !mz0380_dma_iova_remap)) {
+		pr_err("%s: raw_bank_observe (M211) rides a live H.264 capture and requires h264_probe=1 plus dma_iova_remap=1, with raw_bank_probe=0\n",
+		       dev->name);
+		return -EINVAL;
+	}
+
 	ret = mz0380_stream_bufs_alloc(dev);
 	if (ret) {
 		pr_err("%s: stream buffer alloc failed (%d)\n", dev->name, ret);
@@ -821,7 +847,7 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 			return -ENOMEM;
 		}
 	}
-	if (mz0380_raw_bank_probe) {
+	if (mz0380_raw_bank_probe || mz0380_raw_bank_observe) {
 		ret = mz0380_raw_probe_bufs_alloc_iova(dev);
 		if (ret) {
 			pr_err("%s: Windows-parity raw-bank alloc failed (%d)\n",
@@ -832,8 +858,15 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 			mz0380_stream_bufs_free(dev);
 			return ret;
 		}
-		pr_info("%s: M209 raw-only discriminator enabled: two independent four-buffer banks x 0x%x bytes (op 0x02 + op 0x08, no op 0x04)\n",
-			dev->name, MZ0380_RAW_PROBE_BUF_SIZE);
+		pr_info("%s: %s: two independent four-buffer banks x 0x%x bytes (op 0x02 + op 0x08)%s\n",
+			dev->name,
+			mz0380_raw_bank_observe ?
+				"M211 raw-bank observation enabled" :
+				"M209 raw-only discriminator enabled",
+			MZ0380_RAW_PROBE_BUF_SIZE,
+			mz0380_raw_bank_observe ?
+				", alongside the live op 0x04 encoded window" :
+				", no op 0x04");
 	}
 
 	pr_info("%s: %u stream buffers x %u KiB (buf0 @ %pad)\n",

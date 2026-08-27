@@ -843,3 +843,32 @@ bool mz0380_raw_probe_allow_30;
 module_param_named(raw_probe_allow_30, mz0380_raw_probe_allow_30, bool, 0644);
 MODULE_PARM_DESC(raw_probe_allow_30,
 		 "Permit the bounded raw discriminators to run on a progressive 1080p30 source; a documented deviation from the Windows-confirmed 1080p60 (def:0)");
+
+/*
+ * M211: the last structural difference between the raw-only start and the one
+ * that works.
+ *
+ * M209 showed op 0x06 alone leaves the producer dead; M210 restored the whole
+ * Windows encoder tail and it stayed dead - SET_VIC, both SET_ENC_PARAMS,
+ * SET_PREVIEW_PARAMS, and still events=0 with all eight slots poison-intact.
+ * The only thing those runs still lacked was the op 0x04 encoded window.
+ *
+ * The earlier reasoning that a missing *sink* cannot stop generation is
+ * therefore wrong for this firmware: tinyvenc appears to validate its complete
+ * output set before it starts anything. So the next question is not "does the
+ * raw ring work on its own" but "does the raw ring fill while the encoded path
+ * is running", which is also exactly what Windows does - it registers op02,
+ * op08 AND op04 on every start.
+ *
+ * This mode is deliberately passive. It rides the known-good h264_probe path,
+ * which delivers 60 fps today, and changes nothing about V4L2 negotiation,
+ * completion routing or delivery: the eight raw buffers are registered through
+ * op02/op08, poisoned, and read back at stop. If they show writes, the raw
+ * surface exists and is a by-product of the encoded pipeline. If they are
+ * still pristine after a live capture, the op02/op08 ring is not the Linux
+ * raw source at all and the search moves back to the Windows binary.
+ */
+bool mz0380_raw_bank_observe;
+module_param_named(raw_bank_observe, mz0380_raw_bank_observe, bool, 0644);
+MODULE_PARM_DESC(raw_bank_observe,
+		 "M211: register and poison the op02/op08 raw banks alongside a live H.264 capture and report their extents at stop (requires h264_probe=1 + IOVA remap; def:0)");

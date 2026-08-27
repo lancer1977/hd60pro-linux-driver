@@ -897,6 +897,7 @@ extern bool mz0380_set_buf_op8;
 extern bool mz0380_raw_bank_probe;
 extern bool mz0380_raw_probe_enc_tail;
 extern bool mz0380_raw_probe_allow_30;
+extern bool mz0380_raw_bank_observe;
 extern bool mz0380_mst_win_output;
 extern unsigned int mz0380_mst_ad;
 extern bool mz0380_dma_handshake;
