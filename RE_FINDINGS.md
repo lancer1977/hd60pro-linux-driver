@@ -12826,3 +12826,54 @@ double-counted them. `encoder_spawns++` sits on the SET_VIC fire, so the three
 guard-rejected attempts cost nothing at all. The tally read 7 after the M210
 run against roughly 4 real spawns; treat it as a conservative over-count and
 reset it after the next mains-off cycle rather than trusting the number.
+
+---
+
+## Correction (2026-08-27): M210 did not isolate op04, and M211 was mis-configured
+
+The operator's known-good 60 fps OBS load is:
+
+```
+sudo env VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 \
+         FASTKILL=0 H264DIVISOR=0 PERSIST=1 ./mz0380-live.sh load
+```
+
+Two things follow, and both invalidate work above rather than extending it.
+
+**`OP6=1`.** The working path fires `START_STREAMING(0x06)` *after* the Windows
+tail, even though the retail driver does not. M210 deliberately suppressed op06
+on the grounds that Windows omits it once `0x2d`/`0x31` have been sent. So the
+M210 run differed from the working sequence by op06 **and** op04, and its
+negative cannot be attributed to the missing op04 alone. The conclusion "only
+op04 is left" was premature.
+
+The cheap experiment that does isolate op04 is M210 with op06 restored - the
+working sequence minus the encoded window only. `mz0380-m210-raw-enc-tail.sh`
+now takes `OP6=1` for exactly that, and its oracle expects `EXPECT_OP06`
+completions instead of hard-coding zero:
+
+```
+sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh
+```
+
+**Defaults are not the working configuration.** The first `mz0380-m211-raw-observe.sh`
+set only `H264PROBE=1 RAWOBS=1 PERSIST=0` and left the rest to `mz0380-live.sh`,
+which defaults `vic_fw` to 5 (tinyvenc5 - one frame per process, then frozen),
+`win_seq` to 0 (M90: does not reach the splash) and `poll_drain_ms` to 20. That
+is not a configuration that has ever delivered continuous encoded video, so a
+"the raw banks stayed pristine" result from it would have been worthless. Both
+harnesses now name the full knob set explicitly, and any future one must too:
+for this driver, an unnamed knob is a wrong knob.
+
+`POSTMASK=0`, `FASTKILL=0` and `H264DIVISOR=0` are already the driver defaults
+(M128d, M157 and the all-frame bitmap schedule respectively), so those three
+carry no drift - but they are named in the harnesses anyway so the whole start
+sequence is readable in one place.
+
+### Run order after this correction
+
+1. `sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh` - the working sequence
+   minus op04. A positive here means the raw ring works and op04 was never
+   needed; a negative isolates op04 properly, which M210 as first run did not.
+2. `sudo ./mz0380-m211-raw-observe.sh` - the working sequence *with* op04, raw
+   banks observed passively alongside it.

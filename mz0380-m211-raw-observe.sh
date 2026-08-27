@@ -73,8 +73,15 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# This must be the operator's known-good 60 fps OBS configuration plus RAWOBS,
+# and nothing else.  Left to live.sh defaults it would run vic_fw=5 (tinyvenc5,
+# one frame per process), win_seq=0 and poll_drain_ms=20 - a configuration that
+# has never delivered continuous encoded video, which would make a negative
+# result meaningless.  POSTMASK/FASTKILL/H264DIVISOR are the driver defaults
+# already; they are named here so the whole sequence is readable in one place.
 echo "Loading the M211 topology (op02/op08 raw banks + live op04 encoded window)..."
-H264PROBE=1 RAWOBS=1 PERSIST=0 NOSG=0 ./mz0380-live.sh load || exit 1
+VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 \
+	H264DIVISOR=0 PERSIST=1 RAWOBS=1 NOSG=0 ./mz0380-live.sh load || exit 1
 
 NODE=""
 for name_file in /sys/class/video4linux/video*/name; do

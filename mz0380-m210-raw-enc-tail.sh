@@ -22,6 +22,11 @@ cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 command -v v4l2-ctl >/dev/null || { echo "v4l2-ctl is required"; exit 1; }
 
+# OP6=1 additionally fires START_STREAMING(0x06) after the tail.  Windows does
+# not, but the operator's known-good 60 fps configuration does, and the first
+# M210 run omitted it - so OP6=1 is what makes this run "the working sequence
+# minus op04" rather than "minus op04 and op06".
+#
 # FPS30=1 permits the run on a progressive 1080p30 source.  The 0x2f7600
 # extent oracle is geometry-only and stays valid there, but it is a deviation
 # from the Windows-confirmed 1080p60 and the driver logs a warning for it, so
@@ -83,8 +88,13 @@ if [ "${FPS30:-0}" = 1 ]; then
 	echo "      deviation from the Windows-confirmed 1080p60.  Score it as 30 Hz."
 fi
 echo "Loading the M210 topology (raw sinks + encoder tail; load starts nothing)..."
-H264PROBE=0 RAWBANKS=1 RAWTAIL=1 RAW30="${FPS30:-0}" POLLDRAIN=0 VICFW=7 \
-	WINSEQ=1 WINBUFS=1 OP6=0 PERSIST=0 NOSG=0 ./mz0380-live.sh load || exit 1
+# Every knob below is the operator's known-good 60 fps OBS configuration,
+# minus h264_probe and op04.  Anything left to a live.sh default would silently
+# differ from it: vic_fw defaults to 5 (tinyvenc5, one frame per process),
+# win_seq to 0, and poll_drain_ms to 20.
+H264PROBE=0 RAWBANKS=1 RAWTAIL=1 RAW30="${FPS30:-0}" \
+	VICFW=7 WINSEQ=1 WINBUFS=1 POLLDRAIN=0 POSTMASK=0 FASTKILL=0 \
+	OP6="${OP6:-0}" PERSIST=0 NOSG=0 ./mz0380-live.sh load || exit 1
 
 NODE=""
 for name_file in /sys/class/video4linux/video*/name; do
@@ -134,11 +144,16 @@ OP04_COUNT=$(dmesg | grep -c 'H.264 probe registered dedicated window1 ring')
 ENC_COUNT=$(dmesg | grep -c 'stream start: SET_ENC_PARAMS(')
 POST_COUNT=$(dmesg | grep -c 'stream start: SET_PREVIEW_PARAMS(')
 OP06_COUNT=$(dmesg | grep -c 'stream start: START_STREAMING(op 0x06) fired')
+# OP6=1 reproduces the operator's working sequence, which sends op06 AFTER the
+# tail even though Windows does not.  M210's first run suppressed it, so that
+# run differed from the working path by op06 as well as op04 and cannot isolate
+# op04 on its own.
+EXPECT_OP06=${OP6:-0}
 SUCCESS=0
 if dmesg | grep -q 'M209 raw discriminator SUCCESS' &&
    [ "$SETVIC_COUNT" -eq 1 ] && [ "$OP04_COUNT" -eq 0 ] &&
    [ "$ENC_COUNT" -eq 2 ] && [ "$POST_COUNT" -eq 1 ] &&
-   [ "$OP06_COUNT" -eq 0 ]; then
+   [ "$OP06_COUNT" -eq "$EXPECT_OP06" ]; then
 	SUCCESS=1
 fi
 
@@ -149,7 +164,7 @@ echo "  SET_VIC count : $SETVIC_COUNT (required: 1)"
 echo "  op04 count    : $OP04_COUNT (required: 0)"
 echo "  SET_ENC count : $ENC_COUNT (required: 2)"
 echo "  POST_PROC cnt : $POST_COUNT (required: 1)"
-echo "  op06 count    : $OP06_COUNT (required: 0, Windows omits it with the tail)"
+echo "  op06 count    : $OP06_COUNT (required: $EXPECT_OP06)"
 echo "  source rate   : $(dmesg | sed -n 's/.*live input \(1920x1080[pi]@[0-9]*\).*/\1/p' | tail -1)"
 echo "  raw capture   : $RAW_OUT ($(stat -c %s "$RAW_OUT") bytes)"
 echo "  v4l2-ctl log  : $CAPTURE_LOG"

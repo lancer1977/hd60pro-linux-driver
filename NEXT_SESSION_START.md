@@ -24,6 +24,22 @@ which is consistent with tinyvenc validating its complete output set before
 starting, and with Windows registering `op 0x02`, `op 0x08` and `op 0x04`
 together on every start.
 
+**Correction, same day:** the operator's known-good 60 fps load is
+`VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0
+H264DIVISOR=0 PERSIST=1`. It fires `op 0x06` after the tail, which M210
+suppressed - so the M210 run differed from the working sequence by op06 as well
+as op04, and does not isolate op04 on its own. The first run to make is
+therefore M210 with op06 restored:
+
+```
+sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh
+```
+
+Only if that is also negative does M211 become the next question. Note also
+that `mz0380-live.sh` defaults are not the working configuration - `vic_fw`
+defaults to 5, `win_seq` to 0, `poll_drain_ms` to 20 - so every harness names
+the full knob set explicitly. An unnamed knob in this tree is a wrong knob.
+
 M211 inverts the experiment: ride the working encoded path and watch the raw
 banks passively. `raw_bank_observe` registers the eight `0x466000` buffers
 through `op 0x02`/`op 0x08` alongside the live `op 0x04` window, poisons them,
