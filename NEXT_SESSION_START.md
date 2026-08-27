@@ -4,68 +4,84 @@ _Last updated 2026-08-27. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: power-cycle, then run M212 over a CHANGING scene
+## Immediate task: static RE of tinyvenc7's preview DMA length - no spawns
 
-The raw ring is alive. M210b and M211 (2026-08-27, logs
-`docs/m210b-tail-plus-op6-2026-08-27.log` and
-`docs/m211-raw-observe-2026-08-27.log`) settled three things and reopened one.
+The long-standing question is answered. **The sixteen bytes the card writes into
+`op 0x02` are source pixels**, measured rather than guessed: an M211 run sampled
+each slot head on every encoded completion while capturing the H.264 the
+encoder made from the same frames, and the decoded picture's top-left sixteen
+luma samples match the raw heads with a mean absolute difference of 0.50-1.12
+and no byte off by more than 3. Controls from the same frame: a mid-frame
+region scores 37.00, the poison 75.06. Artifacts:
+`docs/m212-head-samples-2026-08-27.log`,
+`docs/m212-encoded-reference-2026-08-27.h264`.
 
-**The producer needs the encoder tail AND `op 0x06`.** M209 sent op06 without
-the tail and got nothing; M210 sent the tail without op06 and got nothing;
-M210b sent both and got 209 completions. The conclusion drawn from M210 - that
-the missing `op 0x04` was the last variable - is retired. op04 was never it.
+So the capture path works end to end and the DMA stops after one burst. Nothing
+about "does the card produce raw video" is open any more.
 
-**Only the `op 0x02` bank rotates.** Tokens cycled `a5a5a5a0..a3` (our sentinel
-with the low nibble replaced), `slots_seen` never exceeded `0x0f`, and all four
-`op 0x08` slots ended poison-intact across both runs. The M209 static claim of
-an eight-slot `token % 8` ring is not what this firmware does on the Linux
-sequence; do not repeat it as confirmed.
+The reframing that follows matters more than the proof. M177 already named this
+window **tinyvenc7's 16-byte preview DMA**, and M92's size table says a preview
+surface on this card is `1024 x 540` - `0x10F000` packed or `0xCA900` planar -
+not `1920 x 1080`. Every oracle in the current harnesses expects `0x2f7600`
+because M209 read that number out of the retail driver's *base raw* callback,
+and nothing has shown the Linux `fw=7` `op 0x02` window is that same surface.
+Resolve that before spending another start on an oracle that may be looking for
+the wrong number.
 
-**`op 0x04` is irrelevant to the raw ring.** M211 ran the operator's working
-configuration with the encoded path fully alive - 60 H.264 frames, 891,529
-bytes, clean IDR - and the raw banks behaved identically to M210b.
+**Do this first, and it costs nothing:** find in tinyvenc7 what sets the
+transfer length for the `op 0x02` preview writer, and whether any
+`SET_PREVIEW_PARAMS` field, geometry register or mask bit changes it. The
+material is already in the tree (`re-dump/`, `ep-disasm.txt`, `windowsDriver/`).
+`op 0x31` is `SET_PREVIEW_PARAMS` and `post_mask` gates which of its fields the
+card applies; we send `post_mask=0`, so the writer currently runs on card
+defaults. M128d mapped that mask under `fw=5`, where a different binary owns
+the writer - it has never been mapped under `fw=7`.
 
-**What is left is the old 16-byte stall.** Every one of the 209 completions
-wrote `extent=0x10` and stopped: `bad_extents=209 exact_frames=0`,
-`1/1126 sampled pages touched`. This is M91/M107/M128a's signature, now
-reproduced on a path that is otherwise fully alive.
+Then, in order:
 
-The open question is M128a's, still unanswered: are those sixteen bytes source
-pixels, or a broken transfer of buffer residue? They are a dithered mid-dark
-grey (`5a`-`5e`) that differs per slot and per run, which is suggestive and
-proves nothing. `raw_bank_observe` now samples each `op 0x02` slot head on
-every encoded completion and logs it when it changes, so one bounded run
-answers it:
+1. Decide from the binary whether the `fw=7` `op 0x02` surface is `0x2f7600` or
+   `0xCA900`, and correct the harness oracles to match.
+2. `probe_windows=1` under `fw=7` - one spawn, never run. M32 concluded the
+   three extra outbound windows are never written, but measured it under
+   `fw=5` against a livelocked producer. Under `fw=7` the producer is alive.
+3. A `post_mask` bisect under `fw=7` - one spawn per step, only once 1 and 2
+   say which field to move.
+
+**Budget: the tally reads 11, inside the historical 8-18 wedge range.** Spend
+nothing on hardware until a mains-off power cycle followed by
+`sudo ./mz0380-spawns.sh reset`. Do not use `./mz0380-spawns.sh add` -
+`mz0380-live.sh` commits the tally itself in `do_unload()`.
+
+### What the three bounded runs established (2026-08-27)
+
+- The producer needs the encoder tail **and** `op 0x06`. Tail alone: nothing.
+  op06 alone: nothing. Both: 209 completions. Logs
+  `docs/m209-raw-only-2026-08-27.log`, `docs/m210-enc-tail-2026-08-27.log`,
+  `docs/m210b-tail-plus-op6-2026-08-27.log`.
+- Only the `op 0x02` bank rotates - tokens `a5a5a5a0..a3`, `slots_seen` capped
+  at `0x0f`, all four `op 0x08` slots poison-intact in every run. The M209
+  static claim of an eight-slot `token % 8` ring is not what this firmware does
+  on the Linux sequence.
+- `op 0x04` is irrelevant to the raw ring: M211 ran the operator's working
+  configuration with the encoded path fully alive (60 frames, 891,529 bytes,
+  clean IDR) and the raw banks behaved identically.
+
+### Known-good load, for reference
 
 ```
-sudo ./mz0380-m211-raw-observe.sh
+sudo env VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 \
+         FASTKILL=0 H264DIVISOR=0 PERSIST=1 ./mz0380-live.sh load
 ```
 
-**Point the camera at something that visibly changes while it runs** - wave a
-hand across the lens, cover it, swing from a lamp to a dark corner. The encoded
-`.h264` the run captures is the visual record of what the camera saw, so the
-head samples can be compared against it directly. Sixteen bytes that track the
-scene are pixels, and the bug becomes "the DMA dies after one burst" - which is
-tractable. Sixteen bytes that sit still while the scene moves mean the raw path
-is not capturing at all.
+`mz0380-live.sh` defaults are NOT this configuration - `vic_fw` defaults to 5,
+`win_seq` to 0, `poll_drain_ms` to 20 - so every harness names the full knob set
+explicitly. An unnamed knob in this tree is a wrong knob.
 
-**Power-cycle first.** The tally reads 10, inside the historical 8-18 wedge
-range. After a mains-off cycle:
-
-```
-sudo ./mz0380-spawns.sh reset
-```
-
-Do not run `./mz0380-spawns.sh add` - `mz0380-live.sh` commits the tally itself
-in `do_unload()`, and the manual repairs earlier in this session inflated it.
-
-One thing measured but not concluded: the 209 raw completions arrived every
-16.3 ms - about 61/s - while the receiver measured 30 fps and the encoded path
-delivered 60 frames in roughly 3 s. Those three numbers do not agree. M105
-records a `hper=337 vper=299` artifact during re-lock, which is exactly what
-this camera reads, so the possibility that the source is really 60 Hz and the
-`vperiod` decode is halved is open. Measure it deliberately before building on
-either reading.
+One measurement taken but not concluded: 209 raw completions at 16.3 ms apart
+(~61/s) against a receiver reading of 30 fps and 60 encoded frames in roughly
+3 s. Those do not agree, and M105 records a `hper=337 vper=299` artifact during
+re-lock that is exactly what this camera reads. The possibility that the source
+is 60 Hz and the `vperiod` decode is halved is open; measure it deliberately.
 
 The product architecture remains unchanged: installed PCI modalias autoload,
 generic V4L2 registration at probe, application-owned format negotiation, and

@@ -12971,3 +12971,100 @@ encoded stream captured alongside is a visual record of what the camera saw.
 `raw_bank_observe` now samples the first sixteen bytes of each `op 0x02` slot
 on every encoded completion and logs them whenever they change, so a single
 bounded run over a changing scene answers it without another start.
+
+---
+
+## M212 (hardware + offline, 2026-08-27): the sixteen bytes ARE pixels, measured against the co-captured picture
+
+The question RE_FINDINGS has carried since M128a - and named explicitly at
+M161/M177, "nobody has ever dumped what those 16 bytes contain" - is answered,
+and answered numerically rather than by eye.
+
+`raw_bank_observe` samples the first sixteen bytes of each `op 0x02` slot on
+every encoded completion and logs them on change, so one bounded M211 run
+produces both the raw samples and, in the same capture window, the H.264 stream
+the encoder made from the same frames. Decoding that stream gives an
+independent record of what the camera saw. Artifacts:
+`docs/m212-head-samples-2026-08-27.log`,
+`docs/m212-encoded-reference-2026-08-27.h264`.
+
+Decoded frame 0, first sixteen luma samples:
+
+```
+5e 5c 59 57 57 57 58 58 59 59 5a 5b 5c 5c 5c 5c
+```
+
+Each raw head against the closest decoded frame:
+
+| slot | head | MAD | max byte diff |
+|---|---|---:|---:|
+| 0 | `5e5d5a5758585959595a5c5c5d5c5a5d` | 0.88 | 2 |
+| 1, 2 | `5f5d5a585858595a5a595d5c5d5b5a5c` | 1.12 | 3 |
+| 0, 3 | `5e5c59585858585959595c5b5c5c5a5d` | 0.56 | 2 |
+| 1 | `5d5b59585858585858595b5b5c5c5b5c` | 0.50 | 1 |
+| 3 | `5e5c5a595656585858595c5c5c5c5c5c` | 0.56 | 2 |
+
+Controls from the same decoded frame: the top-left sixteen bytes against a
+mid-frame region give MAD 37.00, and against the `0xa5` poison 75.06. So a
+mean absolute difference below 1.2, with no byte off by more than 3, is not a
+coincidence of a flat grey scene - it is the same sixteen pixels, differing
+only by H.264 quantisation.
+
+**The card captures correctly and transfers sixteen bytes.** Not a descriptor,
+not buffer residue, not the standby canvas: the top-left luma of the live
+picture, written into whichever `op 0x02` slot the token selects, sixty times a
+second. Two slots receiving byte-identical heads in the same run is consistent
+with that too - the same picture reaching two slots.
+
+### What this means, and the reframing it forces
+
+The raw capture path is not broken in the sense of "no video". Every stage
+works up to and including the DMA, which then stops after one burst. That is a
+much narrower bug than anything considered above.
+
+It also connects to what M177 already called this window: **tinyvenc7's 16-byte
+preview DMA**. Under `fw=7` the `op 0x02` bank is the preview writer, not the
+full-frame raw writer, and M92's own size table says what a preview surface is
+sized for on this card:
+
+```
+0x10F000 = 1024 x 540 x 2   + 4096   (preview, YUV422)
+0x0CA900 = 1024 x 540 x 1.5 + 256    (preview, YUV420)
+```
+
+So the target for a continuous `fw=7` raw path may not be `0x2f7600` at all.
+The M209 static reading that produced that number described the retail driver's
+*base raw* callback; nothing has shown that Linux's `fw=7` `op 0x02` window is
+that same surface. A 1024x540 preview at `0xCA900` is an equally consistent
+reading of the same evidence, and it is the one M177 already adopted.
+
+`op 0x31` is `SET_PREVIEW_PARAMS` - the preview configuration - and
+`post_mask` gates which of its fields the card applies. We currently send
+`post_mask=0`, i.e. no fields applied, so the preview writer runs on card
+defaults. M128d established that `0x1f` truncates to 16 bytes under `fw=5`;
+nothing has mapped the mask under `fw=7`, where the writer is a different
+binary.
+
+### Next, in order, and all but the last are free
+
+1. **Static, zero spawns.** Find the preview DMA length in tinyvenc7 - what
+   sets the transfer size for the `op 0x02` writer, and whether any
+   `SET_PREVIEW_PARAMS` field or geometry register changes it. The sources are
+   already in the tree (`re-dump/`, `ep-disasm.txt`). This is the highest-value
+   remaining work and it costs nothing.
+2. **Re-read the size question.** Decide from the binary whether the `fw=7`
+   `op 0x02` surface is 1920x1080 I420 (`0x2f7600`) or a 1024x540 preview
+   (`0xCA900`). Every oracle in the harnesses currently assumes the former on
+   the strength of a static reading of a different callback.
+3. **`probe_windows=1` under `fw=7`** (one spawn, never run). M32's conclusion
+   that the three extra outbound windows are never written was measured under
+   `fw=5`, against a producer that was livelocked. Under `fw=7` the producer is
+   demonstrably alive, so it is a different experiment with the same command.
+4. **A `post_mask` bisect under `fw=7`** (one spawn per step). Only after 1 and
+   2 say which field to move.
+
+### Budget
+
+The tally reads 11 - inside the historical 8-18 wedge range. Nothing further
+should be spent on hardware until a mains-off power cycle and
+`./mz0380-spawns.sh reset`.

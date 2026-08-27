@@ -1,0 +1,193 @@
+[48058.305670] mz0380 driver version 0.1.0 loaded
+[48058.305786] 0000:04:00.0: dma_handshake: bus mastering enabled pre-firmware
+[48058.305788] mz0380 device found at 0000:04:00.0, rev: 0, irq: 40, latency: 0
+[48058.305789] 0000:04:00.0: probe mode: bus master initially disabled
+[48058.305813] mz0380[0]: subsystem: 1cfa:0006, board: Elgato Game Capture HD60 Pro [card=1,autodetected]
+[48058.305815] mz0380[0]: bar0 @ 0xfc200000 [0x100000 bytes], bar5 @ 0xfc300000 [0x1000 bytes]
+[48058.306950] mz0380[0]: EVENT=0x00000800 during command 0x1 (cmd-done), acked
+[48058.311853] mz0380[0]: CMD_INIT answered on attempt 1 after 6ms (status=0xdddddddd)
+[48058.418914] mz0380[0]: board reports running firmware 1.11 (status=0xaaaaaaaa)
+[48058.418919] mz0380[0]: card runs firmware 1.11 (no upload attempted)
+[48058.418928] mz0380[0]: interrupt: legacy INTx, irq 40 (Windows uses INTx)
+[48058.418951] mz0380[0]: IRQ 40 ready (INTx)
+[48058.419104] mz0380[0]: stream buf[0] phys=0x0000000195c00000 mapped at IOVA 0x100000000 (high32=0x00000001, low32=0)
+[48058.419257] mz0380[0]: stream buf[1] phys=0x0000000416800000 mapped at IOVA 0x200000000 (high32=0x00000002, low32=0)
+[48058.419410] mz0380[0]: stream buf[2] phys=0x000000005fc00000 mapped at IOVA 0x300000000 (high32=0x00000003, low32=0)
+[48058.419561] mz0380[0]: stream buf[3] phys=0x0000000016c00000 mapped at IOVA 0x400000000 (high32=0x00000004, low32=0)
+[48058.419638] mz0380[0]: H.264 probe buf[0] phys=0x000000071aa00000 mapped at IOVA 0x500000000
+[48058.419720] mz0380[0]: H.264 probe buf[1] phys=0x00000006f3600000 mapped at IOVA 0x600000000
+[48058.419806] mz0380[0]: H.264 probe buf[2] phys=0x0000000e85c00000 mapped at IOVA 0x700000000
+[48058.419884] mz0380[0]: H.264 probe buf[3] phys=0x0000000370900000 mapped at IOVA 0x800000000
+[48058.419886] mz0380[0]: H.264 diagnostic enabled: 4 window1 buffers x 1024 KiB
+[48058.420608] mz0380[0]: raw-bank probe bank0 buf[0] mapped at IOVA 0x900000000 (1126 pages)
+[48058.421295] mz0380[0]: raw-bank probe bank0 buf[1] mapped at IOVA 0xa00000000 (1126 pages)
+[48058.421992] mz0380[0]: raw-bank probe bank0 buf[2] mapped at IOVA 0xb00000000 (1126 pages)
+[48058.422602] mz0380[0]: raw-bank probe bank0 buf[3] mapped at IOVA 0xc00000000 (1126 pages)
+[48058.423204] mz0380[0]: raw-bank probe bank1 buf[0] mapped at IOVA 0xd00000000 (1126 pages)
+[48058.423737] mz0380[0]: raw-bank probe bank1 buf[1] mapped at IOVA 0xe00000000 (1126 pages)
+[48058.424342] mz0380[0]: raw-bank probe bank1 buf[2] mapped at IOVA 0xf00000000 (1126 pages)
+[48058.424921] mz0380[0]: raw-bank probe bank1 buf[3] mapped at IOVA 0x1000000000 (1126 pages)
+[48058.424923] mz0380[0]: M211 raw-bank observation enabled: two independent four-buffer banks x 0x466000 bytes (op 0x02 + op 0x08), alongside the live op 0x04 encoded window
+[48058.424925] mz0380[0]: 4 stream buffers x 4096 KiB (buf0 @ 0x0000000100000000)
+[48058.424931] mz0380[0]: synced cached input from BAR5[0x0040][2:0] = 0 (HDMI) during probe
+[48058.424934] mz0380[0]: synced cached quality from BAR5[0x0060] = 0 (raw=00000000) during probe
+[48058.424937] mz0380[0]: BAR5 GOP field returned 0 (raw=00000000), outside the V4L2 range [1..300] - keeping the cached value; the register is unwritten, not zero during probe
+[48058.424941] mz0380[0]: BAR5 bitrate field returned 0 (raw=00000000), outside the V4L2 range [262144..12582912] - keeping the cached value; the register is unwritten, not zero during probe
+[48058.424944] mz0380[0]: synced cached B-frames from BAR5[0x0088] = 0 (raw=00000000) during probe
+[48058.424947] mz0380[0]: synced cached QP step from BAR5[0x0084] = 0 (raw=00000000) during probe
+[48058.424950] mz0380[0]: synced cached record mode from BAR5[0x0058] = 1 (CBR) during probe
+[48058.425140] mz0380[0]: property 201 input-select request 0 (HDMI) via HD60 Pro bring- -> hardware write applied
+[48058.425142] mz0380[0]: property 201 BAR5 write reg=0x0040 mask=0x00000007 shift=0 before=00000000 programmed=00000000 readback=00000000
+[48058.803930] mz0380[0]: MST3367 silent after reset (dir_invert=0) - retrying with the opposite GPIO_DIR sense
+[48059.073922] mz0380[0]: MST3367 answering with dir_invert=1 - GPIO direction polarity now known
+[48059.271427] mz0380[0]: RxVideoInit: 0xae |= 0x04 -> reads back 04
+[48060.110906] mz0380[0]: HPD deasserted -> pin1 reads 1, BANK0[0xb7]=0x02
+[48060.495756] mz0380[0]: EDID read-back failed (ret=0, first bytes a0 00 20 00) - nothing is holding the EDID at 0xa0
+[48060.501678] mz0380[0]: EDID pushed (256 bytes, opcode 0x1f, wait 100ms) - the source is the oracle: a camera switches to HDMI out once it can read one
+[48060.638898] mz0380[0]: HPD asserted -> pin1 reads 0, BANK0[0xb7]=0x00
+[48060.638904] mz0380[0]: MST3367 receiver brought up (reset released, init applied)
+[48060.639013] mz0380[0]: registered video0 (H.264 capture, streaming=armed)
+[48061.075396] mz0380[0]: MST3367 signal: 1920x1080p [host units] (htot=2200 vtot=1125 hper=337 vper=299 hact=1920 R55=0x7f)
+[48061.087827] mz0380 0000:04:00.0: live input 1920x1080p@30 -> encoder output 1920x1080@30
+[48061.087839] mz0380[0]: stream start: pre-STOP(op 0x07, all channels) ret=0, settling 1900 ms
+[48063.035006] mz0380[0]: raw-bank probe op 0x02 bank0 buf[0] target=0x0000000900000000 -> slot {00000009, 00000000}
+[48063.035173] mz0380[0]: raw-bank probe op 0x02 bank0 buf[1] target=0x0000000a00000000 -> slot {0000000a, 00000000}
+[48063.035336] mz0380[0]: raw-bank probe op 0x02 bank0 buf[2] target=0x0000000b00000000 -> slot {0000000b, 00000000}
+[48063.035500] mz0380[0]: raw-bank probe op 0x02 bank0 buf[3] target=0x0000000c00000000 -> slot {0000000c, 00000000}
+[48063.041718] mz0380[0]: raw-bank probe registered bank0 with op 0x02, four independent 0x466000-byte buffers, poison=0xa5 ret=0
+[48063.041890] mz0380[0]: raw-bank probe op 0x08 bank1 buf[0] target=0x0000000d00000000 -> slot {0000000d, 00000000}
+[48063.042054] mz0380[0]: raw-bank probe op 0x08 bank1 buf[1] target=0x0000000e00000000 -> slot {0000000e, 00000000}
+[48063.042216] mz0380[0]: raw-bank probe op 0x08 bank1 buf[2] target=0x0000000f00000000 -> slot {0000000f, 00000000}
+[48063.042380] mz0380[0]: raw-bank probe op 0x08 bank1 buf[3] target=0x0000001000000000 -> slot {00000010, 00000000}
+[48063.048351] mz0380[0]: raw-bank probe registered bank1 with op 0x08, four independent 0x466000-byte buffers, poison=0x5a ret=0
+[48063.048392] mz0380[0]: H.264 SET_BUF_4[0] target=0x0000000500000000 -> slot {00000005, 00000000}
+[48063.048430] mz0380[0]: H.264 SET_BUF_4[1] target=0x0000000600000000 -> slot {00000006, 00000000}
+[48063.048470] mz0380[0]: H.264 SET_BUF_4[2] target=0x0000000700000000 -> slot {00000007, 00000000}
+[48063.048509] mz0380[0]: H.264 SET_BUF_4[3] target=0x0000000800000000 -> slot {00000008, 00000000}
+[48063.054720] mz0380[0]: H.264 probe registered dedicated window1 ring (op 0x04, size=0x97f00) ret=0
+[48063.666834] mz0380[0]: stream start: SET_VIC(input=1920x1080p@30 fw=7 in_fmt=6 out_fmt=0 vic_in=1920x1080 fk=0 int_mode=0 -> H.264 output=1920x1080, bitstreams=1) ret=0
+[48063.667005] mz0380[0]: raw-bank probe op 0x02 bank0 buf[0] target=0x0000000900000000 -> slot {00000009, 00000000}
+[48063.667172] mz0380[0]: raw-bank probe op 0x02 bank0 buf[1] target=0x0000000a00000000 -> slot {0000000a, 00000000}
+[48063.667343] mz0380[0]: raw-bank probe op 0x02 bank0 buf[2] target=0x0000000b00000000 -> slot {0000000b, 00000000}
+[48063.667512] mz0380[0]: raw-bank probe op 0x02 bank0 buf[3] target=0x0000000c00000000 -> slot {0000000c, 00000000}
+[48063.673694] mz0380[0]: raw-bank probe registered bank0 with op 0x02, four independent 0x466000-byte buffers, poison=0xa5 ret=0
+[48063.673876] mz0380[0]: raw-bank probe op 0x08 bank1 buf[0] target=0x0000000d00000000 -> slot {0000000d, 00000000}
+[48063.674039] mz0380[0]: raw-bank probe op 0x08 bank1 buf[1] target=0x0000000e00000000 -> slot {0000000e, 00000000}
+[48063.674227] mz0380[0]: raw-bank probe op 0x08 bank1 buf[2] target=0x0000000f00000000 -> slot {0000000f, 00000000}
+[48063.674392] mz0380[0]: raw-bank probe op 0x08 bank1 buf[3] target=0x0000001000000000 -> slot {00000010, 00000000}
+[48063.680342] mz0380[0]: raw-bank probe registered bank1 with op 0x08, four independent 0x466000-byte buffers, poison=0x5a ret=0
+[48063.680382] mz0380[0]: H.264 SET_BUF_4[0] target=0x0000000500000000 -> slot {00000005, 00000000}
+[48063.680421] mz0380[0]: H.264 SET_BUF_4[1] target=0x0000000600000000 -> slot {00000006, 00000000}
+[48063.680459] mz0380[0]: H.264 SET_BUF_4[2] target=0x0000000700000000 -> slot {00000007, 00000000}
+[48063.680497] mz0380[0]: H.264 SET_BUF_4[3] target=0x0000000800000000 -> slot {00000008, 00000000}
+[48063.686703] mz0380[0]: H.264 probe registered dedicated window1 ring (op 0x04, size=0x97f00) ret=0
+[48063.686706] mz0380[0]: op02/op08 raw banks and the op04 encoded window re-registered after SET_VIC spawn
+[48063.686708] mz0380[0]: SET_BUF(op 0x02) provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8
+[48063.687304] mz0380[0]: real-frame buffers primed with 0xaa poison; the payload size will be inferred from the bounded changed prefix because firmware does not expose its byte count
+[48063.693344] mz0380[0]: stream start: SET_AIC(on=1, 2 ch, 16 bit, 48000 Hz, 256 frames x 4 periods) ret=0
+[48063.849099] mz0380[0]: output stage [before START]: R55=ff LOCKED | B0: ab=15 ad=05 ae=20 b0=21 b1=c0 b2=00 b3=00 b4=54 b5=0c b7=00 51=89 | B2: 01=61 02=f5 07=04
+[48063.849106] mz0380[0]: link [before START]: B1 01=8c 34=40 -> HDMI, HDCP absent | B2 0b=5a 0c=00 0e=90 48=d2, input colorspace YUV444
+[48063.855177] mz0380[0]: MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2, cached)
+[48063.863336] mz0380[0]: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x3fff, main ch0, fps=30, gop=32, quality=24, bitrate=4194304, skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap) ret=0
+[48063.869338] mz0380[0]: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x3fff, sub ch0, fps=30, gop=30, quality=24, bitrate=4000000, skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap) ret=0
+[48063.875335] mz0380[0]: stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x00, fps=30, die_en=1, fake_frame_off=1) ret=0
+[48063.875347] mz0380[0]: stream start: frame-token sentinel a5a5a5a5 seeded into BAR0 40/44/48/4c; readback a5a5a5a5/a5a5a5a5/a5a5a5a5/a5a5a5a5
+[48063.875354] mz0380[0]: stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+[48064.097686] mz0380 0000:04:00.0: clean H.264 IDR received; encoded delivery is synchronized (access unit includes SPS/PPS)
+[48064.097693] mz0380[0]: M212 raw slot 0 head changed (#1): 5e5d5a5758585959595a5c5c5d5c5a5d
+[48064.097696] mz0380[0]: M212 raw slot 1 head changed (#1): a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+[48064.097697] mz0380[0]: M212 raw slot 2 head changed (#1): a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+[48064.097699] mz0380[0]: M212 raw slot 3 head changed (#1): a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+[48064.112041] mz0380[0]: M212 raw slot 1 head changed (#2): 5f5d5a585858595a5a595d5c5d5b5a5c
+[48064.127962] mz0380[0]: M212 raw slot 2 head changed (#2): 5f5d5a585858595a5a595d5c5d5b5a5c
+[48064.144696] mz0380[0]: M212 raw slot 3 head changed (#2): 5e5c59585858585959595c5b5c5c5a5d
+[48064.161835] mz0380[0]: M212 raw slot 0 head changed (#2): 5e5c59585858585959595c5b5c5c5a5d
+[48064.178687] mz0380[0]: M212 raw slot 1 head changed (#3): 5d5b59585858585858595b5b5c5c5b5c
+[48064.211403] mz0380[0]: M212 raw slot 3 head changed (#3): 5e5c5a595656585858595c5c5c5c5c5c
+[48065.078023] mz0380 0000:04:00.0: VB2 detached; persistent H.264 pipeline, DMA mappings and completion ACK path remain active (no STOP, no SET_VIC budget spent)
+[48067.140700] mz0380[0]: final pipeline stop: STOP_STREAMING(all channels) ret=0 after 1 userspace attachment(s) and 1 SET_VIC spawn(s)
+[48067.140716] mz0380[0]: stream stop: EVENT[0x30]=00000000 token[0x40]=a5a5a5a0 0x44=a5a5a5a0 0x48=ffffffff 0x4c=a5a5a5a5 enc[0x50]=00000000 irq_total=191 frame_events=177 fifo_drops=0
+[48067.296804] mz0380[0]: output stage [at stop]: R55=7f LOCKED | B0: ab=15 ad=05 ae=20 b0=21 b1=c0 b2=00 b3=00 b4=54 b5=0c b7=00 51=89 | B2: 01=61 02=f5 07=04
+[48067.296811] mz0380[0]: link [at stop]: B1 01=8c 34=40 -> HDMI, HDCP absent | B2 0b=5a 0c=00 0e=10 48=d2, input colorspace YUV444
+[48067.296824] mz0380[0]: stop buf[0] @0x0000000100000000 head=aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa | 0/1024 sampled pages touched, last @0x0 | 0 frame(s) delivered from it
+[48067.296837] mz0380[0]: stop buf[1] @0x0000000200000000 head=aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa | 0/1024 sampled pages touched, last @0x0 | 0 frame(s) delivered from it
+[48067.296852] mz0380[0]: stop buf[2] @0x0000000300000000 head=aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa | 0/1024 sampled pages touched, last @0x0 | 0 frame(s) delivered from it
+[48067.296865] mz0380[0]: stop buf[3] @0x0000000400000000 head=aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa aa | 0/1024 sampled pages touched, last @0x0 | 0 frame(s) delivered from it
+[48067.297572] mz0380[0]: stop raw bank0 op0x02 buf[0] @0x0000000900000000 extent=0x10 (16 bytes), 1/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=5b 5b 59 57 56 56 58 56 57 5a 5a 5b 5c 5c 5b 5b
+[48067.298286] mz0380[0]: stop raw bank0 op0x02 buf[1] @0x0000000a00000000 extent=0x10 (16 bytes), 1/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=5b 5b 5a 58 56 58 58 57 58 5a 5a 5c 5c 5c 5a 5a
+[48067.299016] mz0380[0]: stop raw bank0 op0x02 buf[2] @0x0000000b00000000 extent=0x10 (16 bytes), 1/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=5b 5b 5a 58 56 58 58 57 58 5a 5a 5c 5c 5c 5a 5a
+[48067.299760] mz0380[0]: stop raw bank0 op0x02 buf[3] @0x0000000c00000000 extent=0x10 (16 bytes), 1/1126 sampled pages touched, poison=0xa5, completions=0 delivered=0 last_completion_extent=0x0, head=5b 5b 59 57 56 56 58 56 57 5a 5a 5b 5c 5c 5b 5b
+[48067.300564] mz0380[0]: stop raw bank1 op0x08 buf[0] @0x0000000d00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[48067.301346] mz0380[0]: stop raw bank1 op0x08 buf[1] @0x0000000e00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[48067.302157] mz0380[0]: stop raw bank1 op0x08 buf[2] @0x0000000f00000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[48067.302985] mz0380[0]: stop raw bank1 op0x08 buf[3] @0x0000001000000000 extent=0x0 (0 bytes), 0/1126 sampled pages touched, poison=0x5a, completions=0 delivered=0 last_completion_extent=0x0, head=5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a
+[48067.303125] mz0380[0]: stop H.264 window1 buf[0] @0x0000000500000000 extent=0x4864a (296522 bytes), 73/256 sampled pages touched, 15 access unit(s) delivered, head=64 00 00 00 00 00 00 00 01 00 00 00 01 00 00 00
+[48067.303132] mz0380 H.264 header: 00000000: 64 00 00 00 00 00 00 00 01 00 00 00 01 00 00 00
+[48067.303134] mz0380 H.264 header: 00000010: 64 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff
+[48067.303135] mz0380 H.264 header: 00000020: ff ff ff ff ef ff ff ff ff ff ff ff ff ff ff ff
+[48067.303136] mz0380 H.264 header: 00000030: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303137] mz0380 H.264 header: 00000040: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303138] mz0380 H.264 header: 00000050: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303139] mz0380 H.264 header: 00000060: ff ff ff ff ff ff ff fe ff ff ff ff ff ff ff ff
+[48067.303140] mz0380 H.264 header: 00000070: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303141] mz0380 H.264 +0x1000: 00000000: 00 00 00 01 21 e2 00 04 03 00 00 03 00 00 19 dc
+[48067.303142] mz0380 H.264 +0x1000: 00000010: 38 70 ec 04 46 30 0b d0 00 00 03 00 00 04 a9 8b
+[48067.303143] mz0380 H.264 +0x1000: 00000020: 15 04 00 00 03 01 0e f9 38 d8 00 00 03 00 48 a0
+[48067.303144] mz0380 H.264 +0x1000: 00000030: 5d ee d1 42 a0 3e dc 6d ab 70 04 47 32 0d 2d 00
+[48067.303145] mz0380 H.264 +0x1000: 00000040: 02 fe c7 f1 8a 17 45 4b ae 41 ba 84 60 ce 26 81
+[48067.303146] mz0380 H.264 +0x1000: 00000050: 1b 3f e2 fb ec 9d 92 de 0b 7e 8e 80 00 e2 8d f8
+[48067.303147] mz0380 H.264 +0x1000: 00000060: 00 77 fb 20 15 3b 32 70 39 19 d1 e5 d0 70 e3 81
+[48067.303148] mz0380 H.264 +0x1000: 00000070: 14 29 a0 6d 1f eb ef 85 31 61 5c 67 af 19 26 7e
+[48067.303299] mz0380[0]: stop H.264 window1 buf[1] @0x0000000600000000 extent=0x9466 (37990 bytes), 10/256 sampled pages touched, 15 access unit(s) delivered, head=21 11 00 00 00 00 00 00 06 00 00 00 02 00 00 00
+[48067.303304] mz0380 H.264 header: 00000000: 21 11 00 00 00 00 00 00 06 00 00 00 02 00 00 00
+[48067.303305] mz0380 H.264 header: 00000010: 21 11 00 00 00 00 00 00 ff ff ff ff ff ff ff ff
+[48067.303306] mz0380 H.264 header: 00000020: ff ff ff ff ef ff ff ff ff ff ff ff ff ff ff ff
+[48067.303307] mz0380 H.264 header: 00000030: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303308] mz0380 H.264 header: 00000040: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303309] mz0380 H.264 header: 00000050: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303310] mz0380 H.264 header: 00000060: ff ff ff ff ff ff ff fe ff ff ff ff ff ff ff ff
+[48067.303311] mz0380 H.264 header: 00000070: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303312] mz0380 H.264 +0x1000: 00000000: 00 00 00 01 21 e1 a0 03 43 01 59 8a 77 81 c0 f7
+[48067.303313] mz0380 H.264 +0x1000: 00000010: fb 4e 43 41 db eb fa 3e 01 c4 45 ef 8a c6 d5 46
+[48067.303314] mz0380 H.264 +0x1000: 00000020: b4 66 9f a4 98 be 0e a6 5a 72 f4 50 28 51 18 a6
+[48067.303315] mz0380 H.264 +0x1000: 00000030: 4c f5 eb 71 ca 56 15 a5 35 77 bb c7 bd bb 75 14
+[48067.303316] mz0380 H.264 +0x1000: 00000040: 91 5e 6b 89 c4 66 a8 62 df cd 97 56 a9 53 d5 75
+[48067.303317] mz0380 H.264 +0x1000: 00000050: cd ce 74 3b 80 3f d6 1d cc fa 40 18 be 32 ad e8
+[48067.303318] mz0380 H.264 +0x1000: 00000060: a4 3b a6 9d cc fc ff 7d 81 d1 e0 6c 5a a7 d1 a6
+[48067.303319] mz0380 H.264 +0x1000: 00000070: ba 99 75 7d cf 32 2d 41 b3 78 ef 6e 13 d5 f4 8a
+[48067.303496] mz0380[0]: stop H.264 window1 buf[2] @0x0000000700000000 extent=0x1298 (4760 bytes), 2/256 sampled pages touched, 15 access unit(s) delivered, head=99 00 00 00 00 00 00 00 07 00 00 00 03 00 00 00
+[48067.303500] mz0380 H.264 header: 00000000: 99 00 00 00 00 00 00 00 07 00 00 00 03 00 00 00
+[48067.303501] mz0380 H.264 header: 00000010: 99 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff
+[48067.303502] mz0380 H.264 header: 00000020: ff ff ff ff ef ff ff ff ff ff ff ff ff ff ff ff
+[48067.303503] mz0380 H.264 header: 00000030: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303504] mz0380 H.264 header: 00000040: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303505] mz0380 H.264 header: 00000050: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303506] mz0380 H.264 header: 00000060: ff ff ff ff ff ff ff fe ff ff ff ff ff ff ff ff
+[48067.303507] mz0380 H.264 header: 00000070: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303508] mz0380 H.264 +0x1000: 00000000: 00 00 00 01 21 e1 c0 03 83 00 00 03 00 00 19 dc
+[48067.303509] mz0380 H.264 +0x1000: 00000010: 38 96 9f e8 a3 00 3d e0 83 47 ad d8 00 00 03 00
+[48067.303510] mz0380 H.264 +0x1000: 00000020: 0b 4c 22 6a 00 00 03 00 00 03 00 00 03 00 00 15
+[48067.303511] mz0380 H.264 +0x1000: 00000030: db a8 34 80 dc 00 00 03 00 65 af b0 ce b8 23 80
+[48067.303512] mz0380 H.264 +0x1000: 00000040: e5 11 30 4f dc d3 bf e6 b6 72 ad dd b1 30 cb 87
+[48067.303513] mz0380 H.264 +0x1000: 00000050: d0 91 a0 cb ba e0 59 b1 a1 61 9c 60 e0 8a bc c9
+[48067.303514] mz0380 H.264 +0x1000: 00000060: 5d 84 89 f1 e8 e4 41 10 8c 05 25 ec 67 2a bf 6c
+[48067.303515] mz0380 H.264 +0x1000: 00000070: 18 c5 d0 2c 3a 19 16 c1 36 2e dc 4e 1c 95 2a 55
+[48067.303668] mz0380[0]: stop H.264 window1 buf[3] @0x0000000800000000 extent=0x9a14 (39444 bytes), 10/256 sampled pages touched, 15 access unit(s) delivered, head=7b 07 00 00 00 00 00 00 08 00 00 00 04 00 00 00
+[48067.303672] mz0380 H.264 header: 00000000: 7b 07 00 00 00 00 00 00 08 00 00 00 04 00 00 00
+[48067.303673] mz0380 H.264 header: 00000010: 7b 07 00 00 00 00 00 00 ff ff ff ff ff ff ff ff
+[48067.303674] mz0380 H.264 header: 00000020: ff ff ff ff ef ff ff ff ff ff ff ff ff ff ff ff
+[48067.303675] mz0380 H.264 header: 00000030: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303676] mz0380 H.264 header: 00000040: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303677] mz0380 H.264 header: 00000050: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303678] mz0380 H.264 header: 00000060: ff ff ff ff ff ff ff fe ff ff ff ff ff ff ff ff
+[48067.303679] mz0380 H.264 header: 00000070: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+[48067.303680] mz0380 H.264 +0x1000: 00000000: 00 00 00 01 21 e1 e0 03 c3 05 f3 93 52 54 bb 12
+[48067.303681] mz0380 H.264 +0x1000: 00000010: b3 44 40 3e 74 0f f4 7d bd d3 2d d6 48 59 c4 5b
+[48067.303682] mz0380 H.264 +0x1000: 00000020: f2 ab 87 31 1a 52 0a 03 00 a1 90 94 b6 2c 11 1f
+[48067.303683] mz0380 H.264 +0x1000: 00000030: 12 20 cd c8 66 5d ef 3a f8 11 0b b9 cf f7 1a 62
+[48067.303684] mz0380 H.264 +0x1000: 00000040: f2 2f 18 1c 0a a3 b4 16 7e 58 ae 43 29 bb 37 8f
+[48067.303685] mz0380 H.264 +0x1000: 00000050: 95 fe 3d 14 3a 5a d6 05 d1 44 52 5a c1 d2 75 ae
+[48067.303686] mz0380 H.264 +0x1000: 00000060: 89 a3 d0 51 06 7c 27 d0 e4 75 5d 27 ea 4c 67 96
+[48067.303687] mz0380 H.264 +0x1000: 00000070: cf fd 98 0c cd 87 a6 9a 4b 2d 1b 5a f9 8a 71 6a
+[48067.303688] mz0380[0]: H.264 V4L2 totals: 60 delivered, 0 dropped for lack of a userspace buffer
+[48067.305341] mz0380 driver unloaded
