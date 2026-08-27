@@ -4,76 +4,68 @@ _Last updated 2026-08-27. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: run M211 once, after a mains-off power cycle
+## Immediate task: power-cycle, then run M212 over a CHANGING scene
 
-M209 and M210 are both spent and both answered. Neither started the card's
-producer, and neither wrote a single byte into the eight `op 0x02`/`op 0x08`
-slots. Logs: `docs/m209-raw-only-2026-08-27.log`,
-`docs/m210-enc-tail-2026-08-27.log`.
+The raw ring is alive. M210b and M211 (2026-08-27, logs
+`docs/m210b-tail-plus-op6-2026-08-27.log` and
+`docs/m211-raw-observe-2026-08-27.log`) settled three things and reopened one.
 
-M209 sent `op 0x06` on the raw-only topology: `irq_total=8 frame_events=0`, the
-seeded BAR0 sentinel untouched, `enc[0x50]=0`. M210 added the whole Windows
-encoder tail - `SET_VIC 1, SET_ENC_PARAMS 2, SET_PREVIEW_PARAMS 1, op06 0` -
-and the result was byte-identical: `events=0 slots_seen=0x00`, every slot
-`extent=0x0` with `0/1126 sampled pages touched`.
+**The producer needs the encoder tail AND `op 0x06`.** M209 sent op06 without
+the tail and got nothing; M210 sent the tail without op06 and got nothing;
+M210b sent both and got 209 completions. The conclusion drawn from M210 - that
+the missing `op 0x04` was the last variable - is retired. op04 was never it.
 
-One structural difference remains against the encoded path that delivers 60 fps
-today: those runs never registered `op 0x04`. So the earlier reasoning was
-wrong - for this firmware a missing sink evidently does stop the producer,
-which is consistent with tinyvenc validating its complete output set before
-starting, and with Windows registering `op 0x02`, `op 0x08` and `op 0x04`
-together on every start.
+**Only the `op 0x02` bank rotates.** Tokens cycled `a5a5a5a0..a3` (our sentinel
+with the low nibble replaced), `slots_seen` never exceeded `0x0f`, and all four
+`op 0x08` slots ended poison-intact across both runs. The M209 static claim of
+an eight-slot `token % 8` ring is not what this firmware does on the Linux
+sequence; do not repeat it as confirmed.
 
-**Correction, same day:** the operator's known-good 60 fps load is
-`VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0
-H264DIVISOR=0 PERSIST=1`. It fires `op 0x06` after the tail, which M210
-suppressed - so the M210 run differed from the working sequence by op06 as well
-as op04, and does not isolate op04 on its own. The first run to make is
-therefore M210 with op06 restored:
+**`op 0x04` is irrelevant to the raw ring.** M211 ran the operator's working
+configuration with the encoded path fully alive - 60 H.264 frames, 891,529
+bytes, clean IDR - and the raw banks behaved identically to M210b.
 
-```
-sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh
-```
+**What is left is the old 16-byte stall.** Every one of the 209 completions
+wrote `extent=0x10` and stopped: `bad_extents=209 exact_frames=0`,
+`1/1126 sampled pages touched`. This is M91/M107/M128a's signature, now
+reproduced on a path that is otherwise fully alive.
 
-Only if that is also negative does M211 become the next question. Note also
-that `mz0380-live.sh` defaults are not the working configuration - `vic_fw`
-defaults to 5, `win_seq` to 0, `poll_drain_ms` to 20 - so every harness names
-the full knob set explicitly. An unnamed knob in this tree is a wrong knob.
-
-M211 inverts the experiment: ride the working encoded path and watch the raw
-banks passively. `raw_bank_observe` registers the eight `0x466000` buffers
-through `op 0x02`/`op 0x08` alongside the live `op 0x04` window, poisons them,
-and reads their extents back at stop. V4L2 still negotiates H.264 and
-completion routing is untouched, so nothing about the observation can perturb
-what it measures. It is implemented, dual-kernel build-checked, and unspent.
+The open question is M128a's, still unanswered: are those sixteen bytes source
+pixels, or a broken transfer of buffer residue? They are a dithered mid-dark
+grey (`5a`-`5e`) that differs per slot and per run, which is suggestive and
+proves nothing. `raw_bank_observe` now samples each `op 0x02` slot head on
+every encoded completion and logs it when it changes, so one bounded run
+answers it:
 
 ```
 sudo ./mz0380-m211-raw-observe.sh
 ```
 
-Any slot with a non-zero extent after confirmed encoded delivery means the raw
-surface is a by-product of the configured encoder pipeline, and native V4L2
-negotiation can be built on it. Eight pristine slots after real encoded frames
-means the `op 0x02`/`op 0x08` ring is not the Linux raw source, and the step
-after that is static work in the Windows binary, not another start.
+**Point the camera at something that visibly changes while it runs** - wave a
+hand across the lens, cover it, swing from a lamp to a dark corner. The encoded
+`.h264` the run captures is the visual record of what the camera saw, so the
+head samples can be compared against it directly. Sixteen bytes that track the
+scene are pixels, and the bug becomes "the DMA dies after one burst" - which is
+tractable. Sixteen bytes that sit still while the scene moves mean the raw path
+is not capturing at all.
 
-**Power-cycle first.** The tally read 7 at the end of 2026-08-27 against
-roughly 4 real spawns - `mz0380-live.sh` commits the tally itself in
-`do_unload()`, so the manual `./mz0380-spawns.sh add 1` after each run
-double-counted. Do not add it manually again. After a mains-off cycle:
+**Power-cycle first.** The tally reads 10, inside the historical 8-18 wedge
+range. After a mains-off cycle:
 
 ```
 sudo ./mz0380-spawns.sh reset
 ```
 
-Source state: the camera currently outputs 1080p30 (`QUERY_DV_TIMINGS` reports
-`74250000 Hz (30.00 fps)`, `CTA-861 VIC: 34`). M211 has no refresh guard - the
-encoded path runs at any rate - so it needs no `FPS30`. Check the source
-whenever a rate-sensitive run is planned; it is free and sends no `SET_VIC`:
+Do not run `./mz0380-spawns.sh add` - `mz0380-live.sh` commits the tally itself
+in `do_unload()`, and the manual repairs earlier in this session inflated it.
 
-```
-sudo ./mz0380-source-check.sh
-```
+One thing measured but not concluded: the 209 raw completions arrived every
+16.3 ms - about 61/s - while the receiver measured 30 fps and the encoded path
+delivered 60 frames in roughly 3 s. Those three numbers do not agree. M105
+records a `hper=337 vper=299` artifact during re-lock, which is exactly what
+this camera reads, so the possibility that the source is really 60 Hz and the
+`vperiod` decode is halved is open. Measure it deliberately before building on
+either reading.
 
 The product architecture remains unchanged: installed PCI modalias autoload,
 generic V4L2 registration at probe, application-owned format negotiation, and

@@ -386,6 +386,10 @@ struct mz0380_dev {
 		size_t last_extent;
 		u32 completions;
 		u32 delivered;
+		/* M212: last sampled head, for the "are these pixels" control. */
+		u8 observed_head[16];
+		bool observed_valid;
+		u64 observed_changes;
 	} raw_probe_bufs[MZ0380_RAW_PROBE_NR_BUFS];
 	u64 raw_probe_events;
 	u64 raw_probe_full_frames;

@@ -14,6 +14,13 @@
 # routing and delivery are untouched, and the raw banks are only poisoned,
 # registered, and read back at stop.
 #
+# It also samples the first sixteen bytes of each op02 slot on every encoded
+# completion (M212) and logs them when they change.  Point the camera at
+# something that visibly changes - wave a hand, cover the lens, swing it from a
+# lamp to a dark corner - and those samples answer M128a's open question:
+# sixteen bytes that track the scene are source pixels, which makes this a DMA
+# that dies after one burst rather than a capture that never happens.
+#
 # Scoring is the poison: if any op02/op08 slot reports a non-zero extent after a
 # live encoded capture, the raw surface exists and is a by-product of the
 # encoded pipeline.  If all eight are pristine, the ring is not the Linux raw
@@ -116,6 +123,17 @@ echo "M211 result:"
 grep -E 'stop raw bank' "$DMESG_OUT" | sed 's/^.*mz0380\[0\]: /  /' | \
 	sed 's/, head=.*//'
 
+# M212: did those sixteen bytes move while the scene did?  Distinct head values
+# across the run are what separates "source pixels" from "buffer residue".
+HEAD_CHANGES=$(grep -c 'M212 raw slot' "$DMESG_OUT")
+DISTINCT_HEADS=$(grep 'M212 raw slot' "$DMESG_OUT" | sed 's/.*: //' | sort -u | wc -l)
+if [ "$HEAD_CHANGES" -gt 0 ]; then
+	echo
+	echo "  --- M212 head samples (first/last few) ---"
+	grep 'M212 raw slot' "$DMESG_OUT" | sed 's/^.*mz0380\[0\]: /  /' | head -4
+	grep 'M212 raw slot' "$DMESG_OUT" | sed 's/^.*mz0380\[0\]: /  /' | tail -4
+fi
+
 SETVIC_COUNT=$(grep -c 'stream start: SET_VIC(' "$DMESG_OUT")
 H264_FRAMES=$(sed -n 's/.*H.264 V4L2 totals: \([0-9]\+\) delivered.*/\1/p' \
 	"$DMESG_OUT" | tail -1)
@@ -125,6 +143,7 @@ TOUCHED=$(grep -c 'stop raw bank.* extent=0x[1-9a-f]' "$DMESG_OUT")
 echo "  SET_VIC count    : $SETVIC_COUNT (expected: 1)"
 echo "  H.264 delivered  : $H264_FRAMES (the encoded path must actually run)"
 echo "  raw slots written: $TOUCHED of 8"
+echo "  head changes     : $HEAD_CHANGES ($DISTINCT_HEADS distinct values)"
 echo "  encoded capture  : $RAW_OUT ($(stat -c %s "$RAW_OUT") bytes)"
 echo "  kernel log       : $DMESG_OUT"
 
@@ -139,6 +158,18 @@ if [ "$TOUCHED" -gt 0 ]; then
 	echo "POSITIVE: the op02/op08 raw banks receive DMA while the encoded pipeline"
 	echo "runs.  Record the extents and tokens; the raw surface is a by-product of"
 	echo "the configured encoder, not an independent capture path."
+	if [ "$HEAD_CHANGES" -gt 0 ]; then
+		echo
+		echo "The sixteen bytes MOVED during the run ($DISTINCT_HEADS distinct"
+		echo "values).  If the scene was changing, they are source pixels and the"
+		echo "bug is a DMA that dies after one burst - compare them against"
+		echo "$RAW_OUT, which is what the camera saw."
+	else
+		echo
+		echo "The sixteen bytes never changed.  Either the scene was static or"
+		echo "they are not pixels; re-run over a deliberately changing scene"
+		echo "before concluding either way."
+	fi
 	exit 0
 fi
 

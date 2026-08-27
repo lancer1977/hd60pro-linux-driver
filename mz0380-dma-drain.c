@@ -413,6 +413,52 @@ mz0380_drain_h264_snapshot(struct mz0380_dev *dev,
 	mutex_unlock(&dev->h264_delivery_lock);
 }
 
+/*
+ * M212: the control M128a asked for and never got.
+ *
+ * Every run that reaches the raw ring writes exactly sixteen bytes and stops -
+ * 0x11 in the splash era, 0x53 in M128a, 0x5a..0x5e tonight.  Whether those are
+ * source pixels or a broken transfer of whatever sat in the buffer has never
+ * been settled, and it decides which bug this is: a capture that works and a
+ * transfer that dies after one burst, or no capture at all.
+ *
+ * In observation mode nothing routes completions to the raw ring, so the only
+ * view of those bytes was the read-back at stop - one sample, after the fact.
+ * Sampling them alongside each encoded completion turns a bounded run over a
+ * changing scene into the answer: bytes that track the source are pixels.
+ *
+ * Sixteen bytes per encoded frame across four slots is nothing next to the DMA
+ * this path already does, and it only ever reads.
+ */
+static void mz0380_raw_observe_sample(struct mz0380_dev *dev)
+{
+	unsigned int i;
+
+	if (!mz0380_raw_bank_observe)
+		return;
+
+	dma_rmb();
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		struct mz0380_raw_probe_buf *b = &dev->raw_probe_bufs[i];
+		u8 head[sizeof(b->observed_head)];
+
+		if (!b->va)
+			continue;
+		memcpy(head, b->va, sizeof(head));
+		if (b->observed_valid &&
+		    !memcmp(head, b->observed_head, sizeof(head)))
+			continue;
+
+		memcpy(b->observed_head, head, sizeof(head));
+		b->observed_valid = true;
+		b->observed_changes++;
+		pr_info_ratelimited("%s: M212 raw slot %u head changed (#%llu): %16phN\n",
+				    dev->name, i,
+				    (unsigned long long)b->observed_changes,
+				    b->observed_head);
+	}
+}
+
 static void
 mz0380_drain_raw_probe_snapshot(struct mz0380_dev *dev,
 				const struct mz0380_frame_event *snapshot)
@@ -534,6 +580,7 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 
 	if (mz0380_h264_probe) {
 		mz0380_drain_h264_snapshot(dev, snapshot);
+		mz0380_raw_observe_sample(dev);
 		return;
 	}
 

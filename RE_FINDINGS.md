@@ -12877,3 +12877,97 @@ sequence is readable in one place.
    needed; a negative isolates op04 properly, which M210 as first run did not.
 2. `sudo ./mz0380-m211-raw-observe.sh` - the working sequence *with* op04, raw
    banks observed passively alongside it.
+
+---
+
+## M210b + M211 (hardware, 2026-08-27): the producer runs, and the blocker is the old 16-byte stall
+
+Two runs, both on the 1080p30 camera. Logs:
+`docs/m210b-tail-plus-op6-2026-08-27.log`, `docs/m211-raw-observe-2026-08-27.log`.
+
+### The producer needs the encoder tail AND op 0x06 - neither alone
+
+`sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh` produced **209 completions**
+where M209 and M210 produced none. Lining the three up:
+
+| run | encoder tail | op 0x06 | result |
+|---|---|---|---|
+| M209 | no | yes | `events=0`, all eight slots poison-intact |
+| M210 | yes | no | `events=0`, all eight slots poison-intact |
+| M210b | yes | yes | 209 completions rotating op02 slots 0..3 |
+
+So `op 0x06` alone does not start the producer and the Windows tail alone does
+not either; the pair does. This also retires the conclusion drawn from M210
+that "only the missing op04 is left" - op04 was never the discriminator.
+
+### Only the op02 bank rotates - op08 is never written
+
+Tokens arrived as `a5a5a5a0`, `a5a5a5a1`, `a5a5a5a2`, `a5a5a5a3` - our seeded
+`a5a5a5a5` sentinel with only the low nibble replaced, cycling 0..3 - and
+`slots_seen` never exceeded `0x0f` across 209 events. All four `op 0x08` slots
+ended `extent=0x0`, `0/1126 sampled pages touched`, poison intact.
+
+The M209 static reading said this board selects `token % 8` across two banks
+when all eight buffers exist. On the Linux command sequence it demonstrably
+uses four. Either the eight-slot mode needs something we do not send, or the
+`% 8` branch is not the one this firmware takes; the static claim should not be
+repeated as if hardware had confirmed it.
+
+### Every write is exactly 16 bytes - the M91/M107/M128a stall
+
+`extent=0x10` on every one of the 209 completions, `1/1126 sampled pages
+touched`, `bad_extents=209`, `exact_frames=0`. This is the long-standing
+16-byte stall signature, and it is now reproduced on the raw ring itself.
+
+The bytes are not the splash and not a constant:
+
+```
+M91   (splash-era):  11 11 11 11 10 10 11 11 11 11 11 11 11 11 11 11
+M128a (0x53 field):  a dithered flat field at 0x53
+M210b slot0:         5e 5e 5d 5d 5a 5a 5b 5a 5c 5c 5c 5e 5e 5e 5e 5e
+M210b slot1:         5d 5d 5d 5d 5c 5a 5a 5c 5d 5c 5c 5c 5e 5d 5d 5e
+M211  slot0/slot3:   5d 5d 5b 5a 5a 5a 5b 5d 5c 5c 5d 5e 5d 5d 5d 5c
+M211  slot1/slot2:   5c 5c 5c 59 5a 5c 5b 5c 5b 5c 5d 5d 5d 5d 5d 5d
+```
+
+Dithered mid-dark grey around 0x5a-0x5e, differing per slot and between runs.
+That is what a dark camera scene looks like as luma, and M128a's control
+question - "are these pixels or a broken transfer of whatever was in the
+buffer" - is still the right question. It has not been answered, and these
+values do not answer it either.
+
+### M211: the encoded path does not change any of it
+
+`sudo ./mz0380-m211-raw-observe.sh` ran the operator's working configuration
+with `op 0x04` live and the raw banks observed passively. The encoded path
+worked - **60 H.264 frames delivered, 891,529 bytes, clean IDR** - and the raw
+banks behaved exactly as in M210b: four `op 0x02` slots at `extent=0x10`, all
+four `op 0x08` slots pristine.
+
+So registering and consuming `op 0x04` neither enables nor disturbs the raw
+ring. The raw path's problem is not a missing sink. It is that the transfer
+stops after one 16-byte burst - the same failure the splash-era runs hit, now
+visible on a path that is otherwise fully alive.
+
+### Cadence, and one thing not to conclude yet
+
+The 209 raw completions arrived every 16.3 ms on average - about 61 per second
+- while the encoder was configured for the 30 fps the receiver measured. That
+is worth noticing but not worth concluding from: it could mean the source is
+really 60 Hz and the `vperiod` decode is halved (M105 records a
+`hper=337 vper=299` artifact during re-lock, exactly the numbers this camera
+produces), or it could mean the card emits two records per frame. The 60 H.264
+frames in the M211 window work out to roughly 20 fps, which matches neither
+cleanly. Measure it deliberately before building on it.
+
+### Next: answer M128a's control, which is still open
+
+The question is unchanged since M128a: are those sixteen bytes source pixels,
+or a broken transfer of buffer residue? The cheap discriminator M128a proposed
+is still the right one - make the source drastically brighter or darker and see
+whether the bytes track it - and M211 is now the ideal host for it, because the
+encoded stream captured alongside is a visual record of what the camera saw.
+
+`raw_bank_observe` now samples the first sixteen bytes of each `op 0x02` slot
+on every encoded completion and logs them whenever they change, so a single
+bounded run over a changing scene answers it without another start.
