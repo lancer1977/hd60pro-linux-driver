@@ -784,6 +784,17 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 		return -EINVAL;
 	}
 
+	/*
+	 * M210 only means anything on top of the M209 sink topology. Setting it
+	 * alone would silently change nothing, and a bounded hardware run must
+	 * never be scored against a configuration that was not the one intended.
+	 */
+	if (mz0380_raw_probe_enc_tail && !mz0380_raw_bank_probe) {
+		pr_err("%s: raw_probe_enc_tail (M210) requires raw_bank_probe=1; the H.264 path already sends the encoder tail\n",
+		       dev->name);
+		return -EINVAL;
+	}
+
 	ret = mz0380_stream_bufs_alloc(dev);
 	if (ret) {
 		pr_err("%s: stream buffer alloc failed (%d)\n", dev->name, ret);

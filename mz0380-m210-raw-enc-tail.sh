@@ -1,19 +1,31 @@
 #!/bin/bash
-# Bounded M209 op02/op08 raw-bank discriminator.
+# Bounded M210 discriminator: the M209 sink topology WITH the Windows encoder
+# tail.
 #
-# This is intentionally a one-shot hardware experiment.  It loads the driver
-# in raw-only mode, queues eight V4L2 I420 buffers, and stops at the earlier of
-# eight exact frames or two seconds after START_STREAMING.  It never enables
-# h264_probe, and it treats any op04 registration or second SET_VIC as failure.
+# M209 ran the whole raw-only sequence and the card never wrote a frame token:
+# irq_total=8, frame_events=0, the BAR0 sentinel intact, all eight slots still
+# poisoned.  op 0x06 alone does not start this firmware's producer.  Raw-only
+# differed from the working 60 fps H.264 start in two ways - no op04 sink and
+# no encoder tail - and only the tail can explain a dead producer.
+#
+# This run changes exactly that one variable: identical eight-slot op02/op08
+# topology, still no op04, plus SET_ENC_PARAMS x2 and SET_PREVIEW_PARAMS sent
+# byte for byte as the H.264 path sends them.  Windows does not send op 0x06
+# when the tail is present, so neither does this; the deadline therefore starts
+# at SET_PREVIEW_PARAMS instead.
+#
+# One-shot: it stops at the earlier of eight exact frames or two seconds after
+# the tail completes, never enables h264_probe, and treats any op04
+# registration or second SET_VIC as failure.
 set -u
 cd "$(dirname "$0")"
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 command -v v4l2-ctl >/dev/null || { echo "v4l2-ctl is required"; exit 1; }
 
 KEEPLOADED=${KEEPLOADED:-0}
-CAPTURE_LOG=$(mktemp /tmp/mz0380-m209-v4l2.XXXXXX.log) || exit 1
-RAW_OUT=$(mktemp /tmp/mz0380-m209.XXXXXX.i420) || exit 1
-DMESG_OUT=/tmp/mz0380-m209-dmesg.txt
+CAPTURE_LOG=$(mktemp /tmp/mz0380-m210-v4l2.XXXXXX.log) || exit 1
+RAW_OUT=$(mktemp /tmp/mz0380-m210.XXXXXX.i420) || exit 1
+DMESG_OUT=/tmp/mz0380-m210-dmesg.txt
 CAPTURE_PID=""
 
 # The first M209 run wedged the harness itself: v4l2-ctl sat in an
@@ -62,8 +74,8 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "Loading the isolated M209 topology (no stream is started by load)..."
-H264PROBE=0 RAWBANKS=1 POLLDRAIN=0 VICFW=7 WINSEQ=1 WINBUFS=1 \
+echo "Loading the M210 topology (raw sinks + encoder tail; load starts nothing)..."
+H264PROBE=0 RAWBANKS=1 RAWTAIL=1 POLLDRAIN=0 VICFW=7 WINSEQ=1 WINBUFS=1 \
 	OP6=0 PERSIST=0 NOSG=0 ./mz0380-live.sh load || exit 1
 
 NODE=""
@@ -74,19 +86,20 @@ for name_file in /sys/class/video4linux/video*/name; do
 	NODE="/dev/${node##*/}"
 	break
 done
-[ -n "$NODE" ] || { echo "M209 video node not found"; exit 1; }
+[ -n "$NODE" ] || { echo "M210 video node not found"; exit 1; }
 
-echo "Capturing from $NODE; deadline starts when the sole op06 is logged."
+echo "Capturing from $NODE; deadline starts when SET_PREVIEW_PARAMS is logged."
 v4l2-ctl -d "$NODE" --set-fmt-video=width=1920,height=1080,pixelformat=YU12 \
 	--stream-mmap=8 --stream-count=8 --stream-to="$RAW_OUT" \
 	>"$CAPTURE_LOG" 2>&1 &
 CAPTURE_PID=$!
 
-# STREAMON includes the Windows-order 1.9 s settle.  Wait for the actual kick,
-# then enforce the requested two-second live window rather than charging that
-# setup time against the discriminator.
+# STREAMON includes the Windows-order 1.9 s settle.  Wait for the tail, which
+# is the kick on this path, then enforce the requested two-second live window
+# rather than charging that setup time against the discriminator.
+START_MARK='stream start: SET_PREVIEW_PARAMS'
 START_DEADLINE=$(( $(date +%s%3N) + 7000 ))
-while ! dmesg | grep -q 'stream start: START_STREAMING(op 0x06) fired'; do
+while ! dmesg | grep -q "$START_MARK"; do
 	if ! kill -0 "$CAPTURE_PID" 2>/dev/null; then
 		break
 	fi
@@ -96,7 +109,7 @@ while ! dmesg | grep -q 'stream start: START_STREAMING(op 0x06) fired'; do
 	sleep 0.02
 done
 
-if dmesg | grep -q 'stream start: START_STREAMING(op 0x06) fired'; then
+if dmesg | grep -q "$START_MARK"; then
 	LIVE_DEADLINE=$(( $(date +%s%3N) + 2000 ))
 	while kill -0 "$CAPTURE_PID" 2>/dev/null; do
 		dmesg | grep -q 'M209 raw discriminator SUCCESS' && break
@@ -110,26 +123,39 @@ save_evidence
 
 SETVIC_COUNT=$(dmesg | grep -c 'stream start: SET_VIC(')
 OP04_COUNT=$(dmesg | grep -c 'H.264 probe registered dedicated window1 ring')
+ENC_COUNT=$(dmesg | grep -c 'stream start: SET_ENC_PARAMS(')
+POST_COUNT=$(dmesg | grep -c 'stream start: SET_PREVIEW_PARAMS(')
+OP06_COUNT=$(dmesg | grep -c 'stream start: START_STREAMING(op 0x06) fired')
 SUCCESS=0
 if dmesg | grep -q 'M209 raw discriminator SUCCESS' &&
-   [ "$SETVIC_COUNT" -eq 1 ] && [ "$OP04_COUNT" -eq 0 ]; then
+   [ "$SETVIC_COUNT" -eq 1 ] && [ "$OP04_COUNT" -eq 0 ] &&
+   [ "$ENC_COUNT" -eq 2 ] && [ "$POST_COUNT" -eq 1 ] &&
+   [ "$OP06_COUNT" -eq 0 ]; then
 	SUCCESS=1
 fi
 
 echo
-echo "M209 result:"
-dmesg | grep -E 'M209 raw completion|M209 raw discriminator|M209 raw V4L2 totals' | tail -20
+echo "M210 result:"
+dmesg | grep -E 'M210:|M209 raw completion|M209 raw discriminator|M209 raw V4L2 totals' | tail -24
 echo "  SET_VIC count : $SETVIC_COUNT (required: 1)"
 echo "  op04 count    : $OP04_COUNT (required: 0)"
+echo "  SET_ENC count : $ENC_COUNT (required: 2)"
+echo "  POST_PROC cnt : $POST_COUNT (required: 1)"
+echo "  op06 count    : $OP06_COUNT (required: 0, Windows omits it with the tail)"
 echo "  raw capture   : $RAW_OUT ($(stat -c %s "$RAW_OUT") bytes)"
 echo "  v4l2-ctl log  : $CAPTURE_LOG"
 echo "  kernel log    : $DMESG_OUT"
 echo "  v4l2-ctl says : $(tr '\n' ' ' < "$CAPTURE_LOG")"
 
 if [ "$SUCCESS" -eq 1 ]; then
-	echo "PASS: eight consecutive 0x2f7600 writes covered all op02/op08 slots."
+	echo "PASS: with the encoder tail present, eight consecutive 0x2f7600 writes"
+	echo "covered all op02/op08 slots.  The raw surface is a product of the"
+	echo "configured encoder pipeline; native V4L2 negotiation can be built on it."
 	exit 0
 fi
 
 echo "INCONCLUSIVE/FAIL: the bounded success oracle was not met; inspect the lines above."
+echo "If the tail was sent (SET_ENC=2, POST_PROC=1) and the banks are still"
+echo "poisoned with frame_events=0, the producer needs the op04 sink to exist at"
+echo "all - see the M210 section in RE_FINDINGS.md for the run after this one."
 exit 1

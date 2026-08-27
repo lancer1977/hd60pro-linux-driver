@@ -166,6 +166,7 @@ load)
 	add_opt h264_probe      "${H264PROBE:-}"
 	add_opt persistent_h264 "${PERSIST:-}"
 	add_opt raw_bank_probe  "${RAWBANKS:-}"
+	add_opt raw_probe_enc_tail "${RAWTAIL:-}"
 	add_opt post_mask       "${POSTMASK:-}"
 	add_opt mst_win_output  "${MSTOUT:-}"
 	add_opt mst_ad          "${MSTAD:-}"

@@ -1,47 +1,92 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-26. Full history in **RE_FINDINGS.md**. This file is the
+_Last updated 2026-08-27. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: implement one raw-only discriminator; do not run it yet
+## Immediate task: run M210 once (raw banks WITH the encoder tail)
 
-M209 closes the Windows raw callback's source statically. On this HD60 Pro
-branch, `0x140280a98` selects `token % 8` from the eight large buffers:
-tokens 0--3 are opcode `0x02` (`context +0x1190..+0x11a8`) and tokens 4--7
-are the independent opcode `0x08` bank (`+0x11b0..+0x11c8`). Opcode `0x04`
-and `0x05` point at later allocation groups and are not the raw callback's
-source.
+M209 was implemented and spent once on hardware, 2026-08-27, on a fresh power
+cycle against a live 1080p60 source. Full log: `docs/m209-raw-only-2026-08-27.log`.
+It is answered - do not re-run it.
 
-Each selected slot is native contiguous planar Y/U/V. At 1080p60 Windows uses
-`fw=7`, so with VBI disabled the exact layout is:
+The topology was exactly right and the result was a clean, total negative. One
+`SET_VIC` (`fw=7 in_fmt=6 out_fmt=0`, `ret=0`), both banks registered and
+re-registered after the spawn, no `op 0x04` anywhere, `START_STREAMING(op 0x06)`
+fired `ret=0` - and then nothing at all for 810 seconds:
 
 ```
-Y: +0x000000 .. +0x1fa3ff  (1920 * 1080)
-U: +0x1fa400 .. +0x278cff  (Y / 4)
-V: +0x278d00 .. +0x2f75ff  (Y / 4)
+irq_total=8 frame_events=0 fifo_drops=0
+token[0x40]=a5a5a5a5 0x44=a5a5a5a5 0x48=a5a5a5a5 0x4c=a5a5a5a5  enc[0x50]=00000000
+M209 raw V4L2 totals: events=0 exact_frames=0 bad_extents=0 slots_seen=0x00
 ```
 
-The frame write is therefore `0x2f7600` / 3,110,400 bytes even though every
-slot is registered at the maximum `0x466000`. The YV12 branch explicitly swaps
-the native U/V pointers into YV12 order, and the packed-output branches convert
-those planar surfaces in the Windows host driver. Windows does not DMA packed
-YUY2 into these banks.
+All eight slots ended `extent=0x0`, `0/1126 sampled pages touched`, poison
+intact. The `irq_total=8` is the setup acknowledgements only. The receiver was
+live the whole time (`R55=0x7f LOCKED`, HDMI, YUV444).
 
-The one next experiment is not another H.264 `RAWBANKS=1` run. First implement
-and dual-kernel build-check an opt-in raw-only start: base raw selection,
-H.264/op04 disabled, eight independently poisoned `0x466000` op02/op08 slots,
-confirmed 1080p60 `fw=7`, and VBI zero. The eventual hardware run is bounded
-to one start and two seconds or eight completions. Continuous success means at
-least eight consecutive token-selected `0x2f7600` Y/U/V writes; a single full
-frame is only the already-known tinyvenc5 result. Do not spend the start while
-the diagnostic is unbuilt, and do not advertise YUYV/NV12/YV12 until it passes.
+That is not "the wrong bank". The card never wrote a frame token into the
+seeded BAR0 `0x40..0x4c` sentinel and `enc[0x50]` stayed zero, so **the producer
+never ran**. `op 0x06` alone does not start this firmware's producer.
+
+Raw-only differs from the working H.264 path in two ways, and only one can
+explain a dead producer: `op 0x04` is not registered (a missing *sink*, which
+cannot suppress generation into the sinks that do exist), and the Windows
+encoder tail is skipped - `mz0380-dma-stream.c` guards `SET_ENC_PARAMS` x2 and
+`POST_PROC` on `!mz0380_raw_bank_probe`. The working 60 fps H.264 path sends
+that tail, and so did the older tinyvenc5 sequence that once produced a single
+complete I420 frame.
+
+M210 is therefore one variable: keep the raw-only sink topology exactly as
+M209 built it - eight independently poisoned `op 0x02`/`op 0x08` buffers, no
+`op 0x04`, confirmed 1080p60 `fw=7`, VBI zero - and restore `SET_ENC_PARAMS`
+x2 plus `POST_PROC` byte-identically to the H.264 path. Bound it the same way:
+one start, two seconds or eight completions.
+
+It is implemented and dual-kernel build-checked; the start is unspent. Run it
+once, on a confirmed live 1080p60 source, and do not retry in a loop:
+
+```
+sudo ./mz0380-m210-raw-enc-tail.sh
+sudo ./mz0380-spawns.sh add 1
+```
+
+The knob is `raw_probe_enc_tail` (`RAWTAIL=1` through `mz0380-live.sh`); it is
+rejected at setup unless `raw_bank_probe=1` is set with it. Because Windows
+omits `op 0x06` once the tail is present, so does this path - the harness
+deadline anchors on `SET_PREVIEW_PARAMS`, and its oracle requires one
+`SET_VIC`, zero `op 0x04`, two `SET_ENC_PARAMS`, one `SET_PREVIEW_PARAMS` and
+zero op06. The driver's raw-completion success line still reads `M209 raw
+discriminator SUCCESS`; that is the shared oracle, not a stale label.
+
+If the banks fill, the raw surface is a by-product of the configured encoder
+pipeline and native V4L2 negotiation can be built on it. If they stay poisoned
+with the tail present, the producer needs the `op 0x04` sink to exist at all,
+and the run after that registers all three windows and watches the raw banks
+alongside a live H.264 stream - which the mutual-exclusion check in
+`mz0380-dma.c` currently forbids and would have to be relaxed for that
+experiment only.
+
+Budget: M209 spent one SET_VIC spawn. The card wedges somewhere in the 8-18
+spawn range per power cycle and `mz0380-spawns.sh` tracks the tally in `/run`,
+which the harness cannot commit because it unloads on its own - repair it with
+`sudo ./mz0380-spawns.sh add 1` after each bounded run.
+
+Harness state: `mz0380-m209-raw-only.sh` no longer hangs. The M209 run wedged
+the script, not the card - `v4l2-ctl` blocked in `DQBUF` on a stream that
+produced nothing and the unbounded `wait` in the cleanup trap held for 13.5
+minutes. Reaping now escalates INT -> TERM -> KILL with a 1.5 s bound per
+signal, warns if the process survives SIGKILL (D-state inside the driver),
+writes `dmesg` to `/tmp/mz0380-m209-dmesg.txt`, chmods all artifacts
+world-readable before teardown, and wraps the unload in `timeout 30`. Reuse
+that shape for M210.
 
 The product architecture remains unchanged: installed PCI modalias autoload,
 generic V4L2 registration at probe, application-owned format negotiation, and
 raw or H.264 setup only at STREAMON. There is no mandatory loopback and no
 kernel H.264 decoder. Windows files remain reverse-engineering references, not
-Linux firmware or runtime dependencies.
+Linux firmware or runtime dependencies. Do not advertise YUYV/NV12/YV12 until a
+bounded run shows repeated full frames.
 
 ## Current development build: hybrid NO SIGNAL recovery (host-only follow-up)
 

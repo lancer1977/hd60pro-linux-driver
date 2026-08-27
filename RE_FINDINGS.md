@@ -12587,3 +12587,111 @@ checked.
 This resolves the static questions but does not yet authorize advertising a
 raw V4L2 format. Native format negotiation remains gated on repeated full
 frames from the bounded raw-only run.
+
+---
+
+## M209 hardware run (2026-08-27): the raw-only start has no producer at all
+
+The bounded raw-only discriminator was spent once, on a fresh card power cycle,
+against a live 1080p60 source. Full log: `docs/m209-raw-only-2026-08-27.log`.
+
+The topology behaved exactly as designed. One `SET_VIC` was sent
+(`fw=7 in_fmt=6 out_fmt=0 -> M209 raw-only output=1920x1080, bitstreams=1`,
+`ret=0`), both banks were registered before it and re-registered after the
+spawn (`op 0x02` at IOVA `0x9..0xc00000000`, `op 0x08` at `0xd..0x1000000000`,
+four independent `0x466000` buffers each, poison `0xa5`/`0x5a`), no `op 0x04`
+window was ever created, and `START_STREAMING(op 0x06)` fired `ret=0`.
+
+Nothing followed. Over the 810 s the node stayed open:
+
+```
+stream stop: EVENT[0x30]=00000000 token[0x40]=a5a5a5a5 0x44=a5a5a5a5
+             0x48=a5a5a5a5 0x4c=a5a5a5a5 enc[0x50]=00000000
+             irq_total=8 frame_events=0 fifo_drops=0
+M209 raw V4L2 totals: events=0 exact_frames=0 bad_extents=0
+                      consecutive_exact=0 slots_seen=0x00
+```
+
+Every one of the eight raw slots ended at `extent=0x0`, `0/1126 sampled pages
+touched`, poison intact, `completions=0`. The `irq_total=8` accounts for the
+setup command acknowledgements only.
+
+This is a stronger negative than M203, and a different one. M203 at least found
+16-byte records in `op 0x02`; here the card never wrote a frame token into
+BAR0 `0x40..0x4c` - the seeded `a5a5a5a5` sentinel survived untouched - and
+`enc[0x50]` stayed zero. The encoder side never ran. The receiver was not the
+problem: `R55=0x7f LOCKED`, HDMI, HDCP absent, input colorspace YUV444, both
+before START and at stop.
+
+The result therefore does not close the op02/op08 ring. It closes something
+else: **`op 0x06` alone does not start this firmware's producer.** The raw-only
+path differs from the working H.264 path in exactly two ways, and only one of
+them can explain a dead producer:
+
+1. `op 0x04` is not registered - a missing *sink*, which cannot stop the card
+   from generating frames into the two sinks that were registered; and
+2. the Windows encoder tail is skipped
+   (`mz0380-dma-stream.c` guards `SET_ENC_PARAMS` x2 and `POST_PROC` on
+   `!mz0380_raw_bank_probe`).
+
+M82 already established that ep.ko routes `0x2d` (45) and `0x31` (49) to the
+same bare `sysfs_notify("epint")` that `0x06` performs, and that Windows never
+sends `0x06` on the capture path. The natural reading of this run is that the
+wake is not the point: the encoder tail *configures the pipeline that produces
+frames*, and the raw planes in `op 0x02`/`op 0x08` are a product of that
+pipeline rather than an independent capture path that bypasses it. The single
+complete I420 frame Linux received through the older tinyvenc5 route arrived on
+a sequence that did send the tail.
+
+One caveat about the stop diagnostics, so it is not misread later: the legacy
+`stop buf[0..3]` lines report `1024/1024 sampled pages touched` with all-zero
+heads. Those buffers are zero-initialised rather than poisoned, so "touched" is
+trivially true for them. They are not evidence of writes.
+
+Harness note: the run wedged the *script*, not the card. `v4l2-ctl` sat in
+`DQBUF` on a stream that produced nothing, `kill -INT` did not reap it, and the
+unbounded `wait` in the cleanup trap blocked for 13.5 minutes until the operator
+interrupted the shell. `mz0380-m209-raw-only.sh` now escalates INT -> TERM ->
+KILL with a 1.5 s bound per signal, warns explicitly if the process survives
+SIGKILL (a D-state wait inside the driver), saves `dmesg` to
+`/tmp/mz0380-m209-dmesg.txt` and chmods all three artifacts world-readable
+before teardown, and wraps the unload in `timeout 30`. The card itself was
+clean throughout: one SET_VIC spawn, zero mailbox timeouts, and a normal
+`final pipeline stop: STOP_STREAMING(all channels) ret=0`.
+
+### M210: implemented, build-checked, unspent
+
+Do not re-run M209 as it stands; its question is answered. The next bounded run
+keeps the raw-only sink topology and restore the encoder tail: eight
+independently poisoned `op 0x02`/`op 0x08` buffers, no `op 0x04` registration,
+confirmed 1080p60 `fw=7`, VBI zero, and `SET_ENC_PARAMS` x2 plus `POST_PROC`
+sent exactly as the working H.264 path sends them. That isolates the single
+remaining variable.
+
+It is now implemented as `raw_probe_enc_tail` (module parameter, default off,
+`RAWTAIL=1` through `mz0380-live.sh`) and driven by
+`mz0380-m210-raw-enc-tail.sh`. Three gates changed and nothing else:
+`mz0380_stream_configure_encoder()` takes the Windows-exact 1.1.195.0 values
+for M210 as well as for `h264_probe`; the encoder-tail block in
+`mz0380_dma_start()` now runs when `raw_bank_probe` is paired with the new
+knob; and `op 0x06` is suppressed in that case, because Windows does not send
+it once the tail is present and M82 showed `0x2d`/`0x31` already perform the
+same epint wake. `raw_probe_enc_tail` without `raw_bank_probe` is rejected at
+`mz0380_dma_setup()` rather than silently doing nothing, so a spent run can
+never be scored against a configuration that was not the intended one. The
+harness deadline consequently anchors on the `SET_PREVIEW_PARAMS` log line
+instead of the op06 line, and its oracle additionally requires
+`SET_ENC_PARAMS` x2, one `SET_PREVIEW_PARAMS`, and zero op06. The driver's
+success line still reads `M209 raw discriminator SUCCESS` - it is the shared
+raw-completion oracle, not a mislabel.
+
+Both kernels build warning-free (`6.18.42-1-cachyos-lts`, `7.2.0-1-cachyos`).
+The start is unspent. If raw planes appear in the banks, the raw surface is a
+by-product of the configured encoder pipeline and native V4L2 negotiation can
+be built on it. If the banks stay poisoned while the encoder tail is present,
+the producer requires the `op 0x04` sink to exist at all, and the next step is a
+run with all three windows registered and the raw banks observed alongside a
+live H.264 stream - which the current mutual-exclusion check in
+`mz0380-dma.c` forbids and would have to be relaxed for that experiment only.
+
+Budget: this run spent one SET_VIC spawn of the 8-18 per-power-cycle range.

@@ -798,3 +798,27 @@ bool mz0380_raw_bank_probe;
 module_param_named(raw_bank_probe, mz0380_raw_bank_probe, bool, 0644);
 MODULE_PARM_DESC(raw_bank_probe,
 		 "M209: raw-only Windows-exact independent op02/op08 banks (requires h264_probe=0 + IOVA remap; forbids op04; def:0)");
+
+/*
+ * M210: the M209 hardware run answered its own question and produced nothing.
+ * The full raw-only sequence ran - one SET_VIC, both banks registered, op06
+ * fired - and the card never wrote a frame token: irq_total=8, frame_events=0,
+ * the seeded BAR0 0x40..0x4c sentinel intact, all eight slots still poisoned.
+ * The producer never started, so op06 alone does not start it.
+ *
+ * Raw-only differs from the working 60 fps H.264 start in exactly two ways: no
+ * op04 sink, and no encoder tail.  A missing sink cannot suppress generation
+ * into the sinks that do exist, which leaves the tail.  M82 showed the card
+ * routes 0x2d/0x31 to the same epint wake as 0x06, so the wake is not the
+ * point - SET_ENC_PARAMS/SET_PREVIEW_PARAMS configure the pipeline that
+ * produces frames at all, and the raw planes are plausibly its by-product.
+ *
+ * This knob restores that tail on top of the M209 sink topology, byte for byte
+ * as the H.264 path sends it: the Windows-exact encoder values, both streams,
+ * SET_PREVIEW_PARAMS, and no op06 (Windows does not send it when the tail is
+ * present).  It changes exactly one variable against M209.
+ */
+bool mz0380_raw_probe_enc_tail;
+module_param_named(raw_probe_enc_tail, mz0380_raw_probe_enc_tail, bool, 0644);
+MODULE_PARM_DESC(raw_probe_enc_tail,
+		 "M210: with raw_bank_probe, send the Windows encoder tail (SET_ENC_PARAMS x2 + SET_PREVIEW_PARAMS) and suppress op06 (def:0)");

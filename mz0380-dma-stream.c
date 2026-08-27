@@ -38,7 +38,7 @@ static int mz0380_stream_configure_encoder(struct mz0380_dev *dev, u32 fps,
 	 * gop = 32 / 4 MiB; nothing suggests the card cares, so the sub stream
 	 * just mirrors the main configuration here.
 	 */
-	if (mz0380_h264_probe) {
+	if (mz0380_h264_probe || mz0380_raw_probe_enc_tail) {
 		/* Exact values logged by the Windows 1.1.195.0 capture driver. */
 		enc[0] = 0x3fff;
 		gop = main_or_sub ? 30 : 32;
@@ -593,7 +593,10 @@ vic_done:
 	 * Windows never sends 0x06 on the capture path.
 	 */
 	if (mz0380_win_seq && !mz0380_stream_nosg &&
-	    !mz0380_raw_bank_probe) {
+	    (!mz0380_raw_bank_probe || mz0380_raw_probe_enc_tail)) {
+		if (mz0380_raw_bank_probe)
+			pr_info("%s: M210: sending the Windows encoder tail on the raw-only sink topology; M209 proved op 0x06 alone leaves the producer dead\n",
+				dev->name);
 		ret = mz0380_stream_configure_encoder(dev, fps, 0);
 		if (ret)
 			goto err_events;
@@ -677,8 +680,8 @@ vic_done:
 	 * Frame arrival is confirmed downstream by the MSI/outbound-ATU path, not
 	 * by a command ack.
 	 */
-	if (mz0380_raw_bank_probe || !mz0380_win_seq ||
-	    mz0380_win_start_op6) {
+	if ((mz0380_raw_bank_probe && !mz0380_raw_probe_enc_tail) ||
+	    !mz0380_win_seq || mz0380_win_start_op6) {
 		ret = mz0380_send_command(dev, MZ0380_CMD_START_STREAMING,
 					  NULL, 0, NULL, 0);
 		pr_info("%s: stream start: START_STREAMING(op 0x06) fired (async, ret=%d)\n",
