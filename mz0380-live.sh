@@ -9,6 +9,7 @@
 #   sudo ./mz0380-live.sh unload    # kill users of the node, rmmod, tidy up
 #
 # Takes the same env knobs as m55 (POLLDRAIN VICFW VICB0 MSTB1 MSTB2 MSTB5
+# POSTMASK POSTSKIP POSTAVG RAWDELIVER
 # B0LATE KICKOP KICKREP OP6KICK WINSEQ INTX SETBUF ... plus EXTRA="p=v ...").
 # POLLDRAIN remains available for the legacy raw-preview path. H264PROBE=1 uses
 # the dedicated window-1 completion ring and does not need polling.
@@ -55,11 +56,11 @@ do_unload() {
 		sleep 1
 	fi
 	if [ -d /sys/module/mz0380 ]; then
-		./mz0380-spawns.sh commit 2>/dev/null || true
+		scripts/mz0380-spawns.sh commit 2>/dev/null || true
 	fi
 	if rmmod mz0380 2>/dev/null; then
 		echo "module unloaded"
-		./mz0380-spawns.sh unloaded 2>/dev/null || true
+		scripts/mz0380-spawns.sh unloaded 2>/dev/null || true
 	elif [ -d /sys/module/mz0380 ]; then
 		echo "rmmod FAILED - state=$(cat /sys/module/mz0380/initstate 2>/dev/null)"
 		echo "if that says 'going' the module is wedged; power-cycle at mains."
@@ -71,7 +72,11 @@ do_unload() {
 		# Hardware harnesses run make as root and can leave generated outputs that
 		# break the next non-root build with "Operation not permitted".  The
 		# ordinary glob misses .module-common.o, so name it and the final ko.
-		rm -f ./*.o ./.module-common.o ./mz0380.ko
+		# src/ holds the objects since the 2026-08 reorg; the root-owned ones
+		# there are just as fatal to the next non-root build as the top-level
+		# ones, and a bare ./*.o no longer reaches them.
+		rm -f ./*.o ./.module-common.o ./mz0380.ko \
+		      ./src/*.o ./src/.*.o.cmd
 	fi
 	return 0
 }
@@ -120,7 +125,7 @@ watch)
 	;;
 
 load)
-	. ./mz0380-build.sh
+	. scripts/mz0380-build.sh
 	MZKO=$(mz0380_resolve_module) || exit 1
 
 	# M85: never leave a module loaded that cannot unload cleanly. An oops in
@@ -133,7 +138,7 @@ load)
 			echo "mz0380 is wedged in MODULE_STATE_GOING - power-cycle at mains"
 			exit 1
 		fi
-		./mz0380-m85-unload-smoke.sh >/tmp/mz0380-smoke.log 2>&1 || {
+		scripts/mz0380-m85-unload-smoke.sh >/tmp/mz0380-smoke.log 2>&1 || {
 			echo "load/unload smoke test FAILED - see /tmp/mz0380-smoke.log"
 			tail -20 /tmp/mz0380-smoke.log
 			exit 1
@@ -169,7 +174,10 @@ load)
 	add_opt raw_probe_enc_tail "${RAWTAIL:-}"
 	add_opt raw_probe_allow_30 "${RAW30:-}"
 	add_opt raw_bank_observe "${RAWOBS:-}"
+	add_opt raw_deliver     "${RAWDELIVER:-}"
 	add_opt post_mask       "${POSTMASK:-}"
+	add_opt post_skip       "${POSTSKIP:-}"
+	add_opt post_avg        "${POSTAVG:-}"
 	add_opt mst_win_output  "${MSTOUT:-}"
 	add_opt mst_ad          "${MSTAD:-}"
 	add_opt vic_in_w        "${VICINW:-}"
@@ -189,9 +197,12 @@ load)
 	add_opt stream_without_signal "${NOSRC:-}"
 	add_opt signal_monitor_ms "${SIGMON:-}"
 	add_opt no_signal_fps "${NOSIGFPS:-}"
-	# The one knob this script does default, because the node delivers nothing
-	# without it. Override with POLLDRAIN=0 to see the pre-M112 behaviour.
-	add_opt poll_drain_ms   "${POLLDRAIN:-20}"
+	# M216: no longer defaulted here. poll_drain_ms is 0 in the driver now,
+	# which is right for the fw=7 completion-ring path; hardcoding 20 here
+	# would silently override the module default, which is exactly what the
+	# add_opt comment above warns against. POLLDRAIN=20 still selects the
+	# legacy fw=5 poll-drain path.
+	add_opt poll_drain_ms   "${POLLDRAIN:-}"
 
 	dmesg -C
 	insmod "$MZKO" dma_handshake=1 enable_dma=1 \

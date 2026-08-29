@@ -1,56 +1,95 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-27. Full history in **RE_FINDINGS.md**. This file is the
+_Last updated 2026-08-28. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: static RE of tinyvenc7's preview DMA length - no spawns
+## Immediate task: confirm the M224 timestamp fix, then commit
 
-The long-standing question is answered. **The sixteen bytes the card writes into
-`op 0x02` are source pixels**, measured rather than guessed: an M211 run sampled
-each slot head on every encoded completion while capturing the H.264 the
-encoder made from the same frames, and the decoded picture's top-left sixteen
-luma samples match the raw heads with a mean absolute difference of 0.50-1.12
-and no byte off by more than 3. Controls from the same frame: a mid-frame
-region scores 37.00, the poison 75.06. Artifacts:
-`docs/m212-head-samples-2026-08-27.log`,
-`docs/m212-encoded-reference-2026-08-27.h264`.
+**Uncompressed capture works.** The driver delivers 1920x1080 I420 through
+V4L2 with no encoder in the delivery path, at ~50 fps, selectable by an
+application through `S_FMT` with no module parameters. That was the project's
+goal and it is done (M213-M218, hardware-confirmed).
 
-So the capture path works end to end and the DMA stops after one burst. Nothing
-about "does the card produce raw video" is open any more.
+**One defect is open and its fix is untested: raw output stutters** ("flicker"
+in OBS on `YU12` and on the `BGR3`/`YV12` libv4l2 derives, never on `H264`).
 
-The reframing that follows matters more than the proof. M177 already named this
-window **tinyvenc7's 16-byte preview DMA**, and M92's size table says a preview
-surface on this card is `1024 x 540` - `0x10F000` packed or `0xCA900` planar -
-not `1920 x 1080`. Every oracle in the current harnesses expects `0x2f7600`
-because M209 read that number out of the retail driver's *base raw* callback,
-and nothing has shown the Linux `fw=7` `op 0x02` window is that same surface.
-Resolve that before spending another start on an oracle that may be looking for
-the wrong number.
+### Read this before touching the flicker
 
-**Do this first, and it costs nothing:** find in tinyvenc7 what sets the
-transfer length for the `op 0x02` preview writer, and whether any
-`SET_PREVIEW_PARAMS` field, geometry register or mask bit changes it. The
-material is already in the tree (`re-dump/`, `ep-disasm.txt`, `windowsDriver/`).
-`op 0x31` is `SET_PREVIEW_PARAMS` and `post_mask` gates which of its fields the
-card applies; we send `post_mask=0`, so the writer currently runs on card
-defaults. M128d mapped that mask under `fw=5`, where a different binary owns
-the writer - it has never been mapped under `fw=7`.
+It has been misdiagnosed **four times**. Three fixes shipped, each a real defect,
+none of them the cause:
 
-Then, in order:
+| | claimed cause | verdict |
+|---|---|---|
+| M220 | partial frame passing an OR sentinel test | real bug, fixed, symptom remained |
+| M221 | frame size hardcoded to 1080p | real bug, fixed, symptom remained |
+| M222 | token does not name the raw slot | real bugs, fixed, symptom remained |
+| M224 | **wrong timestamp per frame** | **untested** |
 
-1. Decide from the binary whether the `fw=7` `op 0x02` surface is `0x2f7600` or
-   `0xCA900`, and correct the harness oracles to match.
-2. `probe_windows=1` under `fw=7` - one spawn, never run. M32 concluded the
-   three extra outbound windows are never written, but measured it under
-   `fw=5` against a livelocked producer. Under `fw=7` the producer is alive.
-3. A `post_mask` bisect under `fw=7` - one spawn per step, only once 1 and 2
-   say which field to move.
+What finally produced evidence was the M223 counters, not more reading:
 
-**Budget: the tally reads 11, inside the historical 8-18 wedge range.** Spend
-nothing on hardware until a mains-off power cycle followed by
-`sudo ./mz0380-spawns.sh reset`. Do not use `./mz0380-spawns.sh add` -
-`mz0380-live.sh` commits the tally itself in `do_unload()`.
+```
+raw scan landed=0x8 took slot 3 (multi=0 torn=0)
+raw scan landed=0x1 took slot 0 (multi=0 torn=0)
+raw scan landed=0x2 took slot 1 (multi=0 torn=0)
+```
+
+One slot ready per completion, clean 0-1-2-3 rotation, never a queue, tear
+detector never firing. An 89-frame capture off the running driver had **no
+poison anywhere**, no tears, flat luma, correct colour. **The delivered frames
+are provably good** - every content-side explanation is dead.
+
+M224 therefore targets the only category left. `vbuf->vb.vb2_buf.timestamp` was
+copying `snapshot->timestamp_ns`, which was correct under M217 (the slot came
+from that completion's token) and became wrong at M222 (slots are scanned in
+rotation, so the triggering completion is a different frame). Every raw frame
+carried another frame's timestamp, at ~50 fps against the 60 the node
+advertises. It now uses `ktime_get_ns()` at delivery.
+
+**Before spending a run, ask what the flicker looks like.** If it is stutter -
+correct picture, uneven timing - M224 is aimed correctly. If it is corruption or
+flashing, the capture evidence says the fault is not in the driver's frame data
+and M224 is wrong too.
+
+### Budget: STOP AND POWER CYCLE FIRST
+
+**The tally is 14, inside the 8-18 wedge band.** A wedge from here costs a
+mains-off cold boot. Do a mains-off power cycle and
+`sudo scripts/mz0380-spawns.sh reset` before any further hardware run.
+
+### Then
+
+1. **Commit.** ~100 changed paths are uncommitted, including work that is
+   correct regardless of the flicker.
+2. Confirm M224 on one run: load, select `YU12`, watch OBS.
+3. `raw_frames_delivered` vs `raw_probe_stub_frames` in `/proc/mz0380-state`
+   quantifies the 50-vs-60 gap; ~50 fps is the PCIe x1 Gen1 ceiling
+   (`3110400 * 50 = 155 MB/s`), not a driver limit.
+
+## What this session built
+
+- **M213/M214** (static, tinyvenc7): the `op 0x02` transfer length is
+  `ALIGN16(W)*H*3/2`; the famous 16 bytes were the stub the card writes for
+  every frame its preview scheduler did not select, and `post_mask` bit 0 is
+  what populates that selection bitmap. Nothing was ever broken.
+- **M215** (hardware): all four op02 slots came back with full `0x2f7600`
+  frames. `op 0x08` is never written.
+- **M216**: the validated configuration is the driver's default -
+  `sudo modprobe mz0380` works with no parameters. `make dkms-install`,
+  `make install`, `/etc/modprobe.d/mz0380.conf`, `MODULE_VERSION`.
+- **M217/M218**: raw delivered to V4L2; both `H264` and `YU12` enumerated, the
+  application chooses with `S_FMT`, and `post_mask` bit 0 is forced on whenever
+  raw is live so no parameter is needed.
+- **M219**: full-rate raw measured at ~50 fps, link-limited.
+- **M223**: `S_FMT` coerces geometry to the live source - the card has no
+  scaler, and accepting 1280x720 previously wedged the node into refusing every
+  STREAMON with no way back.
+- Repo reorganised into `src/` and `scripts/` with `mz0380-live.sh` at the root;
+  GPL-2.0-or-later with `COPYING` and SPDX tags; sc0710 removed from the build
+  and from `src/`.
+- `scripts/mz0380-build-check.sh` - builds in an empty tree and reports **make's
+  exit status**. It exists because a check that looked for `mz0380.ko` passed on
+  a stale file and reported two compile failures as successes.
 
 ### What the three bounded runs established (2026-08-27)
 
@@ -577,13 +616,13 @@ ffplay -f rawvideo -pixel_format yuv420p -video_size 1920x1080 /tmp/f.i420
 Expect **one frame, then a clean end-of-stream** (`DQBUF` returns `-EIO`).
 STREAMOFF + STREAMON gets the next one. Do not respawn per frame to fake video:
 every stream start forks an encoder and the card wedges somewhere in the
-**8-18 spawn range per power cycle**. `./mz0380-spawns.sh` has the running
+**8-18 spawn range per power cycle**. `scripts/mz0380-spawns.sh` has the running
 total and needs no root.
 
 ## THE ONE THING TO RUN FIRST
 
 ```bash
-sudo ./mz0380-m176-fw6-test.sh
+sudo scripts/mz0380-m176-fw6-test.sh
 ```
 
 One spawn. This is the open question and it is the answer to "how does Windows
@@ -664,7 +703,7 @@ this firmware **by measurement of every binary the card ships**, rather than by
 having tested two of three - which is what this file used to claim.
 
 Two of the three have pixels and no cadence; one has cadence and no pixels.
-Do not re-derive this from the prose below - `sudo ./mz0380-m175-fw8-test.sh`
+Do not re-derive this from the prose below - `sudo scripts/mz0380-m175-fw8-test.sh`
 re-checks it for one spawn.
 
 **What this does NOT close is `fw=6`**, which selects none of these three
@@ -724,7 +763,7 @@ three frames on a one-frame card and **exited by itself in 7 s with exactly
 3110400 bytes, rc=0**. Re-run it any time with
 
 ```bash
-sudo ./mz0380-m168-v4l2-abi.sh
+sudo scripts/mz0380-m168-v4l2-abi.sh
 ```
 
 One spawn. The enumeration half of it costs none.
@@ -739,12 +778,12 @@ firmware-upload blob; and the README still told users to pass
 `PLAN.md` marked SUPERSEDED with its false claims named. **Not yet run:**
 
 ```bash
-sudo ./mz0380-m170-readiness.sh
+sudo scripts/mz0380-m170-readiness.sh
 ```
 
 `v4l2-compliance` (zero spawns) plus the first repeat-capture test this project
 has run - three stills in a row, checked for whole frames and for being
-different images. Costs 3 spawns; check `./mz0380-spawns.sh` first.
+different images. Costs 3 spawns; check `scripts/mz0380-spawns.sh` first.
 
 **M171 ran it. Repeat capture PASSES** - three stills, all 3110400 bytes, all
 real pictures, all three hashes different, so each STREAMOFF/STREAMON really did
@@ -765,7 +804,7 @@ in source, all needing a re-run to confirm:
 sudo rmmod mz0380; sudo insmod ./mz0380.ko && sleep 3 && v4l2-compliance -d /dev/video0 2>&1 | tail -25
 ```
 
-Zero spawns, and `./mz0380-compliance.sh` makes it one word.
+Zero spawns, and `scripts/mz0380-compliance.sh` makes it one word.
 
 **Progress: 132/16 -> 142/6 -> 147/1.** Note the middle step: **five of those
 six were introduced by the fix for the first sixteen** (a bare `vb2_is_busy()`
@@ -805,7 +844,7 @@ finding.
    applications a 720p frame in a buffer labelled 1920x1080, silently. The guard
    (`strict_geometry`, def 1) now refuses that instead, but **the non-1080p path
    is correct by construction, not verified**. Any source that can output 720p
-   settles it. The 1080p regression check is `sudo ./mz0380-m168-v4l2-abi.sh` -
+   settles it. The 1080p regression check is `sudo scripts/mz0380-m168-v4l2-abi.sh` -
    the guard sits on the working path.
 
 1. **Widen the spawn budget** so single-shot capture is at least repeatable.
@@ -816,7 +855,7 @@ finding.
    script here opens with `dmesg -C`. Now:
 
    ```bash
-   ./mz0380-spawns.sh
+   scripts/mz0380-spawns.sh
    ```
 
    No root needed to read. `mz0380-m55-real-capture.sh` banks each run's spawns
@@ -966,7 +1005,7 @@ mismatch. See the build section.)
 The longer I2C probe says the same thing and also shows the bus, if wanted:
 
 ```bash
-sudo START=0x50 ./mz0380-m83-i2c-devscan.sh 16
+sudo START=0x50 scripts/mz0380-m83-i2c-devscan.sh 16
 ```
 
 `periph: card handshake not complete` and `0 of 0 registers read` means the
@@ -976,8 +1015,8 @@ source or the receiver.
 **The control capture is the health check:**
 
 ```bash
-sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1
-./mz0380-m127-splash.py /tmp/cap-m55.nv12       # expect: SPLASH
+sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 1
+scripts/mz0380-m127-splash.py /tmp/cap-m55.nv12       # expect: SPLASH
 ```
 
 `sudo` is required for `dmesg` on this kernel - without it it fails and silently
@@ -1032,7 +1071,7 @@ in front of the camera, confirmed visually and by measurement. The raw frame is
 preserved in the repo as `m129-first-real-frame.raw`
 (sha256 `76e7050e...cc8704`).
 
-    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" scripts/mz0380-m55-real-capture.sh 1
 
     captured 3110400 bytes = 1 whole frames + 0 bytes
     VERDICT: NOT SPLASH  (Y 170 distinct values, UV 144)
@@ -1379,7 +1418,7 @@ host counter can tell one VIC capture from several that were never published.
 ### The Windows ordering - one spawn, three distinguishable answers.
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="win_seq=1" ./mz0380-m55-real-capture.sh 5
+sudo POLLDRAIN=20 EXTRA="win_seq=1" scripts/mz0380-m55-real-capture.sh 5
 ```
 
 **Why this and not more RE.** Windows streams continuously off this exact card

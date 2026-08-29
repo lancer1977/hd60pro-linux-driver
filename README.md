@@ -11,7 +11,14 @@ exposes the result as a V4L2 capture device.
 > picture, same-mode HDMI unplug/reconnect, and clean-IDR recovery. The
 > all-frame scheduler is hardware-validated at approximately 60 encoded fps
 > from a confirmed 1080p60 input, with one encoder spawn and a clean final
-> stop. Audio is not implemented.
+> stop.
+>
+> **Uncompressed capture works as of 2026-08-28 (M215/M217).** With
+> `raw_deliver=1 post_mask=0x01` the node advertises `YU12` and delivers whole
+> 1920x1080 I420 frames - no encoder in the delivery path. `post_skip` throttles
+> the rate: the card's preview bitmap step is `post_skip+1`, and full-rate raw
+> at 1080p60 is ~186 MB/s against a link this card negotiates as PCIe x1 Gen1.
+> Audio is not implemented.
 
 This is reverse-engineered development code, not a mainline or production
 driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
@@ -197,7 +204,6 @@ make all-kernels                     # save all builds under ko/
 make objclean                        # clean top-level kbuild products
 make clean                           # normal clean; preserves ko/
 make distclean                       # clean and remove ko/
-make legacy                          # attempt the unsupported sc0710 build
 ```
 
 If `/lib/modules/$(uname -r)/build` is missing, no out-of-tree module can be
@@ -209,6 +215,42 @@ different kernel will fail with `Invalid module format`; check its vermagic:
 uname -r
 modinfo -F vermagic ./mz0380.ko
 ```
+
+## Install
+
+The driver's compiled-in defaults are the validated 1080p60 capture
+configuration, and `MODULE_DEVICE_TABLE` covers every known subsystem ID, so an
+installed module autoloads when the card is present. No parameters are needed.
+
+**Persistent install (recommended)** - rebuilds itself on every kernel upgrade:
+
+```bash
+sudo make dkms-install
+sudo modprobe mz0380
+```
+
+**Single-kernel install** - quicker, but the next kernel upgrade leaves it
+behind:
+
+```bash
+sudo make install
+sudo modprobe mz0380
+```
+
+Either way `/etc/modprobe.d/mz0380.conf` is installed. It sets no options - it
+pulls in the V4L2/ALSA dependencies and documents the knobs worth knowing,
+commented out. To remove: `sudo make dkms-uninstall` or `sudo make uninstall`.
+
+Verify:
+
+```bash
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/video0 --all
+```
+
+The development workflow below (`mz0380-live.sh`) is a different thing: it
+insmods the module straight out of the build tree with explicit parameters, for
+experiments. You do not need it to use the card.
 
 ## Recommended persistent H.264 workflow
 
@@ -380,7 +422,7 @@ same-mode HDMI recovery reuse one pipeline. Still, inspect the tally before
 experiments:
 
 ```bash
-./mz0380-spawns.sh
+scripts/mz0380-spawns.sh
 ```
 
 The tally is stored in `/run`, and loading scripts commit their per-module
@@ -388,7 +430,7 @@ count before unload. A warm reboot may clear `/run` without removing PCIe slot
 power, so only reset the tally after a known full power removal:
 
 ```bash
-sudo ./mz0380-spawns.sh reset
+sudo scripts/mz0380-spawns.sh reset
 ```
 
 Do not fake video by repeatedly restarting the legacy one-frame stream. Do not
@@ -449,7 +491,7 @@ The validation harness reloads the module, waits for HDMI lock, captures and
 scores this raw control, then unloads:
 
 ```bash
-sudo ./mz0380-m55-real-capture.sh 1 45
+sudo scripts/mz0380-m55-real-capture.sh 1 45
 ```
 
 Each raw STREAMON sends `SET_VIC`; use the harness sparingly and count spawns.
@@ -595,13 +637,91 @@ card.
 | `RE_FINDINGS.md` | Full reverse-engineering history, milestone by milestone. |
 | `MZ0380_SDK_CONTROL_PATH.md` | Card-side SDK control path and command model. |
 | `mz0380-live.sh` | Recommended live loader/status/watch/unload workflow. |
-| `mz0380-spawns.sh` | Cross-reload encoder-spawn accounting. |
-| `mz0380-m55-real-capture.sh` | Legacy raw control-capture harness. |
+| `scripts/mz0380-spawns.sh` | Cross-reload encoder-spawn accounting. |
+| `scripts/mz0380-m55-real-capture.sh` | Legacy raw control-capture harness. |
 
 The handoff contains older, explicitly superseded investigation sections for
 historical context. Prefer its topmost current section and this README over old
 intermediate conclusions.
 
+## Repository layout
+
+```
+mz0380-live.sh      the load/status/watch/unload workflow - start here
+Makefile            builds mz0380.ko at the repo root
+COPYING             GNU GPL version 2
+src/                driver sources (mz0380-*.c/.h; legacy sc0710-* alongside)
+scripts/            build helpers, milestone harnesses (mXX), analysis tools
+docs/               captured run logs and RE artefacts
+re-dump/            vendor disassembly and the card's own firmware tree
+ko/                 per-kernel module copies from `make all-kernels`
+```
+
+Scripts in `scripts/` `cd` to the repo root before doing anything, so they can
+be invoked from anywhere and still find `mz0380.ko`, `docs/` and each other:
+
+```
+sudo ./mz0380-live.sh load
+sudo scripts/mz0380-m55-real-capture.sh 1 45
+scripts/mz0380-spawns.sh
+```
+
 ## License
 
-GPLv2 or later.
+**GPL-2.0-or-later**, and for a Linux kernel module that is not really a
+choice. Recorded as an SPDX tag in every source file, with the full text in
+`COPYING`.
+
+GPLv3 is not available here, for three independent reasons:
+
+1. **The kernel is GPLv2-only.** Linux does not carry the "or later" clause, and
+   GPLv2 and GPLv3 are mutually incompatible. A loadable module is a derivative
+   work of the kernel it links against, so a GPLv3 module could not be
+   distributed for use with Linux.
+2. **`MODULE_LICENSE()` has no GPLv3 ident.** The accepted strings in
+   `include/linux/module.h` are all GPLv2-based, plus `"Proprietary"`. A
+   GPLv3-only module would have to declare itself proprietary, which taints the
+   kernel and makes the loader refuse to bind `EXPORT_SYMBOL_GPL` symbols - and
+   videobuf2, which this driver is built on, exports GPL-only. The module would
+   not load.
+`MODULE_LICENSE("GPL")` already means "GPLv2 or later", so the built module is
+consistent with the SPDX tags with no change needed.
+
+Note that reasons 1 and 2 are properties of building a Linux kernel module and
+hold no matter whose code is in the tree. Removing third-party code, as the
+next section describes, does not make GPLv3 available.
+
+## Provenance
+
+This driver was written for the HD60 Pro (MZ0380). It is not a fork.
+
+**sc0710 (Elgato 4K60 Pro Mk.2, Steven Toth) - not used.** The repository
+directory is named `sc0710` for historical reasons and early revisions carried
+that driver's sources locally as reading material, but they were never tracked
+in git, never built by default, and never distributed. In 2026-08 they were
+moved out of `src/` to a gitignored `reference/` directory and the `legacy`
+build target was deleted. Three register-map sections (`BAR0` XDMA, `BAR0`
+Xilinx AXI IIC, `BAR0` HDMI signal status) had been modelled on it; every
+define in all three was unused, hardware disproved the model on all three
+counts, and they were removed. **No code in `src/` derives from sc0710.**
+
+**hdcapm (Startech USB2HDCAPM, Steven Toth / Michael Grzeschik, GPL-2) - used,
+and credited.** `src/mz0380-mst3367.c` follows the structure of that driver's
+`mst3367_init_setup()`. This is a genuine and deliberate dependency, and it is
+kept because the alternative is worse, not because it could not be avoided:
+
+- hdcapm reverse-engineered **the same Windows driver** this project does, for
+  a board built on the same Vatics Mozart 395s + MST3367 combination.
+- Every register value in the sequence was independently re-derived from our
+  own disassembly of `e60MZ0380.X64.SYS` and agrees with theirs. See
+  `docs/re-2026-07-05/mst3367-reference-from-gpl-driver.md`, which marks each
+  confirmation inline.
+- The values are therefore facts about how the MST3367 is brought up, not
+  authored expression, and we hold an independent derivation of them.
+
+Since the project is GPL-2.0-or-later regardless, the honest thing is to keep
+the citation rather than paraphrase the code to obscure it.
+
+**Everything else** comes from this project's own reverse engineering of the
+card's firmware image (`ep.ko`, `video_capture_mgr`, `tinyvenc5`/`tinyvenc7`)
+and the Windows driver, documented milestone by milestone in `RE_FINDINGS.md`.

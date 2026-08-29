@@ -1,58 +1,46 @@
 #
 # Linux driver for Elgato Game Capture HD60 Pro (YUAN MZ0380).
 #
-# Default target builds only mz0380.ko. The legacy sc0710 source set
-# (4K60 Pro Mk.2) is preserved in the repo but no longer included in
-# the default build because it does not compile on kernel 6.x (it
-# depends on media/videobuf-vmalloc.h which was removed).
-#
-# To attempt the legacy build:
-#     make legacy
+# Builds mz0380.ko. This driver is written for the HD60 Pro (MZ0380) and
+# shares no source with any other capture driver; see README's Provenance
+# section for what was consulted during reverse engineering and what was not.
 #
 
 mz0380-objs := \
-	mz0380-cards.o \
-	mz0380-pci.o \
-	mz0380-params-base.o \
-	mz0380-params-signal.o \
-	mz0380-params-windows.o \
-	mz0380-core.o \
-	mz0380-snapshot.o \
-	mz0380-proc-diagnostics.o \
-	mz0380-proc-debug.o \
-	mz0380-proc.o \
-	mz0380-controls-read.o \
-	mz0380-controls-write.o \
-	mz0380-mailbox.o \
-	mz0380-video.o \
-	mz0380-video-state.o \
-	mz0380-vb2.o \
-	mz0380-no-signal.o \
-	mz0380-signal.o \
-	mz0380-mst3367.o \
-	mz0380-mst3367-debug.o \
-	mz0380-mst3367-signal.o \
-	mz0380-mst3367-bitbang.o \
-	mz0380-dma.o \
-	mz0380-dma-extent.o \
-	mz0380-dma-stream.o \
-	mz0380-dma-drain.o \
-	mz0380-dma-nosg.o \
-	mz0380-fw.o \
-	mz0380-audio.o
+	src/mz0380-cards.o \
+	src/mz0380-pci.o \
+	src/mz0380-params-base.o \
+	src/mz0380-params-signal.o \
+	src/mz0380-params-windows.o \
+	src/mz0380-core.o \
+	src/mz0380-snapshot.o \
+	src/mz0380-proc-diagnostics.o \
+	src/mz0380-proc-debug.o \
+	src/mz0380-proc.o \
+	src/mz0380-controls-read.o \
+	src/mz0380-controls-write.o \
+	src/mz0380-mailbox.o \
+	src/mz0380-video.o \
+	src/mz0380-video-state.o \
+	src/mz0380-vb2.o \
+	src/mz0380-no-signal.o \
+	src/mz0380-signal.o \
+	src/mz0380-mst3367.o \
+	src/mz0380-mst3367-debug.o \
+	src/mz0380-mst3367-signal.o \
+	src/mz0380-mst3367-bitbang.o \
+	src/mz0380-dma.o \
+	src/mz0380-dma-extent.o \
+	src/mz0380-dma-stream.o \
+	src/mz0380-dma-drain.o \
+	src/mz0380-dma-nosg.o \
+	src/mz0380-fw.o \
+	src/mz0380-audio.o
 
-sc0710-objs := \
-	sc0710-cards.o sc0710-core.o sc0710-i2c.o \
-	sc0710-dma-channel.o sc0710-dma-channels.o \
-	sc0710-dma-chains.o sc0710-dma-chain.o \
-	sc0710-things-per-second.o sc0710-video.o \
-	sc0710-audio.o
+
+ccflags-y += -I$(src)/src
 
 obj-m += mz0380.o
-
-ifeq ($(MZ0380_LEGACY_SC0710),1)
-obj-m += sc0710.o
-endif
 
 #
 # Kernel feature probes (kbuild pass only - $(srctree) is the kernel tree).
@@ -84,11 +72,12 @@ endif
 
 endif
 
-.PHONY: all all-kernels kernels kcheck clean objclean distclean legacy fw-install \
+.PHONY: all all-kernels kernels kcheck clean objclean distclean fw-install \
         load load-streaming unload tarball list probe \
-        capture capture-h264 capture-audio
+        capture capture-h264 capture-audio \
+        install uninstall dkms-install dkms-uninstall
 
-TARFILES = Makefile *.h *.c *.txt *.md
+TARFILES = Makefile *.md *.sh src scripts
 
 #
 # Which kernel to build against.
@@ -199,6 +188,7 @@ kernels:
 # untouched by construction.
 objclean:
 	@rm -f *.o .*.o *.mod *.mod.c .*.cmd mz0380.ko \
+		src/*.o src/.*.o src/.*.cmd \
 		Module.symvers modules.order modules.builtin*
 	@rm -rf .tmp_versions
 
@@ -209,7 +199,8 @@ clean:
 		$(MAKE) -C $(KBUILD) M=$(PWD) $(KBUILD_FLAGS) clean; \
 	else \
 		echo "no build tree for '$(KVER)' - removing build products directly"; \
-		rm -f *.o *.ko *.mod *.mod.c .*.cmd Module.symvers modules.order; \
+		rm -f *.o *.ko *.mod *.mod.c .*.cmd src/*.o src/.*.cmd \
+			Module.symvers modules.order; \
 		rm -rf .tmp_versions; \
 	fi
 
@@ -218,8 +209,6 @@ clean:
 distclean: clean
 	rm -rf $(KO_DIR)
 
-legacy: kcheck
-	$(MAKE) -C $(KBUILD) M=$(PWD) $(KBUILD_FLAGS) MZ0380_LEGACY_SC0710=1 modules
 
 #
 # Firmware install. The MZ0380.HD.HEX blob ships with the Windows
@@ -278,15 +267,73 @@ list:
 	v4l2-ctl --list-devices
 
 probe:
-	@echo "Use: sudo ./mz0380-m55-real-capture.sh 6 45"
+	@echo "Use: sudo scripts/mz0380-m55-real-capture.sh 6 45"
 
 # M130: the payload is planar I420, not an H.264 bitstream. The old name said
 # h264 and the old argument asked for 6 frames from a card that delivers one.
 capture: all
-	sudo ./mz0380-m55-real-capture.sh 1 45
+	sudo scripts/mz0380-m55-real-capture.sh 1 45
 
 capture-h264: capture
 
 capture-audio:
 	@echo "ALSA PCM DMA is not implemented; enable_audio must remain disabled."
 	@false
+
+#
+# Installation.
+#
+# `make install` is the quick path: drop the module where depmod can find it,
+# install the modprobe.d file, and rebuild the dependency tables. It is tied to
+# ONE kernel - the next kernel upgrade leaves it behind. For anything other
+# than a quick test, use `make dkms-install`, which rebuilds automatically.
+#
+VERSION      = 0.1.0
+MODDIR       = /lib/modules/$(KVER)/kernel/drivers/media/pci/mz0380
+MODPROBE_DIR = /etc/modprobe.d
+DKMS_SRC     = /usr/src/mz0380-$(VERSION)
+
+install: all
+	install -d $(DESTDIR)$(MODDIR)
+	install -m 644 mz0380.ko $(DESTDIR)$(MODDIR)/
+	install -d $(DESTDIR)$(MODPROBE_DIR)
+	install -m 644 mz0380.modprobe.conf $(DESTDIR)$(MODPROBE_DIR)/mz0380.conf
+	@[ -n "$(DESTDIR)" ] || depmod -a $(KVER)
+	@echo
+	@echo "installed for kernel $(KVER)."
+	@echo "The card autoloads on its PCI ID - MODULE_DEVICE_TABLE is set - so a"
+	@echo "reboot is enough. To load it now:  sudo modprobe mz0380"
+	@echo
+	@echo "This binds to ONE kernel. Use 'make dkms-install' to survive upgrades."
+
+uninstall:
+	rm -f $(DESTDIR)$(MODDIR)/mz0380.ko
+	rm -f $(DESTDIR)$(MODPROBE_DIR)/mz0380.conf
+	-rmdir $(DESTDIR)$(MODDIR) 2>/dev/null
+	@[ -n "$(DESTDIR)" ] || depmod -a $(KVER)
+	@echo "uninstalled from kernel $(KVER)."
+
+#
+# DKMS. Copies the tree to /usr/src so the module is rebuilt on kernel upgrade.
+# The source list is explicit rather than a bare `cp -r .`: the working tree
+# carries multi-megabyte RE material (re-dump/, windowsDriver/, reference/) that
+# has no business in /usr/src.
+#
+dkms-install: dkms.conf
+	@command -v dkms >/dev/null || { echo "dkms is not installed"; exit 1; }
+	install -d $(DKMS_SRC)
+	cp -r Makefile dkms.conf mz0380.modprobe.conf src $(DKMS_SRC)/
+	dkms add     -m mz0380 -v $(VERSION)
+	dkms build   -m mz0380 -v $(VERSION)
+	dkms install -m mz0380 -v $(VERSION)
+	install -d $(MODPROBE_DIR)
+	install -m 644 mz0380.modprobe.conf $(MODPROBE_DIR)/mz0380.conf
+	@echo
+	@echo "DKMS install complete. The module now rebuilds on kernel upgrades."
+	@echo "Load it with:  sudo modprobe mz0380"
+
+dkms-uninstall:
+	-dkms remove -m mz0380 -v $(VERSION) --all
+	rm -rf $(DKMS_SRC)
+	rm -f $(MODPROBE_DIR)/mz0380.conf
+	@echo "DKMS package removed."

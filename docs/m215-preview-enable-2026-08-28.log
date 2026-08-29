@@ -1,0 +1,119 @@
+[20311.631507] mz0380[0]: MST3367 signal: 1920x1080p [host units] (htot=2200 vtot=1125 hper=674 vper=599 hact=1920 R55=0x7f)
+[20311.643866] mz0380 0000:04:00.0: live input 1920x1080p@60 -> encoder output 1920x1080@60
+[20311.643877] mz0380[0]: stream start: pre-STOP(op 0x07, all channels) ret=0, settling 1900 ms
+[20313.547634] mz0380[0]: raw-bank probe op 0x02 bank0 buf[0] target=0x0000000900000000 -> slot {00000009, 00000000}
+[20313.547799] mz0380[0]: raw-bank probe op 0x02 bank0 buf[1] target=0x0000000a00000000 -> slot {0000000a, 00000000}
+[20313.547962] mz0380[0]: raw-bank probe op 0x02 bank0 buf[2] target=0x0000000b00000000 -> slot {0000000b, 00000000}
+[20313.548125] mz0380[0]: raw-bank probe op 0x02 bank0 buf[3] target=0x0000000c00000000 -> slot {0000000c, 00000000}
+[20313.554344] mz0380[0]: raw-bank probe registered bank0 with op 0x02, four independent 0x466000-byte buffers, poison=0xa5 ret=0
+[20313.554516] mz0380[0]: raw-bank probe op 0x08 bank1 buf[0] target=0x0000000d00000000 -> slot {0000000d, 00000000}
+[20313.554681] mz0380[0]: raw-bank probe op 0x08 bank1 buf[1] target=0x0000000e00000000 -> slot {0000000e, 00000000}
+[20313.554845] mz0380[0]: raw-bank probe op 0x08 bank1 buf[2] target=0x0000000f00000000 -> slot {0000000f, 00000000}
+[20313.555010] mz0380[0]: raw-bank probe op 0x08 bank1 buf[3] target=0x0000001000000000 -> slot {00000010, 00000000}
+[20313.560917] mz0380[0]: raw-bank probe registered bank1 with op 0x08, four independent 0x466000-byte buffers, poison=0x5a ret=0
+[20313.560958] mz0380[0]: H.264 SET_BUF_4[0] target=0x0000000500000000 -> slot {00000005, 00000000}
+[20313.560998] mz0380[0]: H.264 SET_BUF_4[1] target=0x0000000600000000 -> slot {00000006, 00000000}
+[20313.561037] mz0380[0]: H.264 SET_BUF_4[2] target=0x0000000700000000 -> slot {00000007, 00000000}
+[20313.561075] mz0380[0]: H.264 SET_BUF_4[3] target=0x0000000800000000 -> slot {00000008, 00000000}
+[20313.567339] mz0380[0]: H.264 probe registered dedicated window1 ring (op 0x04, size=0x97f00) ret=0
+[20314.176231] mz0380[0]: stream start: SET_VIC(input=1920x1080p@60 fw=7 in_fmt=6 out_fmt=0 vic_in=1920x1080 fk=0 int_mode=0 -> H.264 output=1920x1080, bitstreams=1) ret=0
+[20314.176400] mz0380[0]: raw-bank probe op 0x02 bank0 buf[0] target=0x0000000900000000 -> slot {00000009, 00000000}
+[20314.176594] mz0380[0]: raw-bank probe op 0x02 bank0 buf[1] target=0x0000000a00000000 -> slot {0000000a, 00000000}
+[20314.176766] mz0380[0]: raw-bank probe op 0x02 bank0 buf[2] target=0x0000000b00000000 -> slot {0000000b, 00000000}
+[20314.176935] mz0380[0]: raw-bank probe op 0x02 bank0 buf[3] target=0x0000000c00000000 -> slot {0000000c, 00000000}
+[20314.182367] mz0380[0]: raw-bank probe registered bank0 with op 0x02, four independent 0x466000-byte buffers, poison=0xa5 ret=0
+[20314.182537] mz0380[0]: raw-bank probe op 0x08 bank1 buf[0] target=0x0000000d00000000 -> slot {0000000d, 00000000}
+[20314.182701] mz0380[0]: raw-bank probe op 0x08 bank1 buf[1] target=0x0000000e00000000 -> slot {0000000e, 00000000}
+[20314.182868] mz0380[0]: raw-bank probe op 0x08 bank1 buf[2] target=0x0000000f00000000 -> slot {0000000f, 00000000}
+[20314.183037] mz0380[0]: raw-bank probe op 0x08 bank1 buf[3] target=0x0000001000000000 -> slot {00000010, 00000000}
+[20314.188460] mz0380[0]: raw-bank probe registered bank1 with op 0x08, four independent 0x466000-byte buffers, poison=0x5a ret=0
+[20314.188502] mz0380[0]: H.264 SET_BUF_4[0] target=0x0000000500000000 -> slot {00000005, 00000000}
+[20314.188544] mz0380[0]: H.264 SET_BUF_4[1] target=0x0000000600000000 -> slot {00000006, 00000000}
+[20314.188582] mz0380[0]: H.264 SET_BUF_4[2] target=0x0000000700000000 -> slot {00000007, 00000000}
+[20314.188620] mz0380[0]: H.264 SET_BUF_4[3] target=0x0000000800000000 -> slot {00000008, 00000000}
+[20314.194570] mz0380[0]: H.264 probe registered dedicated window1 ring (op 0x04, size=0x97f00) ret=0
+[20314.194575] mz0380[0]: op02/op08 raw banks and the op04 encoded window re-registered after SET_VIC spawn
+[20314.194577] mz0380[0]: SET_BUF(op 0x02) provides four collision-free buffers (tokens 0..3); 3-bit tokens 4..7 are rejected and acknowledged until a second four-buffer allocation is wired to SET_BUF_8
+[20314.195169] mz0380[0]: real-frame buffers primed with 0xaa poison; the payload size will be inferred from the bounded changed prefix because firmware does not expose its byte count
+[20314.200857] mz0380[0]: stream start: SET_AIC(on=1, 2 ch, 16 bit, 48000 Hz, 256 frames x 4 periods) ret=0
+[20314.356827] mz0380[0]: output stage [before START]: R55=7f LOCKED | B0: ab=15 ad=05 ae=20 b0=21 b1=c0 b2=00 b3=00 b4=54 b5=0c b7=00 51=89 | B2: 01=61 02=f5 07=04
+[20314.356834] mz0380[0]: link [before START]: B1 01=8c 34=40 -> HDMI, HDCP absent | B2 0b=5a 0c=00 0e=90 48=d2, input colorspace YUV444
+[20314.362974] mz0380[0]: MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2, cached)
+[20314.370854] mz0380[0]: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x3fff, main ch0, fps=60, gop=32, quality=24, bitrate=4194304, skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap) ret=0
+[20314.376678] mz0380[0]: stream start: SET_ENC_PARAMS(op 0x2d, mask=0x3fff, sub ch0, fps=60, gop=30, quality=24, bitrate=4000000, skip=0, avg=0, tinyvenc7 schedule=all-frame bitmap) ret=0
+[20314.382661] mz0380[0]: stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x01, fps=60, skip=29, avg=0, die_en=1, fake_frame_off=1) ret=0
+[20314.382673] mz0380[0]: stream start: frame-token sentinel a5a5a5a5 seeded into BAR0 40/44/48/4c; readback a5a5a5a5/a5a5a5a5/a5a5a5a5/a5a5a5a5
+[20314.382680] mz0380[0]: stream start: START_STREAMING(op 0x06) fired (async, ret=0)
+[20314.618239] mz0380 0000:04:00.0: clean H.264 IDR received; encoded delivery is synchronized (access unit includes SPS/PPS)
+[20314.618246] mz0380[0]: M212 raw slot 0 head changed (#1): 46474b4e4e4c4c49424140414242403e
+[20314.618249] mz0380[0]: M212 raw slot 1 head changed (#1): a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+[20314.618250] mz0380[0]: M212 raw slot 2 head changed (#1): a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+[20314.618252] mz0380[0]: M212 raw slot 3 head changed (#1): a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5
+[20314.629037] mz0380[0]: M212 raw slot 1 head changed (#2): 45464b4e4e4c4c49424140414142403e
+[20314.645014] mz0380[0]: M212 raw slot 2 head changed (#2): 45464b4e4e4c4c49424140414142403e
+[20314.661684] mz0380[0]: M212 raw slot 3 head changed (#2): 4647494e4e4c4b4842403f424241403e
+[20314.678903] mz0380[0]: M212 raw slot 0 head changed (#2): 4647494e4e4c4b4842403f424241403e
+[20314.695740] mz0380[0]: M212 raw slot 1 head changed (#3): 47474b4e4e4c4b4842403f414242413e
+[20314.711654] mz0380[0]: M212 raw slot 2 head changed (#3): 47474b4e4e4c4b4842403f414242413e
+[20317.816424] mz0380[0]: H.264 slot 0 not complete: len=619293 copy=619293 identity=1 prefix=00 00 00 01
+[20318.349699] mz0380[0]: H.264 slot 0 not complete: len=618589 copy=618589 identity=1 prefix=00 00 00 01
+[20318.808498] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=192.168.88.248 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=25969 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20318.808540] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=192.168.88.243 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=23607 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20318.883031] mz0380[0]: H.264 slot 0 not complete: len=619123 copy=619123 identity=1 prefix=00 00 00 01
+[20319.420384] mz0380[0]: H.264 slot 0 not complete: len=619950 copy=619950 identity=1 prefix=00 00 00 01
+[20319.628881] mz0380_raw_observe_sample: 227 callbacks suppressed
+[20319.628884] mz0380[0]: M212 raw slot 1 head changed (#74): 47474b4e4c4c4a48423f3f4143423f3d
+[20319.644842] mz0380[0]: M212 raw slot 2 head changed (#75): 47474b4e4c4c4a48423f3f4143423f3d
+[20319.661529] mz0380[0]: M212 raw slot 3 head changed (#77): 47464b4d4c4c4b48423f3f4143423f3e
+[20319.695543] mz0380[0]: M212 raw slot 1 head changed (#75): 46464a4d4c4c4a47423f3f4143433f3f
+[20319.728186] mz0380[0]: M212 raw slot 3 head changed (#78): 47474a4c4c4a4b484340404043433f3f
+[20319.762212] mz0380[0]: M212 raw slot 1 head changed (#76): 4748494c4c4a4a474441404044443f3e
+[20319.778185] mz0380[0]: M212 raw slot 2 head changed (#76): 4748494c4c4a4a474441404044443f3e
+[20319.794861] mz0380[0]: M212 raw slot 3 head changed (#79): 4648494c4c4c4b4844413f4043433f3e
+[20319.828876] mz0380[0]: M212 raw slot 1 head changed (#77): 47484a4d4e4c4a4743403e4043433f3e
+[20319.844845] mz0380[0]: M212 raw slot 2 head changed (#77): 47484a4d4e4c4a4743403e4043433f3e
+[20319.949700] mz0380[0]: H.264 slot 0 not complete: len=619804 copy=619804 identity=1 prefix=00 00 00 01
+[20320.058470] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=192.168.88.248 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=26245 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20320.058509] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=192.168.88.243 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=24682 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20320.482996] mz0380[0]: H.264 slot 0 not complete: len=619353 copy=619353 identity=1 prefix=00 00 00 01
+[20321.016348] mz0380[0]: H.264 slot 0 not complete: len=618338 copy=618338 identity=1 prefix=00 00 00 01
+[20321.308457] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=192.168.88.248 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=27134 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20321.308499] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=192.168.88.243 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=25511 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20322.808457] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=fe80:0000:0000:0000:e356:dd0b:65fb:ed5d DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=529916 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20322.808509] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=fe80:0000:0000:0000:5f88:7e53:d229:6412 DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=310687 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20322.812552] [UFW BLOCK] IN=enp7s0 OUT= MAC=33:33:00:01:00:03:b4:b5:b6:92:b2:81:86:dd SRC=fe80:0000:0000:0000:5f88:7e53:d229:6412 DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=310687 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20322.932374] [UFW BLOCK] IN=wlan0 OUT= MAC=33:33:00:01:00:03:04:42:1a:e6:d8:9b:86:dd SRC=fe80:0000:0000:0000:e356:dd0b:65fb:ed5d DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=529916 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20324.058429] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=fe80:0000:0000:0000:e356:dd0b:65fb:ed5d DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=529916 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20324.058473] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=fe80:0000:0000:0000:5f88:7e53:d229:6412 DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=310687 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20324.062504] [UFW BLOCK] IN=enp7s0 OUT= MAC=33:33:00:01:00:03:b4:b5:b6:92:b2:81:86:dd SRC=fe80:0000:0000:0000:5f88:7e53:d229:6412 DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=310687 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20324.112017] [UFW BLOCK] IN=wlan0 OUT= MAC=33:33:00:01:00:03:04:42:1a:e6:d8:9b:86:dd SRC=fe80:0000:0000:0000:e356:dd0b:65fb:ed5d DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=529916 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20324.645429] mz0380_raw_observe_sample: 212 callbacks suppressed
+[20324.645432] mz0380[0]: M212 raw slot 2 head changed (#143): 47474a4d4e4c4c48413f403f41413f3d
+[20324.661420] mz0380[0]: M212 raw slot 3 head changed (#152): 47484a4e4e4c4c484240403f41413f3e
+[20324.695318] mz0380[0]: M212 raw slot 1 head changed (#145): 46484b4d4e4c4c4843403f404242413f
+[20324.712087] mz0380[0]: M212 raw slot 2 head changed (#144): 46484b4d4e4c4c4843403f404242413f
+[20324.733885] mz0380[0]: M212 raw slot 3 head changed (#153): 46474b4d4f4d4c48424040404141403e
+[20324.761980] mz0380[0]: M212 raw slot 1 head changed (#146): 45474b4d4e4c4a47433f40404040403e
+[20324.778776] mz0380[0]: M212 raw slot 2 head changed (#145): 45474b4d4e4c4a47433f40404040403e
+[20324.794767] mz0380[0]: M212 raw slot 3 head changed (#154): 46484b4d4c4c4a47423f3f3f4040403e
+[20324.828649] mz0380[0]: M212 raw slot 1 head changed (#147): 46484a4d4e4c4947433f3f404140403e
+[20324.845414] mz0380[0]: M212 raw slot 2 head changed (#146): 46484a4d4e4c4947433f3f404140403e
+[20325.308409] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=fe80:0000:0000:0000:e356:dd0b:65fb:ed5d DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=529916 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20325.308453] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=fe80:0000:0000:0000:5f88:7e53:d229:6412 DST=ff02:0000:0000:0000:0000:0000:0001:0003 LEN=70 TC=0 HOPLIMIT=255 FLOWLBL=310687 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20326.349538] mz0380[0]: H.264 slot 0 not complete: len=618296 copy=618296 identity=1 prefix=00 00 00 01
+[20327.416216] mz0380[0]: H.264 slot 0 not complete: len=618491 copy=618491 identity=1 prefix=00 00 00 01
+[20327.808364] [UFW BLOCK] IN=wlan0 OUT= MAC= SRC=192.168.88.248 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=31690 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20327.808400] [UFW BLOCK] IN=enp7s0 OUT= MAC= SRC=192.168.88.243 DST=224.0.0.252 LEN=50 TOS=0x00 PREC=0x00 TTL=255 ID=25598 PROTO=UDP SPT=5355 DPT=5355 LEN=30 
+[20329.016179] mz0380[0]: H.264 slot 0 not complete: len=618289 copy=618289 identity=1 prefix=00 00 00 01
+[20329.661329] mz0380_raw_observe_sample: 221 callbacks suppressed
+[20329.661332] mz0380[0]: M212 raw slot 3 head changed (#227): 45464a4e4e4c4a49444040414241403e
+[20329.695214] mz0380[0]: M212 raw slot 1 head changed (#217): 46474a4e4e4c4b4a45413f404140403f
+[20329.711995] mz0380[0]: M212 raw slot 2 head changed (#215): 46474a4e4e4c4b4a45413f404140403f
+[20329.727997] mz0380[0]: M212 raw slot 3 head changed (#228): 47484a4e504c4c4a4541404140413f3f
+[20329.761876] mz0380[0]: M212 raw slot 1 head changed (#218): 47484a4d504c4b4a454040414142403f
+[20329.761896] mz0380 0000:04:00.0: VB2 detached; persistent H.264 pipeline, DMA mappings and completion ACK path remain active (no STOP, no SET_VIC budget spent)
+[20329.778665] mz0380[0]: M212 raw slot 2 head changed (#216): 47484a4d504c4b4a454040414142403f
+[20329.794670] mz0380[0]: M212 raw slot 3 head changed (#229): 47484a4d4e4c4b4a443f404041413f3e
+[20329.828541] mz0380[0]: M212 raw slot 1 head changed (#219): 46474a4d4e4c4c4b433f3f404140403f
+[20329.845327] mz0380[0]: M212 raw slot 2 head changed (#217): 46474a4d4e4c4c4b433f3f404140403f
+[20329.861321] mz0380[0]: M212 raw slot 3 head changed (#230): 46474b4d4e4c4b4a433e3e404141403f

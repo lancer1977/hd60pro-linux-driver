@@ -12,9 +12,11 @@
 .claude/
 # RE source material (large vendor binaries) - kept local, not committed
 windowsDriver/
-sc0710-*.c
-sc0710-*.h
-sc0710.h
+# Third-party GPL drivers consulted during RE. Never built, never distributed,
+# and nothing in src/ derives from them - see README "Provenance". Safe to
+# delete; kept only so the RE citations in RE_FINDINGS.md can be checked.
+reference/
 # RE-derived vendor disasm/dumps - kept local
 re-dump/
 ep-disasm.txt
+__pycache__/

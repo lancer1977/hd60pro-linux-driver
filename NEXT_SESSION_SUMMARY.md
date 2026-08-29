@@ -229,35 +229,35 @@ For record mode:
 
 ```bash
 cd /home/wolffyx/Projects/sc0710
-./mz0380-correlation.sh --profile 5 --record-mode 2 --record-mode-reg 0x0058 --keep-loaded
+scripts/mz0380-correlation.sh --profile 5 --record-mode 2 --record-mode-reg 0x0058 --keep-loaded
 ```
 
 For bitrate:
 
 ```bash
 cd /home/wolffyx/Projects/sc0710
-./mz0380-correlation.sh --profile 5 --bitrate-seq 6291456,8388608,12582912 --bitrate-reg 0x005c --keep-loaded
+scripts/mz0380-correlation.sh --profile 5 --bitrate-seq 6291456,8388608,12582912 --bitrate-reg 0x005c --keep-loaded
 ```
 
 For quality:
 
 ```bash
 cd /home/wolffyx/Projects/sc0710
-./mz0380-correlation.sh --profile 5 --quality-seq 0,50,80,100 --quality-reg 0x0060 --keep-loaded
+scripts/mz0380-correlation.sh --profile 5 --quality-seq 0,50,80,100 --quality-reg 0x0060 --keep-loaded
 ```
 
 For GOP:
 
 ```bash
 cd /home/wolffyx/Projects/sc0710
-./mz0380-correlation.sh --profile 5 --gop-seq 30,60,120 --enable-video --keep-loaded
+scripts/mz0380-correlation.sh --profile 5 --gop-seq 30,60,120 --enable-video --keep-loaded
 ```
 
 For QP step:
 
 ```bash
 cd /home/wolffyx/Projects/sc0710
-./mz0380-correlation.sh --profile 5 --qp-step-seq 0,4,8 --enable-video --keep-loaded
+scripts/mz0380-correlation.sh --profile 5 --qp-step-seq 0,4,8 --enable-video --keep-loaded
 ```
 
 ## Recommended Resume Commands
@@ -279,7 +279,7 @@ The next quick sanity-check command for the confirmed QP-step path should look l
 ```bash
 cd /home/wolffyx/Projects/sc0710
 sudo rmmod mz0380
-./mz0380-correlation.sh --no-build --profile 5 --qp-step-seq 0,4,8 --enable-video --keep-loaded
+scripts/mz0380-correlation.sh --no-build --profile 5 --qp-step-seq 0,4,8 --enable-video --keep-loaded
 ```
 
 `0x0080`, `0x0084`, and `0x0088` are now confirmed as the BAR5 property-405, property-408, and property-411 fields. The next syntax-family search should stay in the same BAR5 `0x0080..0x00bc` window before considering any wider search.
@@ -289,5 +289,5 @@ The current quick-start command for re-checking the grounded property-411 path s
 ```bash
 cd /home/wolffyx/Projects/sc0710
 sudo rmmod mz0380
-./mz0380-correlation.sh --no-build --profile 5 --b-frames-seq 0,1,2 --enable-video --keep-loaded
+scripts/mz0380-correlation.sh --no-build --profile 5 --b-frames-seq 0,1,2 --enable-video --keep-loaded
 ```

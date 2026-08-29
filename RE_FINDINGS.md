@@ -228,7 +228,7 @@ per-read `pr_info` trace):
 Correct surface = the HDMI **bridge chip (0x90)** via the proven mailbox
 `REG_READ (0x1a)` path (`mz0380_periph_read`). New `/proc/mz0380-periph-scan`
 walks a chip's register file diff-stably. The old `MZ0380_BRIDGE_SIGNAL 0x12
-bit0` label is unverified -- the hunt (`PERIPH=1 ./mz0380-signal-hunt.sh`)
+bit0` label is unverified -- the hunt (`PERIPH=1 scripts/mz0380-signal-hunt.sh`)
 finds which bridge register really tracks lock. Needs `dma_handshake=1`.
 
 Tooling: `/proc/mz0380-scan` (raw BAR, safe-range gated), `/proc/mz0380-periph-scan`
@@ -745,7 +745,7 @@ BRING-UP ORDER (Windows): reset -> write EDID -> assert HPD -> mode detect.
 A source outputs NOTHING until EDID+HPD are presented; reg 0x55 reads
 no-signal even with I2C working — do not conflate with NAK.
 
-NEXT: run ./mz0380-mst3367-test.sh (root, module loaded) — baseline 0x9C read
+NEXT: run scripts/mz0380-mst3367-test.sh (root, module loaded) — baseline 0x9C read
 (nonzero result = first-ever ACK), GPIO bitmap read, then the gating
 candidates: --with-vic (SET_VIC first), GPL init/reset sequence. First real
 ACK unblocks the whole hdcapm reuse path.
@@ -847,7 +847,7 @@ FIX (mailbox commands, no direction needed):
   companion:      pin8 low during the low phase, high on release.
 Then run the hdcapm init + probe reg 0x55.
 
-TEST: ./mz0380-mst3367-test.sh --gpio-reset   (P3g runs exactly this sequence,
+TEST: scripts/mz0380-mst3367-test.sh --gpio-reset   (P3g runs exactly this sequence,
 then re-probes 0x55 + a write/read-back bus-liveness check). First nonzero read
 = MST3367 out of reset = whole bring-up unblocked.
 
@@ -3877,7 +3877,7 @@ now the only remaining instrument, and M77 already proved its transport.
 
 ### M95 (2026-08-20): the vic_b0=0x20 test was confounded by a bad DEFAULT
 
-`sudo VICB0=0x20 ./mz0380-m55-real-capture.sh 4` returned 0/1024, no splash -
+`sudo VICB0=0x20 scripts/mz0380-m55-real-capture.sh 4` returned 0/1024, no splash -
 and the result is worthless, because `win_seq` still defaulted to 1. The log
 shows it plainly: pre-STOP -> SET_VIC -> SET_AIC -> 2x SET_ENC -> POST_PROC, no
 op6. M90 had ALREADY established that `win_seq=1` renders nothing whatever else
@@ -3900,11 +3900,11 @@ oracle is a trap, not a preference.
 The `vic_b0 = 0x20` question is therefore still **OPEN and untested**. Rerun on
 the corrected defaults:
 
-    sudo VICB0=0x20 ./mz0380-m55-real-capture.sh 4
+    sudo VICB0=0x20 scripts/mz0380-m55-real-capture.sh 4
 
 with the control immediately before or after it:
 
-    sudo ./mz0380-m55-real-capture.sh 4        # must give 760/1024
+    sudo scripts/mz0380-m55-real-capture.sh 4        # must give 760/1024
 
 ---
 
@@ -3916,8 +3916,8 @@ verified control immediately before it. Every other knob confirmed at its
 known-good value *from the source*, not from memory: `vic_fw=5`, `win_seq=0`,
 `win_bufs_first=1`, `enc_sub=1`, `mst_win_output=0`, `irq_intx=1`.
 
-    sudo ./mz0380-m55-real-capture.sh 4               # control
-    sudo VICB0=0x20 ./mz0380-m55-real-capture.sh 4    # the test
+    sudo scripts/mz0380-m55-real-capture.sh 4               # control
+    sudo VICB0=0x20 scripts/mz0380-m55-real-capture.sh 4    # the test
 
 **Control reproduced the baseline exactly**: `760/1024 sampled pages touched,
 last @0x2f7000`, head `11 11 11 11 11 10 11 11`, bufs 1-3 untouched, `R55=0x7f`
@@ -3999,7 +3999,7 @@ opposite direction: not a bad default, a bad deliberate pairing.
 
 The block has never been tried at the only `b0` that works:
 
-    sudo MSTOUT=1 ./mz0380-m55-real-capture.sh 4     # vic_b0 stays at its 0x21 default
+    sudo MSTOUT=1 scripts/mz0380-m55-real-capture.sh 4     # vic_b0 stays at its 0x21 default
 
 `mst_win_output=1` writes `b0` as a plain write of `vic_b0` (0x21), where the
 default path writes `(b0 & 0xc2) | (vic_b0 & 0x3d)`. Hardware `b0 & 0xc2` reads
@@ -4079,7 +4079,7 @@ consumer, run it *instead of* the script's capture step, never alongside it.
 ### M99 RESULT (hardware, 2026-08-20): the Windows output-stage block is NEUTRAL
 ### at b0=0x21 - and it accidentally bisected 0xad as well
 
-    sudo MSTOUT=1 ./mz0380-m55-real-capture.sh 4
+    sudo MSTOUT=1 scripts/mz0380-m55-real-capture.sh 4
 
 Block applied and logged: `b0=21 ae|=04 ad=00 b1=c0 b2=00 b3=00 b4=54 ret=0`.
 Result **bit-identical to the baseline**: `760/1024 sampled pages touched, last
@@ -4150,8 +4150,8 @@ init, and the bit hdcapm labels 10-BITS. BT.1120 is natively a **20-bit**
 interface (10-bit Y + 10-bit C); 8-bit is the reduced BT.656-style variant.
 Feeding a 10-bit VIC an 8-bit stream is precisely a width/structure mismatch.
 
-    sudo ./mz0380-m55-real-capture.sh 4               # control
-    sudo VICB0=0x25 ./mz0380-m55-real-capture.sh 4
+    sudo scripts/mz0380-m55-real-capture.sh 4               # control
+    sudo VICB0=0x25 scripts/mz0380-m55-real-capture.sh 4
 
 `0x25 & 0x3d = 0x25`, so the mask in `commit_digital_output()` passes it intact;
 confirm `b0=25` in the output-stage diag before reading anything else. Note that
@@ -4167,7 +4167,7 @@ write `0xc0/0x00` from the HD60 Pro's own `FUN_14024dc28`.
 ### M101 RESULT (hardware, 2026-08-20): vic_b0=0x25 is NEUTRAL - 10-bit changes
 ### nothing - but the new readback catches a write that never landed
 
-    sudo VICB0=0x25 ./mz0380-m55-real-capture.sh 4
+    sudo VICB0=0x25 scripts/mz0380-m55-real-capture.sh 4
 
 `b0=25` read back at all three diag points. Output **bit-identical to the
 baseline**: `760/1024 sampled pages touched, last @0x2f7000`, head
@@ -4226,8 +4226,8 @@ with embedded timing codes is **CCIR656**, not BT1120 - BT1120 is the wide
 So the two ends of the link are configured for different structures, which is
 the exact shape of the failure, and it is a one-knob test:
 
-    sudo ./mz0380-m55-real-capture.sh 4                 # control
-    sudo VICINFMT=3 ./mz0380-m55-real-capture.sh 4      # CCIR656p
+    sudo scripts/mz0380-m55-real-capture.sh 4                 # control
+    sudo VICINFMT=3 scripts/mz0380-m55-real-capture.sh 4      # CCIR656p
 
 `vic_b0` stays at its `0x21` default, so the pairing is coherent: receiver says
 8-bit embedded sync, VIC is told CCIR656p. Confirm `in_fmt=3` in the SET_VIC
@@ -4295,8 +4295,8 @@ Fixed: `MZ0380_VIC_IN_FMT_AUTO` (`~0u`) is now the "derive it" sentinel and the
 parameter defaults to it, so the derived behaviour is byte-for-byte unchanged
 while `vic_in_fmt=0` is finally reachable.
 
-    sudo ./mz0380-m55-real-capture.sh 4              # control
-    sudo VICINFMT=0 ./mz0380-m55-real-capture.sh 4   # interlace=0, progressive
+    sudo scripts/mz0380-m55-real-capture.sh 4              # control
+    sudo VICINFMT=0 scripts/mz0380-m55-real-capture.sh 4   # interlace=0, progressive
 
 Confirm `in_fmt=0` in the SET_VIC line. An encoder told to expect interlaced
 fields from a progressive source is a completely sufficient explanation for
@@ -4314,7 +4314,7 @@ grepping for elsewhere: `mz0380_vic_fw ?: (...)` has the identical shape, and
 ### M104 RESULT (hardware, 2026-08-20): byte7 is the FORMAT ENUM after all -
 ### M103 RETRACTED - but byte7 is now PROVEN CONSUMED
 
-    sudo VICINFMT=0 ./mz0380-m55-real-capture.sh 4
+    sudo VICINFMT=0 scripts/mz0380-m55-real-capture.sh 4
 
 `in_fmt=0` in the SET_VIC line, and the **splash STOPPED**: `0/1024` on all four
 buffers, buf0 solid `aa`. The first non-neutral result ever obtained from the
@@ -4414,7 +4414,7 @@ Everything here was static: **zero encoder spawns, zero hardware runs.**
 ### M107 RESULT (hardware, 2026-08-20): WINBUFS=0 does not move the 16-byte
 ### stall - but the 16 bytes are NOT a truncated splash
 
-    sudo WINSEQ=1 OP6=1 WINBUFS=0 ./mz0380-m55-real-capture.sh 4
+    sudo WINSEQ=1 OP6=1 WINBUFS=0 scripts/mz0380-m55-real-capture.sh 4
 
 `1/1024 sampled pages touched, last @0x0`, i.e. the same "exactly 16 bytes
 written" stall M91 found with `WINSEQ=1 OP6=1` alone. Putting SET_BUF back after
@@ -4485,8 +4485,8 @@ negative. That verdict should not be trusted:
   There is now a specific threshold, a specific register, and a specific
   consequence.
 
-    sudo ./mz0380-m55-real-capture.sh 4                 # control
-    sudo VICINW=3840 ./mz0380-m55-real-capture.sh 4     # cross the 2560 threshold
+    sudo scripts/mz0380-m55-real-capture.sh 4                 # control
+    sudo VICINW=3840 scripts/mz0380-m55-real-capture.sh 4     # cross the 2560 threshold
 
 Everything else stays at today's verified defaults (`fw=5`, `win_seq=0`,
 `b0=0x21`, `in_fmt=6`). Confirm `vic_in=3840x1080` in the SET_VIC line.
@@ -4503,7 +4503,7 @@ and costs no spawns.
 ### M109 RESULT (hardware, 2026-08-20): vic_in_w=3840 is NEUTRAL under a
 ### verified baseline - M76's negative now stands
 
-    sudo VICINW=3840 ./mz0380-m55-real-capture.sh 4
+    sudo VICINW=3840 scripts/mz0380-m55-real-capture.sh 4
 
 `vic_in=3840x1080` in the SET_VIC line, and the result is **bit-identical to the
 baseline**: `760/1024`, `last @0x2f7000`, head `11 11 11 11 11 10 11 11`.
@@ -4567,8 +4567,8 @@ artefact of the original bring-up. 0 and 1 are both real levels, so
 `MZ0380_RX_STRAP_LEAVE` (`~0u`) is a third value meaning "do not drive pin 8 at
 all". Default is 0, i.e. **behaviour is unchanged** unless asked.
 
-    sudo RXSTRAP=1 ./mz0380-m55-real-capture.sh 4            # release the strap
-    sudo RXSTRAP=0xffffffff ./mz0380-m55-real-capture.sh 4   # never drive it
+    sudo RXSTRAP=1 scripts/mz0380-m55-real-capture.sh 4            # release the strap
+    sudo RXSTRAP=0xffffffff scripts/mz0380-m55-real-capture.sh 4   # never drive it
 
 Score BOTH oracles on these runs: the buffer scan as usual, **and the monitor on
 the card's HDMI OUT**. A passthrough that comes back is a real result even if
@@ -4706,7 +4706,7 @@ Windows shows the no-signal splash in OBS with nothing plugged in, so the source
 is not required to get pixels - and leaving it out removes the last uncontrolled
 variable from the run.
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
 
 Expect in dmesg:
 
@@ -4760,7 +4760,7 @@ The timing change matters beyond convenience. A no-source run is ~15s instead of
 which is what produced the M105 measurement artefact. It is a strictly better
 instrument for everything except source-content questions.
 
-    sudo NOSRC=1 POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo NOSRC=1 POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
     ffplay -f rawvideo -pixel_format nv12 -video_size 1920x1080 /tmp/cap-m55.nv12
 
 Expect: `arming anyway at 1920x1080p60 [stream_without_signal=1]`, then
@@ -4772,7 +4772,7 @@ then a non-zero byte count.
 ### M114 RESULT (hardware, 2026-08-20): with NO source the card writes NOTHING -
 ### the splash needs a lock, and the Windows "no signal" was misread
 
-    sudo NOSRC=1 POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo NOSRC=1 POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
 
 Everything armed exactly as intended - `arming anyway at 1920x1080p60
 [stream_without_signal=1]`, SET_VIC/SET_ENC_PARAMS/SET_AIC/START all `ret=0` -
@@ -4817,7 +4817,7 @@ fires, so `mz0380_drain_frame_snapshot()` is never called and userspace gets
 nothing. That is what the poll-drain exists to fix, and it has not yet been run
 in the situation it was written for:
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4     # SOURCE CONNECTED, no NOSRC
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4     # SOURCE CONNECTED, no NOSRC
 
 Expect `poll-drain: buf 0 holds 3110400 bytes with no completion event;
 delivering` and a non-zero byte count, then:
@@ -4832,7 +4832,7 @@ that is what "stuck" looked like here, not a decode problem.)
 ### M115 RESULT (hardware, 2026-08-20): **FIRST PIXELS.** The poll-drain works -
 ### 3903488 bytes captured, and the card's splash renders
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
 
     --- captured 3903488 bytes ---
     frame token 0 inferred length=794368  from 4-byte poison boundary
@@ -4897,7 +4897,7 @@ verdict should be re-tested now that a second frame is a visible outcome.
 ### M116 RESULT (hardware, 2026-08-20): op 0x08 is neutral for CADENCE too -
 ### re-tested on an oracle that can see it
 
-    sudo OP8=1 POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo OP8=1 POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
 
     SET_BUF_8(op 0x08, window0 slots 5..8, sets wency_ready) ret=0
     frame token 0 inferred length=3110400 ...
@@ -4935,7 +4935,7 @@ mangled the outcome it did produce. Fixed three ways:
 * When NOT ONE whole frame survived, it now says so explicitly and prints the
   fix - ask for a count the card can deliver:
 
-      sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1
+      sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 1
 
 **While cadence is one-frame-per-stream, request ONE frame.** Asking for four
 guarantees the kill-mid-write every time.
@@ -4987,7 +4987,7 @@ pass in which it delivered anything, mirroring the event path's batch ack.
 than one frame and buffers 1-3 start seeing traffic. If cadence stays at one
 frame, `enc_stat` is not the gate and `credit_kick_ms` is next.
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
 
 Ask for 4 frames deliberately this time: if the fix works, v4l2-ctl gets its
 four and exits cleanly, and the M116 kill-mid-write problem disappears on its
@@ -4998,7 +4998,7 @@ own. If only one arrives it will be trimmed and reported as before.
 ### M118 RESULT (hardware, 2026-08-20): the enc_stat ack does NOT fix cadence -
 ### M117 refuted. And the 1536-byte shortfall is fully explained
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 4
 
 One `frame token 0 inferred length=3110400` delivery. **Still exactly one
 frame**, bufs 1-3 still untouched. M117's prediction was wrong: acking
@@ -5027,7 +5027,7 @@ That is independent of how v4l2-ctl dies. Score cadence on that from now on.
 To get a clean playable file, ask for a count the card can deliver, so v4l2-ctl
 exits normally and flushes:
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 1
 
 #### What is left, and why credit_kick_ms could not have been tested as-is
 
@@ -5049,14 +5049,14 @@ ever restored it - the card may be sitting on a spent credit, unable to signal
 the next frame, which fits "exactly one frame" as well as enc_stat did and is
 the last part of the ISR the poll path does not reproduce.
 
-    sudo POLLDRAIN=20 POLLCREDIT=1 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 POLLCREDIT=1 scripts/mz0380-m55-real-capture.sh 4
 
 Score with `dmesg | grep -c 'inferred H.264 length='`, and watch bufs 1-3.
 
 ### M119 (2026-08-20): every host-side ack is eliminated - the cadence gate is
 ### the per-frame WAKE-UP, and op 0x06 is it
 
-    sudo POLLDRAIN=20 POLLCREDIT=1 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 POLLCREDIT=1 scripts/mz0380-m55-real-capture.sh 4
     sudo dmesg | grep -c 'inferred H.264 length='   ->  1
 
 The completion credit re-arm (BAR5[0xdc]=2, EVENT=0, doorbell 0x400) fired after
@@ -5097,7 +5097,7 @@ op6 is fire-and-forget - it posts no mailbox completion - and crucially it does
 thread that reliably runs for the whole stream), and the stop line now reports
 the kick count alongside deliveries.
 
-    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 OP6KICK=16 scripts/mz0380-m55-real-capture.sh 4
 
 16 ms is one frame period at 60fps. Score with:
 
@@ -5114,7 +5114,7 @@ Operation not permitted` otherwise, which silently reports 0).
 ### M120 RESULT (hardware, 2026-08-20): a free-running op6 kick is WORSE than
 ### none - zero frames and a lost receiver lock
 
-    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 OP6KICK=16 scripts/mz0380-m55-real-capture.sh 4
     sudo dmesg | grep -c 'inferred H.264 length='   ->  0
 
 A regression from the reliable one frame, and the receiver came apart with it:
@@ -5148,7 +5148,7 @@ new and unexplained.
 kick cannot occur until the first frame has already arrived - and it matches what
 the handshake actually is: consume a frame, ask for the next.
 
-    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4
+    sudo POLLDRAIN=20 OP6KICK=16 scripts/mz0380-m55-real-capture.sh 4
     sudo dmesg | grep -c 'inferred H.264 length='
 
 Expect at least the usual one delivery (the kick cannot make the first frame
@@ -5162,7 +5162,7 @@ power cycle, the wedge band is 8-18, and the card just had a bad run.
 ### M121 (2026-08-20): two zero-frame runs in a row, no cold boot between them -
 ### the card is in the wedge band and the last two results are VOID
 
-    sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4   (reshaped kick)
+    sudo POLLDRAIN=20 OP6KICK=16 scripts/mz0380-m55-real-capture.sh 4   (reshaped kick)
     sudo dmesg | grep -c 'inferred H.264 length='   ->  0
 
 **No op6 kick could have fired.** M120's reshaped kick only fires after a
@@ -5201,14 +5201,14 @@ now.
 #### Sequence to resume
 
 1. **Mains-off cold boot.** Slot standby survives a soft power-off.
-2. `sudo ./mz0380-m77-cardlog.sh` - zero-spawn health check. Healthy = op 0x6e
+2. `sudo scripts/mz0380-m77-cardlog.sh` - zero-spawn health check. Healthy = op 0x6e
    answers with the untouched sentinel; `-110` means still wedged.
 3. Control, and ask for one frame so v4l2-ctl exits cleanly:
-   `sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1`
+   `sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 1`
    Expect exactly one `inferred H.264 length=3110400` and a clean 3110400-byte
    file. **If this does not give one frame, stop - the card is still unhealthy
    and nothing measured after it means anything.**
-4. Only then: `sudo POLLDRAIN=20 OP6KICK=16 ./mz0380-m55-real-capture.sh 4`
+4. Only then: `sudo POLLDRAIN=20 OP6KICK=16 scripts/mz0380-m55-real-capture.sh 4`
    and check `poll-drain stopped after N deliveries, M op6 kicks` in the output.
    M > 0 is the proof the kick actually ran.
 
@@ -5663,7 +5663,7 @@ has ever written it, on this board, by anything.
 answered by this scan. `mz0380-m83-i2c-devscan.sh` scans `0x00..0x3f` only, and
 both registers sit above that window. The scan as run cannot speak to it.
 `periph_start` already existed as a module parameter; the script now plumbs it
-through as `START`, so `START=0x90 sudo ./mz0380-m83-i2c-devscan.sh 0x40`
+through as `START`, so `START=0x90 sudo scripts/mz0380-m83-i2c-devscan.sh 0x40`
 covers `0x90..0xcf` and actually runs the test. Zero spawns.
 
 ### M126: `kick_opcode`
@@ -5671,7 +5671,7 @@ covers `0x90..0xcf` and actually runs the test. Zero spawns.
 `op6_kick_ms` now fires `kick_opcode` (default `0x06`, unchanged) instead of a
 hard-coded `MZ0380_CMD_START_STREAMING`, so M125's lead can be run:
 
-    sudo POLLDRAIN=20 OP6KICK=16 KICKOP=0x2f ./mz0380-m55-real-capture.sh 3
+    sudo POLLDRAIN=20 OP6KICK=16 KICKOP=0x2f scripts/mz0380-m55-real-capture.sh 3
     sudo dmesg | grep -c 'inferred H.264 length='   # cadence: want > 1
 
 Score on the delivery count, never the file size (M118). The poll-drain summary
@@ -5700,17 +5700,17 @@ start-up read of SET_VIC; gating on `delivered > 0` keeps that impossible. The
 first kick's return code is now logged, so a rejected command is visible
 instead of being swallowed by the async send.
 
-    sudo POLLDRAIN=20 OP6KICK=16 KICKOP=0x2f KICKREP=1 ./mz0380-m55-real-capture.sh 3
+    sudo POLLDRAIN=20 OP6KICK=16 KICKOP=0x2f KICKREP=1 scripts/mz0380-m55-real-capture.sh 3
     sudo dmesg | grep -c 'inferred H.264 length='
 
 ### M126 gotcha: sudo resets the environment
 
-`START=0x90 sudo ./mz0380-m83-i2c-devscan.sh 0x40` ran, printed a full scan,
+`START=0x90 sudo scripts/mz0380-m83-i2c-devscan.sh 0x40` ran, printed a full scan,
 and **silently scanned `0x00..0x3f` anyway** - `sudo` does not forward
 environment variables from the caller. Every knob has to sit AFTER `sudo`,
 which is why `sudo POLLDRAIN=20 ./mz0380-m55-...` has always worked:
 
-    sudo START=0x90 ./mz0380-m83-i2c-devscan.sh 0x40
+    sudo START=0x90 scripts/mz0380-m83-i2c-devscan.sh 0x40
 
 The scan header prints the register window it actually used
 (`regs 0x00..0x3f`). Read it before reading the values - this class of failure
@@ -5789,8 +5789,8 @@ Now testable properly: `POLLDRAIN` delivers, and `mz0380-m126-score.py` scores
 on the chroma plane instead of on a byte count that used to be structurally
 zero.
 
-    sudo POLLDRAIN=20 VICINW=2048 VICINH=1125 ./mz0380-m55-real-capture.sh 1
-    sudo POLLDRAIN=20 VICINW=2200 VICINH=1125 ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICINW=2048 VICINH=1125 scripts/mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICINW=2200 VICINH=1125 scripts/mz0380-m55-real-capture.sh 1
 
 #### 0x98 above 0x3f - read, and it is untouched
 
@@ -6044,7 +6044,7 @@ both (`MZ0380_MB_FRAME_TOKEN`, `MZ0380_MB_ENC_STATUS`).
 
 ### M127b - the splash identified by byte identity, not inference
 
-Run: `sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 1`, card healthy, one frame,
+Run: `sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 1`, card healthy, one frame,
 receiver `R55=0x7f` LOCKED 1920x1080p60 HDMI, `htot=2200 vtot=1125`.
 
 The captured Y plane is **`NOSG_LOGO_Y`, the 320x240 data symbol at tinyvenc5
@@ -6160,7 +6160,7 @@ outcome being measured - method rule 1, exactly.
 Next run, one spawn, everything else at the known-good baseline:
 
 ```bash
-sudo POLLDRAIN=20 VICB0=0x20 ./mz0380-m55-real-capture.sh 1
+sudo POLLDRAIN=20 VICB0=0x20 scripts/mz0380-m55-real-capture.sh 1
 ```
 
 Confirm `b0=20` in the `output stage` readback lines before believing anything -
@@ -6175,8 +6175,8 @@ is vendor firmware and is deliberately not vendored - only its digest is.
 
 ### M127f (hardware, 2026-08-21): TWO SPAWNS WASTED - this replicates M96
 
-    sudo POLLDRAIN=20 VICB0=0x20 ./mz0380-m55-real-capture.sh 1
-    sudo POLLDRAIN=20 VICB0=0x20 VICINW=3840 ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICB0=0x20 scripts/mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICB0=0x20 VICINW=3840 scripts/mz0380-m55-real-capture.sh 1
 
 Both landed (`b0=20` at all three diag points, `vic_in=3840x1080` in the SET_VIC
 line) and both produced **nothing**: 0 deliveries, `0/1024` on all four buffers,
@@ -6226,8 +6226,8 @@ flags that verdict as needing re-measurement). M126 re-ran 2048 and 2200 at
 never reaches VIC init, so they say nothing about width.
 
 ```bash
-sudo POLLDRAIN=20 VICINW=3840 ./mz0380-m55-real-capture.sh 1
-./mz0380-m127-splash.py /tmp/cap-m55.nv12
+sudo POLLDRAIN=20 VICINW=3840 scripts/mz0380-m55-real-capture.sh 1
+scripts/mz0380-m127-splash.py /tmp/cap-m55.nv12
 ```
 
 Defaults elsewhere (`b0=0x21`, `fw=5`, `win_seq=0`, `in_fmt=6`). Confirm both
@@ -6235,7 +6235,7 @@ Defaults elsewhere (`b0=0x21`, `fw=5`, `win_seq=0`, `in_fmt=6`). Confirm both
 
 ### M127g RESULT (hardware, 2026-08-21): `vic_in_w = 3840` is NEUTRAL - M76 is now validly dead
 
-    sudo POLLDRAIN=20 VICINW=3840 ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 VICINW=3840 scripts/mz0380-m55-real-capture.sh 1
 
 Both knobs confirmed in the log: `b0=21` at all three diag points,
 `vic_in=3840x1080` in the SET_VIC line. One frame, and
@@ -6449,8 +6449,8 @@ needs root and this session had no sudo.
 
 ### Next
 
-1. `sudo ./mz0380-m85-unload-smoke.sh`, then one spawn:
-   `sudo POLLDRAIN=20 EXTRA="fake_frame_off=1" ./mz0380-m55-real-capture.sh 1`
+1. `sudo scripts/mz0380-m85-unload-smoke.sh`, then one spawn:
+   `sudo POLLDRAIN=20 EXTRA="fake_frame_off=1" scripts/mz0380-m55-real-capture.sh 1`
    scored with `mz0380-m127-splash.py` (expect 2/NO FRAME or, if the race
    reading is right, 0/NOT SPLASH with real content).
 2. `fw = 6`, one spawn - still the last invalidated verdict.
@@ -6458,7 +6458,7 @@ needs root and this session had no sudo.
 
 ### M128a (hardware, 2026-08-21): fake_frame_off lands, the splash is gone, and the frame is a 16-byte stall
 
-One spawn. `sudo POLLDRAIN=20 EXTRA="fake_frame_off=1" ./mz0380-m55-real-capture.sh 1`,
+One spawn. `sudo POLLDRAIN=20 EXTRA="fake_frame_off=1" scripts/mz0380-m55-real-capture.sh 1`,
 default everything else (`win_seq=0`, `fw=5`, `in_fmt=6`, bufs after SET_VIC).
 
 The knob landed - method rule 9 satisfied before reading anything else:
@@ -6523,7 +6523,7 @@ with `fake_frame_off` left at 0 - one variable from this run, every other
 variable at a value already known to permit a full frame:
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="post_proc=1" ./mz0380-m55-real-capture.sh 1
+sudo POLLDRAIN=20 EXTRA="post_proc=1" scripts/mz0380-m55-real-capture.sh 1
 ```
 
     full 3110400 B splash  -> 0x31 is harmless. The stall belongs to
@@ -6546,7 +6546,7 @@ control run to confirm and not more than that.
 
 ### M128b (hardware, 2026-08-21): the control fires - op `0x31` truncates the DMA, and M91 is closed
 
-One spawn. `sudo POLLDRAIN=20 EXTRA="post_proc=1" ./mz0380-m55-real-capture.sh 1`.
+One spawn. `sudo POLLDRAIN=20 EXTRA="post_proc=1" scripts/mz0380-m55-real-capture.sh 1`.
 `fake_frame_off=0`, everything else exactly as M128a.
 
     stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x1f, fps=60, die_en=1, fake_frame_off=0) ret=0
@@ -6619,7 +6619,7 @@ explains M91 without needing `win_bufs_first`.
 `post_proc_gap_ms` (new) inserts a wait between `0x31` and `0x06`:
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_gap_ms=200" ./mz0380-m55-real-capture.sh 1
+sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_gap_ms=200" scripts/mz0380-m55-real-capture.sh 1
 ```
 
     full 3110400 B splash -> cadence. 0x31 is usable with a gap, which is what
@@ -6636,7 +6636,7 @@ as a whole.
 
 ### M128c (hardware, 2026-08-21): the cadence hypothesis is dead; `0x31` bypasses ep.ko's no_signal latch
 
-One spawn. `sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_gap_ms=200" ./mz0380-m55-real-capture.sh 1`.
+One spawn. `sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_gap_ms=200" scripts/mz0380-m55-real-capture.sh 1`.
 One variable from M128b.
 
     stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x1f, fps=60, die_en=1, fake_frame_off=0) ret=0
@@ -6718,7 +6718,7 @@ minimal `0x31` is also the one that still delivers what we want.
    (bits 0/1) and takes the short arm at 0xf014. Strictly fewer card-side
    writes than mask 0x1f.
    ```bash
-   sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0" ./mz0380-m55-real-capture.sh 1
+   sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0" scripts/mz0380-m55-real-capture.sh 1
    ```
    full frame -> `0x31` is usable. Immediately follow with
    `post_proc=1 post_mask=0 fake_frame_off=1`, which is the experiment this
@@ -6730,7 +6730,7 @@ minimal `0x31` is also the one that still delivers what we want.
    before START". `0x09` is inert on both sides: same 0x1824 arm in ep.ko, and
    tinyvenc5's handler at 0xe93c is a bare `pwrite(epint, payload, 44)`.
    ```bash
-   sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_opcode=0x09" ./mz0380-m55-real-capture.sh 1
+   sudo POLLDRAIN=20 EXTRA="post_proc=1 post_proc_opcode=0x09" scripts/mz0380-m55-real-capture.sh 1
    ```
    16 bytes -> the fault is structural: an extra epint command immediately
    before START truncates the stream whatever it is. That is a far bigger
@@ -6770,7 +6770,7 @@ and then complete 21 ms later - a healthy DMA, which is exactly what the
 
 Scored on the host, no spawn:
 
-    ./mz0380-m127-splash.py /tmp/cap-m55.nv12
+    scripts/mz0380-m127-splash.py /tmp/cap-m55.nv12
     sha256  dfce4efd5139298f544d23473f85a42fb7115a3c5e4ba65b71c070d59883a30b
     VERDICT: SPLASH - byte-identical to tinyvenc5's NOSG_LOGO_Y.
 
@@ -6811,8 +6811,8 @@ cost us `fw=7` (method rule 4: parity is a hypothesis generator, not a rule).
 minimal `0x31` carries it:
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" ./mz0380-m55-real-capture.sh 1
-./mz0380-m127-splash.py /tmp/cap-m55.nv12
+sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" scripts/mz0380-m55-real-capture.sh 1
+scripts/mz0380-m127-splash.py /tmp/cap-m55.nv12
 ```
 
 This is the run this whole thread exists for, and it now has a working delivery
@@ -6843,14 +6843,14 @@ touched here.
 
 ## M129 (hardware, 2026-08-21): REAL VIDEO. The card was capturing all along.
 
-    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" ./mz0380-m55-real-capture.sh 1
+    sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" scripts/mz0380-m55-real-capture.sh 1
 
     stream start: SET_PREVIEW_PARAMS(op 0x31, mask=0x00, fps=60, die_en=1, fake_frame_off=1) ret=0
     stream start: START_STREAMING(op 0x06) fired (async, ret=0)
     poll-drain: buf 0 holds 3110400 bytes with no completion event; delivering
     captured 3110400 bytes = 1 whole frames + 0 bytes
 
-    ./mz0380-m127-splash.py /tmp/cap-m55.nv12
+    scripts/mz0380-m127-splash.py /tmp/cap-m55.nv12
     sha256  eea4e3bf875845d453abd5911f7ef9b63fa72ec24dd4ece524e64e73fb50f5f7
     VERDICT: NOT SPLASH
              Y outside the crop: 170 distinct values
@@ -7049,8 +7049,8 @@ New knob `mst_csc_ctl` (default 0x40, i.e. no change):
 
 ```bash
 sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1 mst_csc_ctl=0" \
-     ./mz0380-m55-real-capture.sh 1
-./mz0380-m130-chroma.py /tmp/cap-m55.nv12
+     scripts/mz0380-m55-real-capture.sh 1
+scripts/mz0380-m130-chroma.py /tmp/cap-m55.nv12
 ```
 
 The run echoes `MST3367 CSC control 0x92 = 0x00 (hdcapm default 0x40)` when the
@@ -7082,7 +7082,7 @@ In descending order:
 One spawn.
 
     sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1 mst_csc_ctl=0" \
-         ./mz0380-m55-real-capture.sh 1
+         scripts/mz0380-m55-real-capture.sh 1
 
 | statistic | M129 (`0x92=0x40`) | M130a (`0x92=0x00`) |
 |---|---|---|
@@ -7160,7 +7160,7 @@ So a plain `insmod` should now produce real, correctly-coloured video, and the
 capture command is back to:
 
 ```bash
-sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 5
 ```
 
 Each old behaviour is still reachable: `post_proc=0` restores the pre-M129
@@ -7189,8 +7189,8 @@ been exercised against the splash.
 So the next run is just to ask for more, one variable from M130a:
 
 ```bash
-sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
-./mz0380-m130-chroma.py /tmp/cap-m55.nv12
+sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 5
+scripts/mz0380-m130-chroma.py /tmp/cap-m55.nv12
 ```
 
 `timeout -s INT --foreground "$CAPWAIT"` bounds it, so a stall cannot hang the
@@ -7207,12 +7207,12 @@ M130a forced `0` explicitly. The run echoes
 `MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2)`; if
 chroma comes back contaminated, suspect AUTO before the frame count.
 
-Not yet smoke-tested: `sudo ./mz0380-m85-unload-smoke.sh` should be run first,
+Not yet smoke-tested: `sudo scripts/mz0380-m85-unload-smoke.sh` should be run first,
 as after every build.
 
 ## M132 (hardware, 2026-08-21): the one-frame cadence is REAL
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 5
 
 First run on the M131 defaults, i.e. no `EXTRA=` at all. The frame count was the
 only variable against M130a.
@@ -7266,8 +7266,8 @@ impossible, and M126 made the kick repeat rather than fire once per frame.
 Ask for a frame every ~33 ms once the first has landed:
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="op6_kick_ms=33 kick_repeat=1" ./mz0380-m55-real-capture.sh 5
-./mz0380-m130-chroma.py /tmp/cap-m55.nv12
+sudo POLLDRAIN=20 EXTRA="op6_kick_ms=33 kick_repeat=1" scripts/mz0380-m55-real-capture.sh 5
+scripts/mz0380-m130-chroma.py /tmp/cap-m55.nv12
 ```
 
     5 whole frames  -> streaming works; the card simply needs asking per frame.
@@ -7283,7 +7283,7 @@ line that is now visible.
 
 ## M133 (hardware, 2026-08-21): kicks do not gate the cadence, and they cost the lock
 
-    sudo POLLDRAIN=20 EXTRA="op6_kick_ms=33 kick_repeat=1" ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 EXTRA="op6_kick_ms=33 kick_repeat=1" scripts/mz0380-m55-real-capture.sh 5
 
     29677.971  poll-drain: buf 0 holds 3110400 bytes ... delivering
     29677.972  poll-drain: first kick op 0x06 ret=0
@@ -7329,7 +7329,7 @@ for an event that never fires. It is the only remaining piece of the
 handshake that has not been tried against real frames.
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="poll_drain_credit=1" ./mz0380-m55-real-capture.sh 5
+sudo POLLDRAIN=20 EXTRA="poll_drain_credit=1" scripts/mz0380-m55-real-capture.sh 5
 ```
 
 ### A bug of mine: the CSC AUTO path read the wrong register value
@@ -7363,7 +7363,7 @@ read the driver log; use `... .sh 1` when the frame itself needs scoring.
 
 ## M134 (hardware, 2026-08-21): credit is not the gate either; CSC AUTO verified
 
-    sudo POLLDRAIN=20 EXTRA="poll_drain_credit=1" ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 EXTRA="poll_drain_credit=1" scripts/mz0380-m55-real-capture.sh 5
 
     41251.274  MST3367 CSC 0x92 = 0x00 (auto, input colorspace YUV444 from 0x48=d2, cached)
     41252.546  poll-drain: buf 0 holds 3110400 bytes ... delivering
@@ -7424,7 +7424,7 @@ Which bit of the old 0x1f mask truncates the DMA was deprioritised as
 `skip` can be set at all.
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="post_mask=0x01" ./mz0380-m55-real-capture.sh 5
+sudo POLLDRAIN=20 EXTRA="post_mask=0x01" scripts/mz0380-m55-real-capture.sh 5
 ```
 
 Bit 0 alone = store `skip`, nothing else.
@@ -7441,7 +7441,7 @@ Two answers from one spawn, whichever way it lands. Follow with
 
 ## M135 (hardware, 2026-08-21): mask bit 0 is the truncator - and the mechanism is a SKIPPED function call
 
-    sudo POLLDRAIN=20 EXTRA="post_mask=0x01" ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 EXTRA="post_mask=0x01" scripts/mz0380-m55-real-capture.sh 5
 
 Run twice, identical both times:
 
@@ -7611,7 +7611,7 @@ Nothing has ever set the video one.
 New knob `vic_int_mode` (SET_VIC byte 34, default 0 = no change):
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="vic_int_mode=1" ./mz0380-m55-real-capture.sh 5
+sudo POLLDRAIN=20 EXTRA="vic_int_mode=1" scripts/mz0380-m55-real-capture.sh 5
 ```
 
     >1 frame                 -> the cadence is solved.
@@ -7626,7 +7626,7 @@ anything else - those three are the measurement, not the frame count.
 
 ## M137 (hardware + static, 2026-08-21): `vic_int_mode=1` changes nothing - and why
 
-    sudo POLLDRAIN=20 EXTRA="vic_int_mode=1" ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 EXTRA="vic_int_mode=1" scripts/mz0380-m55-real-capture.sh 5
 
     stream stop: EVENT[0x30]=00000000 token[0x40]=00000000 ... frame_events=0
     poll-drain stopped after 1 deliveries, 0 kicks
@@ -7931,7 +7931,7 @@ the only host-settable values the source layer actually reads.
 
 ## M139 (hardware, 2026-08-21): the encoder never reported a single frame - `store_channel_done` has never run
 
-    sudo POLLDRAIN=20 ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 scripts/mz0380-m55-real-capture.sh 5
 
     stream start: frame-token sentinel a5a5a5a5 seeded into BAR0 40/44/48/4c;
                   readback a5a5a5a5/a5a5a5a5/a5a5a5a5/a5a5a5a5
@@ -8044,7 +8044,7 @@ so the buffer, the SET_BUF geometry and `mz0380_infer_frame_length()`'s
 hardcoded `w*h*3/2` all stay correct.
 
 ```bash
-sudo POLLDRAIN=20 EXTRA="vic_out_w=3840 vic_out_h=540" ./mz0380-m55-real-capture.sh 5
+sudo POLLDRAIN=20 EXTRA="vic_out_w=3840 vic_out_h=540" scripts/mz0380-m55-real-capture.sh 5
 ```
 
 Only the width is compared (`img_handler` reads bss offset 0; offset 2, the
@@ -8069,7 +8069,7 @@ to be distinguishable.
 
 ## M140 (hardware, 2026-08-22): 3840 is not the gate - and no width sweep this project has run was ever single-variable
 
-    sudo POLLDRAIN=20 EXTRA="vic_out_w=3840 vic_out_h=540" ./mz0380-m55-real-capture.sh 5
+    sudo POLLDRAIN=20 EXTRA="vic_out_w=3840 vic_out_h=540" scripts/mz0380-m55-real-capture.sh 5
 
     stream start: SET_VIC(... -> H.264 output=3840x540, bitstreams=1) ret=0
     producer watch: baseline 40=a5a5a5a5 44=a5a5a5a5 48=a5a5a5a5
@@ -9420,7 +9420,7 @@ kind that a power cycle is the only other way to reclaim:
 ### Hardware control: `vic_fast_kill=0` is neutral on capture
 
     sudo POLLDRAIN=20 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1 \
-        vic_fast_kill=0" ./mz0380-m55-real-capture.sh 1
+        vic_fast_kill=0" scripts/mz0380-m55-real-capture.sh 1
 
     stream start: SET_VIC(... fk=0 ...) ret=0
     poll-drain: buf 0 holds 3110400 bytes; delivering
@@ -9616,7 +9616,7 @@ unset. Every negative from that era has to be re-read, and this is one.
 
     sudo POLLDRAIN=20 VICFW=7 \
         EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
-        ./mz0380-m55-real-capture.sh 4
+        scripts/mz0380-m55-real-capture.sh 4
 
 Ask for 4 frames, because the whole point is whether more than one arrives.
 **Frame count is the oracle** (M153), so read `poll-drain stopped after N
@@ -9633,7 +9633,7 @@ collide.
 ## M159 (hardware, 2026-08-24): `fw=7` BREAKS THE ONE-FRAME BOUND - continuous ~61 Hz production, and the frame-token register moves for the first time
 
     sudo POLLDRAIN=20 VICFW=7 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
-        ./mz0380-m55-real-capture.sh 4
+        scripts/mz0380-m55-real-capture.sh 4
 
     stream start: SET_VIC(... fw=7 ... bitstreams=1) ret=0
 
@@ -9726,7 +9726,7 @@ always present a short prefix. Change **one variable** - give the card 2 s per
 look instead of 20 ms:
 
     sudo POLLDRAIN=2000 VICFW=7 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
-        ./mz0380-m55-real-capture.sh 4
+        scripts/mz0380-m55-real-capture.sh 4
     sudo dmesg | grep -aE "poll-drain|stream stop|producer watch"
 
 A length that grows means we were truncating it ourselves and the fix is
@@ -9812,7 +9812,7 @@ see the torn prefixes again if it turns out the card really does send 16 bytes.
 ### The run
 
     sudo POLLDRAIN=20 VICFW=7 EXTRA="post_proc=1 post_mask=0 fake_frame_off=1" \
-        ./mz0380-m55-real-capture.sh 4
+        scripts/mz0380-m55-real-capture.sh 4
     sudo dmesg | grep -aE "poll-drain|stream stop|producer watch|in flight"
 
 - **Whole frames delivered, more than one** - that is streaming video, and the
@@ -10521,7 +10521,7 @@ method note is about, one layer up.
 
 ### Verified on hardware, 2026-08-24
 
-`sudo ./mz0380-m168-v4l2-abi.sh`, one spawn, on 7.2.0-1-cachyos:
+`sudo scripts/mz0380-m168-v4l2-abi.sh`, one spawn, on 7.2.0-1-cachyos:
 
     [0]: 'YU12' (Planar YUV 4:2:0)
             Size: Discrete 1920x1080
@@ -10655,9 +10655,9 @@ at the end of the script, so a run that aborts early or is interrupted still
 banks the spawns it already spent - those are the runs where the remaining
 budget matters most.
 
-    ./mz0380-spawns.sh          # no root needed, reads the tally + live count
-    sudo ./mz0380-spawns.sh commit
-    sudo ./mz0380-spawns.sh reset
+    scripts/mz0380-spawns.sh          # no root needed, reads the tally + live count
+    sudo scripts/mz0380-spawns.sh commit
+    sudo scripts/mz0380-spawns.sh reset
 
 The verdict line is the experiment: below 8 is the safe range, 8-18 is the
 gamble, and past 18 without a wedge is M157's answer.
@@ -12820,8 +12820,8 @@ Both kernels build warning-free. The start is unspent.
 ### Spawn accounting correction
 
 `mz0380-live.sh` already commits the tally itself: `do_unload()` runs
-`./mz0380-spawns.sh commit` before `rmmod` and `unloaded` after it. The manual
-`./mz0380-spawns.sh add 1` recommended after the M209 and M210 runs therefore
+`scripts/mz0380-spawns.sh commit` before `rmmod` and `unloaded` after it. The manual
+`scripts/mz0380-spawns.sh add 1` recommended after the M209 and M210 runs therefore
 double-counted them. `encoder_spawns++` sits on the SET_VIC fire, so the three
 guard-rejected attempts cost nothing at all. The tally read 7 after the M210
 run against roughly 4 real spawns; treat it as a conservative over-count and
@@ -12853,7 +12853,7 @@ now takes `OP6=1` for exactly that, and its oracle expects `EXPECT_OP06`
 completions instead of hard-coding zero:
 
 ```
-sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh
+sudo FPS30=1 OP6=1 scripts/mz0380-m210-raw-enc-tail.sh
 ```
 
 **Defaults are not the working configuration.** The first `mz0380-m211-raw-observe.sh`
@@ -12872,10 +12872,10 @@ sequence is readable in one place.
 
 ### Run order after this correction
 
-1. `sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh` - the working sequence
+1. `sudo FPS30=1 OP6=1 scripts/mz0380-m210-raw-enc-tail.sh` - the working sequence
    minus op04. A positive here means the raw ring works and op04 was never
    needed; a negative isolates op04 properly, which M210 as first run did not.
-2. `sudo ./mz0380-m211-raw-observe.sh` - the working sequence *with* op04, raw
+2. `sudo scripts/mz0380-m211-raw-observe.sh` - the working sequence *with* op04, raw
    banks observed passively alongside it.
 
 ---
@@ -12887,7 +12887,7 @@ Two runs, both on the 1080p30 camera. Logs:
 
 ### The producer needs the encoder tail AND op 0x06 - neither alone
 
-`sudo FPS30=1 OP6=1 ./mz0380-m210-raw-enc-tail.sh` produced **209 completions**
+`sudo FPS30=1 OP6=1 scripts/mz0380-m210-raw-enc-tail.sh` produced **209 completions**
 where M209 and M210 produced none. Lining the three up:
 
 | run | encoder tail | op 0x06 | result |
@@ -12938,7 +12938,7 @@ values do not answer it either.
 
 ### M211: the encoded path does not change any of it
 
-`sudo ./mz0380-m211-raw-observe.sh` ran the operator's working configuration
+`sudo scripts/mz0380-m211-raw-observe.sh` ran the operator's working configuration
 with `op 0x04` live and the raw banks observed passively. The encoded path
 worked - **60 H.264 frames delivered, 891,529 bytes, clean IDR** - and the raw
 banks behaved exactly as in M210b: four `op 0x02` slots at `extent=0x10`, all
@@ -13067,4 +13067,1119 @@ binary.
 
 The tally reads 11 - inside the historical 8-18 wedge range. Nothing further
 should be spent on hardware until a mains-off power cycle and
-`./mz0380-spawns.sh reset`.
+`scripts/mz0380-spawns.sh reset`.
+
+## M213 (tinyvenc7 static, 2026-08-28): the `op 0x02` transfer length is `ALIGN16(W) * H * 3/2`, and SET_PREVIEW_PARAMS cannot change it
+
+Zero spawns. `re-dump/fw/yuan_demo_sdi/tinyvenc7` had never been
+disassembled - only `tinyvenc5.txt` existed in `re-dump/`. The binary is ARM
+EABI5, **not stripped**, so the globals that matter carry their real names:
+`raw_dma_`, `h264_dma_`, `preview_settings`, `preview_params_settings`,
+`is_preview`, `enable_dma`, `PCIEtOptions`. The system `objdump` has no ARM
+support; `llvm-objdump --triple=armv7-none-linux-gnueabi` does.
+
+### The length, in the per-frame path
+
+`vcap_handler(video_cap_state const*, void*)` @ `0x122d4` computes the raw
+transfer size inline and passes it as the 4th argument:
+
+```
+12514: ldrh r0, [r4, #116]      ; preview_settings+0x24
+12518: ldrh r9, [r4, #86]       ; preview_settings+0x06   = H
+12520: mul  r9, r0, r9
+12528: add  r9, r9, r9, lsl #1  ; *3
+1252c: asr  r9, r9, #1          ; /2
+...
+1258c: bl   TK_MMA_SetOptions(h=[r4+0xb4], PCIEtOptions, ...)
+125b8: bl   TK_MMA_StartOneFrame(h=[r4+0xb4], 0x90000000, phys, r9)
+```
+
+`r4` is the settings base `0x4b030`, so `[r4+0xb4]` is `raw_dma_` @ `0x4b0e4`
+and `[r4+0xb8]` is `h264_dma_` @ `0x4b0e8`. **`raw_dma_` is the `op 0x02`
+writer.** The other site, @ `0x126cc`, is `h264_dma_`: a fixed **4096-byte**
+info block whose word at +8 is `(token & 7) + 1` - the eight-slot ring, in the
+binary, exactly as M209 read it out of the `.sys`.
+
+`preview_settings+0x24` is derived once in `main` @ `0xddb0`:
+
+```
+ddb0: ldrh r1, [r10, #84]      ; preview_settings+0x04 = W
+ddbc: ldrh r2, [r10, #86]      ; preview_settings+0x06 = H
+ddc8: add  r12, r1, #15
+ddd0: and  r3, r12, #0xfff0    ; ALIGN16(W)
+dde0: strh r4,  [r10, #118]    ; +0x76 = W/2
+dde4: strh r0,  [r10, #122]    ; +0x7a = ALIGN16(W/2)
+dde8: strh r3,  [r10, #116]    ; +0x74 = ALIGN16(W)      <- the multiplicand
+ddec: strh r12, [r10, #120]    ; +0x78 = H/2
+```
+
+So the `fw=7` `op 0x02` transfer length is
+
+>   **`len = ALIGN16(width) * height * 3 / 2`**  - planar I420, computed at
+>   run time, never a constant.
+
+### Which surface: 0x2f7600, decisively
+
+`preview_settings+0x04` and `+0x06` are written **from the command line**, by
+`atoi` in the getopt switch @ `0xffe8` / `0xffd8`. They are the `-w` / `-h`
+that `video_capture_mgr` sprintf's from SET_VIC geometry. Nothing else writes
+them.
+
+And `vcap_handler` refuses any frame whose geometry disagrees, @ `0x12330`:
+
+```
+[tiny7] Drop frame(%d), Tiny_Set(%d x %d) != VIC_Get( %ld x %ld )
+```
+
+with `Tiny_Set` read from `preview_settings+0x04/+0x06` and `VIC_Get` from the
+capture state. A 1024x540 preview surface underneath a 1920x1080 VIC would
+therefore not produce short writes - it would produce **dropped frames and no
+writes at all**. The two cannot disagree by construction.
+
+For our load, SET_VIC geometry is 1920x1080, `ALIGN16(1920) = 1920`, and
+
+```
+1920 * 1080 * 3/2 = 0x2F7600
+```
+
+**The harness oracles are already correct.** Item 2 of the previous handoff -
+"decide whether the surface is `0x2f7600` or `0xCA900`" - resolves to
+`0x2f7600`, and the M92 preview-surface reading does not govern tinyvenc7's
+writer. Incidentally the `0xCA900` figure was never right on its own terms
+either: `1024 * 540 * 3/2 = 0xCA800`.
+
+### SET_PREVIEW_PARAMS has no geometry field at all
+
+The `op 0x31` handler is in `main` @ `0xea8c`, and its own trace string
+enumerates every field it carries (`.rodata` @ `0x2649c`):
+
+```
+[tiny7] SET_PREVIEW_PARAMS mask=0x%x, ch[%d], fps=%d, skip=%d, avg=%d,
+die_en = %d, preview_off = %d, fake_frame_off = %d, preview_no_osd = %d,
+hw_d = %d is_mirror = %d, is_flip = %d
+```
+
+Reading the handler, the command bytes land in `preview_params_settings`
+(`0x4c0e0`), which is a **different struct** from `preview_settings`
+(`0x4b080`) - and the length is computed only from the latter. Field map, from
+the 44-byte command buffer `cmd` @ `0x4c218`:
+
+| cmd  | -> pps | field                          | mask gate |
+|------|--------|--------------------------------|-----------|
+| +04  | +0x00  | mask, OR-accumulated, persists | -         |
+| +08  | +0x04  | ch                             | always    |
+| +09  | +0x05  | fps (mask-bitmap modulus)      | always    |
+| +0a  | +0x06  | skip (frame modulus)           | bit 1     |
+| +0c  | +0x08  | avg                            | bit 4, **one-shot** (`bic` after apply) |
+| +0d  | +0x09  | die_en / preview_off           | always    |
+| +0e  | +0x0a  | fake_frame_off                 | always    |
+| +0f  | +0x0b  | preview_no_osd                 | always    |
+| +10  | +0x0c  | hw_d                           | always    |
+| +11  | +0x0d  | is_mirror                      | always    |
+| +12  | +0x0e  | is_flip                        | always    |
+| -    | +0x10  | preview bitmap, low 64         | -         |
+| -    | +0x18  | preview bitmap, high 64        | -         |
+
+**No entry is a width, a height, a stride, a surface size, or a transfer
+length.** So item 4 of the previous handoff - a `post_mask` bisect to move the
+transfer size - is answered negative before it costs a spawn: no value of
+`post_mask` can change how many bytes `raw_dma_` writes. `post_mask` selects
+*which frames* get written and how the preview is post-processed, never *how
+much*.
+
+### What `post_mask` does gate: frame selection
+
+`vcap_handler` @ `0x124b0` picks one of two selection modes, and the raw DMA
+runs only if the result is exactly 1:
+
+- `pps[+0x06] != 0`: `r10 = frame_count % pps[+0x06]`, fire when `== 1`.
+- `pps[+0x06] == 0`: `r10 =` bit `(frame_count % pps[+0x05])` of the **128-bit
+  preview bitmap** at `pps+0x10 .. pps+0x1f` - the pair printed by
+  `Preview mask = 0x%llx - 0x%llx`. This is the preview-side twin of the
+  all-frame H.264 bitmap M177 named.
+
+Both feed the same guard @ `0x124cc`, which requires all three of:
+
+```
+pps[+0x09] != 1          ; preview_off / die_en
+r10 == 1                 ; the frame-selection result above
+enable_dma != 0          ; 0x4c118
+```
+
+We send `post_mask=0`, so `skip`, `fps` and the bitmap are all card defaults
+and the selection is running on whatever the flash image chose. That is the
+only remaining `post_mask`-shaped lever, and it is a *rate* lever.
+
+### A bandwidth clamp that sits exactly on our operating point
+
+Also in the `op 0x31` handler, @ `0xeb78`:
+
+```
+eb78: ldrh r12,[r10,#84]      ; W
+eb7c: ldrh r4, [r10,#86]      ; H
+eb80: ldrb r1, [r10,#0x51]    ; preview fps
+eb84: mul  r4, r12, r4
+eb8c: mul  r4, r1, r4         ; W*H*fps
+eb90: cmp  r4, #0x76a7000
+eb94: ble  ok                 ; else halve pps[+0x07]
+```
+
+`0x76a7000 = 124416000 = 1920 * 1080 * 60` **exactly**, and the comparison is
+`ble`. So 1080p60 passes the cap with precisely zero margin and is not
+clamped; anything above it - a higher fps, or a wider surface - is halved. The
+constant is itself good evidence that 1920x1080p60 is the intended maximum
+preview surface for this binary, which is the same conclusion the length
+arithmetic reaches.
+
+### Method note
+
+The disassembly is reproducible and nothing about it touches hardware:
+
+```
+llvm-objdump -d -C --triple=armv7-none-linux-gnueabi \
+  re-dump/fw/yuan_demo_sdi/tinyvenc7 > tinyvenc7.txt
+```
+
+ARM literal pools are not resolved by `llvm-objdump`, and every interesting
+reference in this binary is a pool load, so the reading above was done against
+an annotated dump that resolves each `ldr rN, [pc, #imm]` to its pool word and
+maps that word to a symbol or a C string. Without that step the globals are
+invisible. `mz0380-tinyvenc7-annotate.py` in the tree regenerates it.
+
+## M214 (tinyvenc7 static, 2026-08-28): the 16 bytes are the *not-selected* stub, and `post_mask=0` guarantees every frame is not selected
+
+Zero spawns, same annotated dump as M213. This is the mechanism behind every
+raw-window observation from M128d to M212, and it is a single branch.
+
+### `vcap_handler` writes the raw channel on EVERY frame - at one of two lengths
+
+The frame-selection guard @ `0x124cc` does not choose *whether* to DMA. It
+chooses *how much*. Both arms call `TK_MMA_StartOneFrame` on the same
+`raw_dma_` handle with the same buffer:
+
+| arm | site | length passed in `r3` |
+|-----|------|-----------------------|
+| selected | `0x125b8` | `r9` = `ALIGN16(W) * H * 3/2` = `0x2F7600` at 1080p |
+| **not selected** | `0x129b0` | **`#16`** |
+
+```
+; 0x12944 - the not-selected arm
+12988: mov  r1, #16
+1298c: ldr  r0, [r6, #0x38]
+12990: bl   MemBroker_CacheCopyBack        ; flush 16 bytes
+12994: ldr  r0, [r6, #0x38]
+12998: ldr  r8, [r4, #0xb4]                ; raw_dma_
+1299c: bl   MemBroker_GetPhysAddr
+129a4: mov  r3, #16                        ; <- the transfer length
+129b0: bl   TK_MMA_StartOneFrame(raw_dma_, 0x90000000, phys, 16)
+```
+
+**The sixteen bytes are the first sixteen bytes of the very same I420 frame
+buffer the full transfer would have sent.** That is why M212 found them to be
+genuine top-left luma samples matching the co-captured decoded picture to a
+mean absolute difference of 0.50-1.12: it is the identical source pointer, with
+`3110400` replaced by `16`. Nothing was truncating a large transfer, and nothing
+was writing a header - the card was writing the head of the frame because that
+is what a 16-byte transfer from a frame base pointer *is*.
+
+### Why we are always on the not-selected arm
+
+`r10` must equal 1 for the full transfer. It comes from one of two modes
+(`0x124b0`), and with our payload both evaluate to 0:
+
+- `pps[+0x06]` (`skip`) is `0`, so the modulus mode is not taken and the
+  **128-bit preview bitmap** mode is (`0x129d0`).
+- The bitmap lives at `pps+0x10 .. pps+0x1f`, in **`.bss`**, and the only code
+  that ever writes it is `tiny_calculate_avg_fps` @ `0x13ad4` and
+  `tiny_calculate_skip_fps` @ `0x13c2c`, called from the SET_PREVIEW_PARAMS
+  handler at `0xf228` / `0xf28c`.
+- Both call sites sit behind `ands lr, r3, #1` @ `0xeb54` - **mask bit 0**.
+
+We send `post_mask=0`. Bit 0 is clear, neither helper ever runs, the bitmap
+stays all zeros, `and r10, r3, #1` yields 0 for every frame, and every frame
+takes the 16-byte arm. The other two gate terms are satisfied and are not the
+problem: `enable_dma` is set to 1 in the start path @ `0xe430` (only the
+"Disable dma" argv flag clears it), and `preview_off` = `pps[+0x09]` = cmd
+byte `0x0d`, which we send as 0.
+
+> **Nothing is broken.** The card is doing exactly what it was configured to
+> do. A preview writer that was told to select no frames writes the stub for
+> every frame, forever.
+
+This also re-reads M128d. "post_mask=0x1f truncates the DMA to 16 bytes" was
+the wrong causal direction: 16 bytes is not a truncation, it is the stub the
+not-selected arm always writes. Under `fw=5` with `0x1f`, and under `fw=7` with
+`0`, the frame selection came out empty for different reasons and produced the
+same stub.
+
+### The experiment this implies - one spawn, sharp pass/fail
+
+Set **mask bit 0** so the bitmap is actually computed. Following the handler
+from `0xeb54`:
+
+- bit 0 set, bit 1 clear -> `0xf1f4` -> `r3 = mask & 2` is 0 -> `0xf268` ->
+  `tiny_calculate_skip_fps(pps[5], ..., &lo, &hi, 0)` **writes the bitmap**.
+- bit 0 and bit 1 set -> `pps+0x07` (`avg`) is taken from cmd byte `0x0b`
+  first, and a non-zero `avg` routes to `tiny_calculate_avg_fps` instead.
+
+Either helper populates it, so **`post_mask=0x01` is sufficient** and is the
+minimal step. `post_mask=0x03` with a non-zero `avg` byte exercises the
+averaging variant.
+
+Note that `mz0380_stream_post_proc()` currently builds only
+`post[1] = (fps & 0xff) << 8`, so cmd bytes `0x0a` (`skip`) and `0x0b` (`avg`)
+are always zero. Driving the modulus mode instead of the bitmap mode therefore
+needs a payload change as well as a mask change: `skip` is cmd byte `0x0a`, and
+the fire condition is `frame_count % skip == 1`.
+
+Prediction, and it is falsifiable in one run: with `post_mask=0x01` the raw
+window should start receiving `0x2F7600`-byte transfers on the frames the
+bitmap selects, while unselected frames keep producing 16-byte writes.
+
+### A field-order discrepancy to fix in the driver comment
+
+`mz0380-dma-stream.c` documents the tail of the `op 0x31` payload, from M128's
+**tinyvenc5** decode, as:
+
+```
+[0x10]=mirror  [0x11]=flip  [0x12]=hw_d
+```
+
+tinyvenc7's own trace string orders the last three the other way:
+
+```
+... preview_no_osd = %d, hw_d = %d is_mirror = %d, is_flip = %d
+   ->  [0x10]=hw_d  [0x11]=is_mirror  [0x12]=is_flip
+```
+
+We send zeros in all three, so nothing observable changes today, but the
+comment should not be trusted for `fw=7` if any of them is ever used.
+
+### M214 addendum: `tiny_calculate_skip_fps` decoded, and why bit 0 alone is a big step
+
+`tiny_calculate_skip_fps(fps, skip, &lo, &hi, avg_mode)` @ `0x13c2c` builds the
+128-bit selection bitmap directly:
+
+```
+13c50: mov  r4, r0        ; fps
+13c58: orrs r6, r4, r5    ; fps == 0 -> early out, bitmap untouched
+13c60: mov  r0, r1        ; skip
+13c64: adds r6, r0, #1    ; step = skip + 1
+loop @13c9c:
+       set bit r0 in the 128-bit accumulator
+13cd8: r0 += step
+13ce8: blo loop           ; while (idx < fps)
+```
+
+So it sets bits `0, step, 2*step, ...` below `fps`, i.e. **selects every
+`(skip+1)`th frame**, and the `avg_mode` flag (false on our path) only
+pre-scales `skip` to `2*skip+1`.
+
+The call site passes `skip` from `preview_params_settings[+0x06]`, which comes
+from **command byte `0x0a`** - and `mz0380_stream_post_proc()` never populated
+that byte. It built only `post[1] = (fps & 0xff) << 8`. So the card has always
+been handed `skip = 0`, giving `step = 1`.
+
+**`step = 1` selects every frame.** Turning on mask bit 0 with the payload as it
+stood would therefore jump straight from a 16-byte stub per frame to a full
+`0x2F7600` frame per frame: `3110400 * 60 = 186 MB/s`, on a link this card
+negotiates at PCIe **x1 Gen1** (`pcie link ... speed=1 width=x1`, ~250 MB/s
+theoretical). That is ~75% of the link, on top of the H.264 stream, and it is
+not the experiment anyone would choose to run first.
+
+Note the card itself will not object: tinyvenc7's own bandwidth clamp is
+`W*H*fps <= 0x76a7000`, which is exactly `1920*1080*60`, compared with `ble`.
+1080p60 sits precisely on the cap and is not clamped.
+
+Accordingly `post_skip` (byte `0x0a`) and `post_avg` (byte `0x0b`) are now sent,
+as module parameters defaulting to 0, so the first bit-0 run can request a
+fraction of the frames. `post_skip=29` selects every 30th frame - about 2 full
+frames per second - which is enough to prove the mechanism at ~6 MB/s.
+
+## M215 attempt 1 (2026-08-28): null run - `raw_bank_observe` is a load-time parameter
+
+No spawn consumed; the stream never started, so the encoder never spawned and
+the tally stayed at 1.
+
+The run was set up correctly in every respect that was checked - `post_mask=1`,
+`post_skip=29`, `h264_probe=Y`, `dma_iova_remap=Y`, `raw_bank_probe=N` - and
+still produced nothing:
+
+```
+mz0380[0]: stream start: pre-STOP(op 0x07, all channels) ret=0, settling 1900 ms
+mz0380[0]: SET_BUF failed (-19) - frames will not flow
+mz0380 0000:04:00.0: dma_start failed (-19)
+```
+
+The harness had enabled `raw_bank_observe` through sysfs on the already-loaded
+module, on the assumption that its banks are allocated at stream start. They are
+not. The allocation lives in `mz0380_dma_setup()`, and **`mz0380_dma_setup()` is
+called from `mz0380_pci.c` at PCI probe** - i.e. at insmod. So
+`raw_bank_observe` and `raw_bank_probe` are read once, at load.
+
+Setting either afterwards sends `mz0380_stream_program_bufs()` down the
+raw-bank branch with `raw_probe_bufs[].va == NULL`, and
+`mz0380_raw_probe_program_bufs()` returns a bare `-ENODEV` that surfaces only as
+"SET_BUF failed (-19)" - a message that says nothing about the actual cause.
+
+Three fixes, all made:
+
+1. `mz0380_raw_probe_program_bufs()` now names the cause: that the banks come
+   from `mz0380_dma_setup()` at probe, that the parameter is load-time, and to
+   reload with `RAWOBS=1` rather than poke sysfs.
+2. `MODULE_PARM_DESC(raw_bank_observe)` says LOAD-TIME ONLY.
+3. The harness now *checks* `raw_bank_observe=Y` and refuses, instead of
+   setting it.
+
+**A fourth fix matters more than the other three.** The harness scored this run
+as `M215 NEGATIVE: every slot is still at the 16-byte stub`, because it tested
+`FULL == 0` without asking whether any slot had been written at all. Nothing was
+written; nothing was even streamed. A run that fails to start is not evidence
+about the hypothesis, and reporting it as one would have retired a correct
+prediction on the strength of a driver misconfiguration. The scoring now
+separates a null run from a negative and exits non-zero, printing the
+`SET_BUF`/`dma_start`/alloc failures and v4l2-ctl's own output - which the first
+version discarded to `/dev/null`, which is why the cause was not visible in the
+run output at all.
+
+M214's prediction remains untested.
+
+## M215 (hardware, 2026-08-28): **mask bit 0 turns the stub into whole raw frames** - M214 proven
+
+One spawn (tally 1 -> 2). Load:
+
+```
+VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0x01 POSTSKIP=29
+RAWOBS=1 FASTKILL=0 H264DIVISOR=0 PERSIST=1
+```
+
+900 encoded frames captured at ~60 fps alongside, then a forced pipeline stop
+for the extent dump:
+
+```
+stop raw bank0 op0x02 buf[0] extent=0x2f7600 (3110400 bytes), 760/1126 pages touched, poison=0xa5
+stop raw bank0 op0x02 buf[1] extent=0x2f7600 (3110400 bytes), 757/1126 pages touched, poison=0xa5
+stop raw bank0 op0x02 buf[2] extent=0x2f7600 (3110400 bytes), 760/1126 pages touched, poison=0xa5
+stop raw bank0 op0x02 buf[3] extent=0x2f7600 (3110400 bytes), 758/1126 pages touched, poison=0xa5
+stop raw bank1 op0x08 buf[0..3] extent=0x0 (0 bytes), 0/1126 pages touched, poison=0x5a
+```
+
+`0x2f7600` = 3110400 = `ALIGN16(1920) * 1080 * 3/2`, the exact value M213 read
+out of `vcap_handler` @ `0x12514`. **The raw capture path works.** The card has
+been able to send whole I420 frames the entire time; it was writing the
+not-selected stub because `post_mask=0` left the preview selection bitmap
+empty, exactly as M214 predicted.
+
+### What the numbers confirm beyond the headline
+
+- **The transfer stops at the frame boundary.** The buffer is `0x466000` =
+  1126 pages; a frame is 3110400 bytes = 759.4 pages; 757-760 sampled pages are
+  touched. Nothing runs past the frame, so the length really is computed, not a
+  fixed window size.
+- **`op 0x08` is never written.** Bank1 came back with `extent=0x0`, zero pages
+  touched and its `0x5a` poison fully intact. The "two independent banks"
+  model that M209 carried over from the Windows `.sys` does not describe this
+  path: under `fw=7` raw arrives through **op 0x02 only**. Registering op08
+  costs nothing but it receives nothing.
+- **Both arms write, which is why head-change counts are high.** The M212 head
+  sampler logged max counters of 2, 219, 217 and 230 across the four slots over
+  ~10000 frames. `post_skip=29` selects every 30th frame, which would predict
+  far fewer - until you remember that unselected frames still write the 16-byte
+  stub. Stub and full frame both change the head, so the head sampler counts
+  both. The asymmetry between slot 0 and slots 1-3 is sampling timing, not two
+  different behaviours.
+
+### The remaining gap is now ours, not the card's
+
+```
+completions=0 delivered=0 last_completion_extent=0x0
+```
+
+Whole frames are landing in host memory and **the driver's completion path never
+counts them**. Nothing is wrong on the card side any more: the pixels are there,
+at the right length, in our buffers, at a rate we control. What is missing is
+the host-side plumbing that notices a raw completion and hands the buffer to
+VB2 - the same job `mz0380_drain_raw_probe_snapshot()` does for the encoded
+window.
+
+That is the whole of the remaining work for raw capture, and it is ordinary
+driver work rather than reverse engineering.
+
+### Method note, and two harness bugs worth remembering
+
+The extent dump is emitted only by `mz0380_raw_probe_bufs_dump(dev, "stop")` in
+the stream-stop path. Under `persistent_h264=1` - which is part of the
+known-good load - a V4L2 STREAMOFF only detaches VB2 and the pipeline stays up,
+so that path never runs. Attempt 2 of this run streamed 900 frames flawlessly
+and reported nothing, because the measurement it existed to take is only
+produced by a real stop. The harness now forces the stop itself.
+
+The other bug was worse and is worth stating plainly: the harness scored a run
+with zero extent dumps as `M215 NEGATIVE: every slot is still at the 16-byte
+stub`, having tested `FULL == 0` without ever asking whether any slot had been
+written. Twice in a row it reported a correct hypothesis as refuted by a run
+that had not tested it. Scoring now distinguishes three outcomes - a run that
+never streamed, a run that streamed but produced no measurement, and a run that
+can actually be scored - and the first two exit non-zero saying so.
+
+## M216 (2026-08-28): the validated configuration is now the driver's default, and the driver installs
+
+No hardware, no spawns. Until now the card only worked if the operator supplied
+an eleven-variable `env` incantation; the compiled-in defaults described a
+configuration that had been superseded by M128-M137 and M177. Anyone who
+installed the module and ran `modprobe mz0380` got a driver that did not
+capture, and every harness that did not set the knobs explicitly was measuring
+the old path.
+
+Defaults changed to match the load that M177/M215 validated:
+
+| parameter | was | now | why |
+|-----------|-----|-----|-----|
+| `vic_fw` | 5 | **7** | tinyvenc5 delivers one frame per process then freezes (M158/M159) |
+| `h264_probe` | 0 | **1** | stopped being a diagnostic at M177; it is the capture path |
+| `win_seq` | 0 | **1** | the validated 60 fps order |
+| `win_start_op6` | 0 | **1** | M210b: the producer needs the encoder tail AND op 0x06 |
+| `poll_drain_ms` | 20 | **0** | fw=7 uses the window-1 completion ring, not polling |
+
+`persistent_h264=1` and `vic_fast_kill=0` were already correct.
+
+`mz0380-live.sh` no longer hardcodes `poll_drain_ms=20`. Its own `add_opt`
+comment warns that hardcoding a knob "silently overrides the module default the
+moment the two drift apart" - and that is exactly what had happened.
+
+**Consequence worth stating:** 46 of the 51 harnesses in `scripts/` do not set
+these knobs, so they now exercise the fw=7 path rather than the fw=5 one. They
+are records of concluded experiments, and the standing rule since 72c25d4 is
+that a harness must mirror the load it means to test rather than inherit
+defaults. Any harness re-run from the m25-m85 era needs its configuration
+stated explicitly.
+
+### Packaging
+
+`MODULE_DEVICE_TABLE` already covered all five known subsystem IDs, so an
+installed module autoloads on the card - what was missing was a way to install
+it at all.
+
+- `make dkms-install` / `dkms-uninstall` - the persistent path. An out-of-tree
+  module outside DKMS silently stops loading at the next kernel upgrade, which
+  for a capture card presents as "my camera disappeared".
+- `make install` / `uninstall` - single-kernel, for a quick test.
+- `/etc/modprobe.d/mz0380.conf` - sets **nothing**, deliberately, since the
+  defaults are now right. It carries the `softdep` for videobuf2/DV-timings/ALSA
+  and documents the raw-capture and troubleshooting knobs commented out.
+- `MODULE_VERSION("0.1.0")`, which DKMS needs.
+
+The card now works from `sudo modprobe mz0380` with no parameters.
+
+## M217 (2026-08-28): raw frames delivered to V4L2 - `raw_deliver`
+
+No hardware yet; this is the plumbing M215 said was the only thing left.
+
+`raw_deliver=1` makes the node advertise `V4L2_PIX_FMT_YUV420` at
+`sizeimage=0x2f7600` and forward the card's raw banks to VB2 instead of its
+encoded output. The encoder keeps running, because M210b showed the card-side
+producer only runs with the encoder tail AND `op 0x06` - there is no raw-only
+mode that produces anything - so its bitstream is simply not delivered.
+
+### The completion problem, and the proxy used for it
+
+M215 measured `completions=0` on the raw window while it was demonstrably
+writing whole frames: the raw path raises no completion of its own. What it does
+have is a shared frame clock - the card writes the raw slot for frame N and
+encodes frame N - so the **encoded** completion is used as the trigger, and its
+token selects the slot exactly as it already does for the encoded ring.
+
+### Testing for a whole frame in O(1)
+
+`mz0380_raw_probe_infer_length()` answers "how many bytes did the card write" by
+scanning backwards from the end of a 4.6 MB buffer. For the 16-byte stub that
+walks the whole buffer, so at 60 fps it is ~276 MB/s of reads before the
+whole-buffer re-poison writes it back. Affordable for a diagnostic; not for a
+capture path.
+
+That question no longer needs asking. M213 read the transfer length out of
+tinyvenc7 and M215 confirmed it, and M214 showed the card writes only that
+length or a 16-byte stub - so the only question is which arrived, and four
+sentinels answer it. They sit near the end of the frame, past anything a stub
+touches, and are **spread** rather than adjacent: adjacent sentinels share an
+image region, and a saturated flat area could carry the poison value across a
+few contiguous bytes, whereas four unrelated rows carrying it at once is not a
+coincidence real video produces. Only the sentinels are re-armed afterwards.
+
+### The assumption to doubt first if frames ever tear
+
+An encoded completion does not assert that the raw DMA has finished, so this
+could in principle copy a frame mid-write. The guard is the first sentinel,
+which sits at the **last dword of the frame** and can only read as written once
+the transfer reached the end. That holds if the card writes in ascending address
+order - what a linear DMA does, and consistent with the M209/M215 extent
+measurements - but it has not been proven directly. It is written down in the
+code as the first thing to suspect if torn frames appear.
+
+### Wiring
+
+- `raw_deliver` implies the raw bank allocation, so `raw_bank_observe` need not
+  also be set. Like it, it is **load-time** (`0444`): the banks come from
+  `mz0380_dma_setup()` at PCI probe.
+- It outranks `h264_probe` in `mz0380_current_pixelformat()` and
+  `mz0380_current_sizeimage()`, since `h264_probe` stays on underneath it.
+- A delivered frame under a locked signal retires the NO SIGNAL placeholder;
+  raw has no IDR, so the encoded path's clean-IDR trigger does not apply.
+- `/proc/mz0380-state` gains a `raw frames` line counting delivered, dropped and
+  skipped stub completions.
+
+**Untested on hardware.** It needs `post_mask=0x01`, or every completion is a
+stub and nothing is ever delivered.
+
+### M217 hardware confirmation (2026-08-28): raw capture works end to end
+
+One spawn (tally 2 -> 3). Load:
+
+```
+sudo env POSTMASK=0x01 POSTSKIP=29 RAWDELIVER=1 ./mz0380-live.sh load
+```
+
+Everything else came from the M216 defaults - no other knobs.
+
+```
+Format Video Capture:
+        Width/Height      : 1920/1080
+        Pixel Format      : 'YU12' (Planar YUV 4:2:0)
+```
+
+```
+raw frames : 32 delivered, 0 dropped, 5565 stub completions skipped
+h264 frames: 0 delivered
+```
+
+`v4l2-ctl --stream-mmap --stream-to` produced 32 whole frames; the file's
+292936-byte tail is the final write being cut off when the tool exited, not a
+short payload - the driver reports zero drops and every delivered frame carries
+the full `0x2f7600`.
+
+Content, checked rather than assumed:
+
+- **32 of 32 frames are distinct** - no duplicate delivery, so the sentinel
+  re-arm is keeping up with the completion rate.
+- Y spans 0..255 with a mean near 110; U and V sit at 129-134, i.e. close to
+  neutral. That is a real scene, not poison, not a flat pattern.
+- Rendered to PNG the frame is a sharp, correctly-exposed 1080p photograph of a
+  desk, and **the colours are right** - the blue keypad renders blue. That
+  independently confirms the I420 plane order (a U/V swap gives the textbook
+  blue/orange inversion, which is exactly how M130 caught the earlier
+  mislabelling).
+- No tearing in any frame. The sentinel-at-the-last-dword guard is holding, so
+  the ascending-address DMA assumption recorded above survives its first test.
+
+Rate matches the prediction: 32 frames over ~18 s is ~1.8 fps against the 2 fps
+that `post_skip=29` implies (bits 0 and 30 set in a 60-frame period). The
+higher figure `v4l2-ctl` prints is its own inter-arrival estimate, which
+excludes the idle gaps.
+
+**The driver now captures uncompressed 1920x1080 I420 through V4L2 with no
+encoder in the delivery path.** That was the project's stated goal.
+
+## M218 (2026-08-28): raw is a format applications choose, not a module parameter
+
+No hardware. M217 made raw delivery possible; it was still reachable only by
+reloading the driver with `raw_deliver=1`, which an application cannot discover
+or request. That is the practical difference between a driver that can capture
+raw and a camera.
+
+- **`ENUM_FMT` now enumerates both** `H264` and `YU12` whenever the raw banks
+  exist, instead of the single parameter-chosen entry it returned before.
+  `raw_deliver` no longer decides *whether* raw is reachable, only which of the
+  two is listed first - i.e. what an application that takes index 0 gets.
+- **`S_FMT` selects between them at runtime**, storing the choice in
+  `dev->deliver_raw`. Switching while buffers are queued returns `-EBUSY`
+  rather than handing back a plane sized for the other format.
+- **`TRY_FMT`** evaluates the requested format without committing, and still
+  returns a workable format for anything unrecognised, as V4L2 requires.
+- `mz0380_current_pixelformat()` takes a `dev` now; the drain, the size
+  calculation and `/proc` all follow the runtime choice.
+
+### Two traps this opened, and what closes them
+
+**Selecting raw with `post_mask=0` would deliver nothing.** Bit 0 is what makes
+the card populate its selection bitmap; without it every frame takes the
+not-selected arm and writes a 16-byte stub (M214/M215). While raw was an
+operator's decision the operator also set the parameter. Now that it is an
+application's decision there is no operator, so `mz0380_stream_post_proc()`
+forces bit 0 whenever `dev->deliver_raw` is set. Nothing else has to be
+configured to capture raw.
+
+**Allocating the banks by default could break loading.** `raw_capable`
+(default 1) allocates them whenever the encoded path is on, so raw is
+selectable out of the box - but that is 8 x `0x466000`, and a machine that
+cannot spare it would previously have failed the whole probe. Turning "this
+machine cannot spare 37 MB" into "this card does not work" is a far worse
+outcome than losing an optional format, so a **capability-only** allocation
+failure is now non-fatal: it warns, leaves `raw_capable` false, and H.264
+capture is unaffected. An explicitly requested one (`raw_deliver`,
+`raw_bank_observe`, `raw_bank_probe`) still fails loudly, because there the
+caller asked for something specific and silently not doing it would be worse.
+
+### Not done, and deliberately
+
+`post_skip` still defaults to 0, so selecting I420 asks the card for **every**
+frame - ~186 MB/s at 1080p60 against a link this card negotiates as PCIe x1
+Gen1. That is the honest default for a camera and it is what the next
+experiment measures; it has never been run. If full rate does not hold, the
+default becomes a throttle rather than a surprise.
+
+### Correction to the M215 follow-up list
+
+That list named "source-change events and a watch thread" as missing work. It
+is not missing: `V4L2_EVENT_SOURCE_CHANGE` is emitted by
+`mz0380_signal_event()`, subscription was fixed in M170, and
+`mz0380_signal_recovery_work_fn()` monitors at `signal_monitor_ms` (500 ms)
+during capture. It deliberately does not sample the receiver while the producer
+is healthy, because MST3367 transactions during capture perturb delivery - a
+hardware constraint that was measured, not an oversight.
+
+### M218 hardware confirmation (2026-08-28): a camera, with no parameters
+
+One spawn (tally 3 -> 4). `sudo ./mz0380-live.sh load` with **no env at all** -
+the insmod line printed `insmod:` and nothing else.
+
+```
+[0]: 'H264' (H.264, compressed)   1920x1080 / 1280x720 / 720x480 / 720x576 @ 60
+[1]: 'YU12' (Planar YUV 4:2:0)    1920x1080 / 1280x720 / 720x480 / 720x576 @ 60
+```
+
+`v4l2-ctl --set-fmt-video=pixelformat=YU12 --stream-mmap` then selected raw the
+way an application would, and it streamed. No module parameter was involved at
+any point: `post_mask` bit 0 was forced on by the format choice, as M218
+intended.
+
+## M219 (hardware, 2026-08-28): full-rate raw is ~50 fps, link-limited - and 18% of the frames were duplicates
+
+### The rate
+
+```
+raw frames : 118 delivered, 0 dropped, 0 stub completions skipped (post_skip=0 -> every 1th frame whole)
+```
+
+`v4l2-ctl` reported **50.05 and 51.00 fps** across the run. Zero stubs means the
+card selected every frame, as `post_skip=0` asks; zero drops means no vb2
+buffer was ever missing.
+
+`3110400 * 50 = 155 MB/s`, on `pcie link ... speed=1 width=x1` - PCIe x1 Gen1,
+250 MB/s theoretical, ~200 MB/s realistic after protocol overhead. So 155 MB/s
+is about 78% of usable bandwidth and 60 fps would need 186 MB/s, which is past
+what this link can carry. **The 50 fps ceiling is the link, not the card and not
+the driver**, and the degradation is graceful: no drops, no errors, just a lower
+delivered rate.
+
+That also retires the concern that opened M218 - that defaulting `post_skip=0`
+would be a surprise. It is not; it is simply what the hardware can do.
+
+### The defect
+
+118 frames delivered, **97 distinct**. Twenty-one were byte-identical repeats,
+and consecutive-frame luma deltas included exact zeroes.
+
+The ratio names the cause. Encoded completions arrive at the source rate, 60/s,
+while the raw DMA sustains ~50/s - so about one completion in six finds the slot
+still holding the frame already delivered. `10/60` is 17%; `21/118` is 17.8%.
+
+The sentinel test cannot see this. It answers "is a whole frame present in this
+slot", which is exactly the question M217 needed, but at full rate the question
+that matters is "is it a NEW one". Re-arming the sentinels after delivery does
+not help, because the card re-writes the slot with the same frame.
+
+### The fix
+
+The card gives each frame a token, so the token is the frame identity: a
+completion whose token matches what that slot last delivered is suppressed and
+counted in `raw_dup_token`.
+
+The 16-byte head is compared as well, but **only counted**, never used to
+suppress. A repeat under a *new* token would mean the card re-sent a frame
+rather than the host re-reading one - a different fault needing a different fix,
+and worth being able to tell apart. And content can legitimately repeat: a
+camera pointed at a still subject produces identical frames, and dropping those
+would stall the stream. `/proc/mz0380-state` reports both counters.
+
+### The fix was wrong, and the run said so immediately
+
+Suppressing on the token collapsed full-rate raw from **50 fps to 1.98 fps**.
+
+`snapshot->token` is not a frame identity. It is slot-indexed: the synthesised
+path sets `snapshot.token = idx` outright (`mz0380-dma-drain.c`, "token = the
+buffer index"), and the encoded drain compares its own last token against `idx`
+rather than a frame counter. For a given slot the token barely changes, so the
+guard matched nearly every completion and suppressed nearly every frame.
+
+The assumption was checkable in the tree before the run, and it was not checked.
+
+Both counters are kept, and **neither suppresses now**:
+
+- `raw_dup_token` - how often a slot's token repeated. Now known to be almost
+  always, which is what makes it useless as an identity.
+- `raw_dup_content` - how often the 16-byte head repeated. This is the one that
+  would distinguish a host-side re-read from the card re-sending a frame.
+
+Content cannot become the guard either: a camera pointed at a still subject
+produces identical frames, and suppressing those would stall the stream exactly
+when nothing is wrong.
+
+So the duplicates are measured and left in. A repeated frame in a raw stream is
+cosmetic - it reads as a momentarily lower frame rate - while both suppression
+attempts broke capture outright. Fixing it properly needs a real per-frame
+identity from the card, and nothing found so far provides one. **50 fps with 18%
+repeats is the current honest state of full-rate raw.**
+
+## M220 (2026-08-28): the flicker was a torn-frame bug in M217's sentinel test - OR where it needed AND
+
+Reported from OBS: continuous flicker on `YU12` and on the formats libv4l2
+emulates from it (`BGR3`, `YV12`), while `H264` - a different delivery path
+entirely - stayed clean. That asymmetry localises it to
+`mz0380_drain_raw_deliver()` rather than to anything the card does.
+
+### The bug
+
+`mz0380_raw_probe_frame_landed()` returned `true` as soon as **one** sentinel
+differed from poison:
+
+```c
+for (i = 0; i < ARRAY_SIZE(mz0380_raw_sentinels); i++)
+        if (READ_ONCE(*p) != poison)
+                return true;      /* ANY -> landed */
+return false;
+```
+
+The sentinels are at `FRAME_SIZE-4`, `-4096`, `-65536` and `-1048576`. A
+transfer still in flight has written the early offsets and not yet the late
+ones, so a half-written frame passed the test. What userspace received was new
+content in the leading ~2 MB and the *previous* frame still occupying the
+trailing ~1 MB - a torn frame, every time the race was lost, which at full rate
+is often. In OBS that is a flicker.
+
+The M217 comment claimed the guard held because "the first sentinel sits at the
+LAST dword of the frame, so it can only read as written once the transfer has
+reached the end". That was true of the sentinel and false of the loop: the OR
+meant sentinel[0] was never required, only reached first.
+
+### The fix
+
+Require **all** sentinels. Since the DMA writes in ascending order,
+`FRAME_SIZE-4` is written last, so demanding every sentinel is equivalent to
+demanding the transfer reached the end - which is what the guard was always
+supposed to mean. It is still checked first, so an in-flight frame is rejected
+on the first read.
+
+The trade is a false negative when a real frame's own data happens to equal the
+poison dword at one of four fixed offsets. That costs a single frame and cannot
+persist, because the next frame's content differs.
+
+### Why it did not show up until now
+
+M215 and M217 were both run at `post_skip=29` - one whole frame every 30, about
+2 fps. At that rate each transfer had ~500 ms to finish before the next
+completion looked at the slot, so the race was never lost and the 32-frame
+capture was clean and sharp. M219 was the first run at `post_skip=0`, where a
+slot is revisited every ~4 frames at 50-60 fps and the window is tens of
+milliseconds. **The bug was always there; only the full-rate run could expose
+it.**
+
+That is also a caution about the M217 measurement: "no tearing in any frame"
+was true of what was run, and was read as though it validated the guard in
+general. It validated it at 2 fps.
+
+### What this does not explain
+
+The byte-identical duplicates M219 measured are a separate phenomenon - a torn
+frame is not byte-identical to its predecessor. `raw_dup_content` still counts
+them, and they remain unexplained.
+
+## M221 (2026-08-28): audit of the M217-M220 raw path - two more defects, both introduced this session
+
+Prompted by "are there any other bugs that were possibly missed", after M219
+and M220 had each shipped a wrong fix. Reviewing the new code rather than the
+card found two more, both real, neither yet observed because the paths that
+reach them had not been exercised.
+
+### 1. Raw was silently broken at every resolution except 1080p
+
+`MZ0380_RAW_PROBE_FRAME_SIZE` is the 1080p frame, `0x2f7600`, and the whole raw
+path used it as a constant: `sizeimage`, the sentinel offsets, the `memcpy`
+length and the vb2 plane check.
+
+M218 then advertised `YU12` at 1280x720, 720x480 and 720x576 as well. At those
+geometries the card writes `ALIGN16(W)*H*3/2` - 1382400 bytes at 720p - so
+every sentinel sat **past the end of the frame the card actually wrote**, stayed
+poison forever, and `mz0380_raw_probe_frame_landed()` could never return true.
+Selecting raw at anything other than 1080p would have delivered **nothing at
+all**, with no error anywhere. One fixed offset (`FRAME_SIZE - 1048576`) is
+outright negative for a 720x480 frame of 518400 bytes.
+
+Fixed by deriving the length from geometry, which is what M213 said it was all
+along:
+
+```c
+size_t mz0380_raw_frame_bytes(struct mz0380_dev *dev)
+{
+	return (size_t)ALIGN(dev->capture.width, 16) *
+	       dev->capture.height * 3 / 2;
+}
+```
+
+and by expressing the sentinels as offsets **within** that frame rather than
+fixed byte positions. `[0]` is still the last dword - the one that proves
+completion under an ascending DMA - and the others are spread back through the
+frame, which is what keeps M220's AND meaningful if the write order ever turns
+out not to be ascending.
+
+### 2. Changing format in OBS after streaming once would deliver nothing
+
+`post_mask` bit 0 is sent by `mz0380_stream_post_proc()` during stream start.
+Under `persistent_h264` a second STREAMON on a running pipeline deliberately
+attaches VB2 and sends nothing else - correctly, since tinyvenc is no longer in
+its initial command state and a SET_VIC would fork another process.
+
+So H.264 -> stream -> stop -> switch to `YU12` -> stream would reuse the running
+pipeline, never re-send `post_mask`, and leave the card writing 16-byte stubs.
+Zero frames, no error. The M218 test only passed because the format was chosen
+on a fresh load, where the first STREAMON does a full start.
+
+`S_FMT` now sets `pipeline_reconfigure_pending` when the delivery format changes
+while a pipeline is running, so the next attachment cleanly replaces the encoder
+and re-sends the command - reusing the mechanism already built for HDMI timing
+changes.
+
+### Checked and found sound
+
+- The landed test / `memcpy` race: a slot is revisited every ~4 frames (~80 ms
+  at 50 fps) while the copy takes on the order of a millisecond.
+- `deliver_raw` is only ever set inside the successful bank allocation, so a
+  failed or skipped allocation cannot leave the node advertising a format it
+  cannot deliver.
+- Capability-only allocation failure is non-fatal; an explicitly requested one
+  still fails loudly.
+- A `seq_printf` pair joined by a comma operator was rewritten with braces. It
+  behaved correctly and would not have stayed that way.
+
+### Still open
+
+The byte-identical duplicates from M219 remain unexplained. They are not torn
+frames - a torn frame differs from its predecessor - and both suppression
+attempts made things worse, so they are counted and left alone.
+
+### M221 addendum: the verification was the defect
+
+The M221 changes were reported as building clean and did not build at all. Two
+compile errors reached the operator and cost a load: `mz0380_raw_frame_bytes`
+declared in a header the video side does not include, and
+`mz0380_raw_poison_dword` deleted along with the sentinel array it sat next to.
+
+Neither is interesting. How they got through is.
+
+The working tree could not be built non-root - the hardware scripts run `make`
+as root and leave root-owned objects - so the check was done in a copy under
+/tmp. That copy was refreshed by removing `src/` and `Makefile` and copying them
+back, and then judged by `ls mz0380.ko`. **A stale `.ko` from an earlier
+successful build was still sitting there.** The test passed on a leftover file,
+every time, regardless of whether `make` had succeeded.
+
+So the check reported success on a tree that had never compiled, twice in a row,
+and looked exactly like a real verification in the transcript.
+
+`scripts/mz0380-build-check.sh` now does the two things that were missing: it
+starts from an empty directory, so nothing from a previous run can be mistaken
+for this one's output, and it reports **make's exit status** rather than the
+presence of a file. It needs no root and touches no hardware, so there is no
+longer a reason to skip it.
+
+The declaration itself now lives in `mz0380.h`, the only header both sides
+share. `mz0380-internal.h` is reachable from the video side and
+`mz0380-dma-internal.h` from the DMA side; putting it in either one built clean
+on one side and failed on the other.
+
+## M222 (2026-08-28): the flicker was never one bug - the token does not name the raw slot
+
+Two reports after M220/M221 landed: the flicker was still there at 1080p, and
+selecting 1280x720 "crashed the driver".
+
+### The 720p report was not a crash
+
+The driver refused, correctly, and said why:
+
+```
+refusing to stream: the source is 1920x1080 but the buffers were allocated for
+1280x720, and this path has no scaler - the card would write 3110400 bytes into
+a buffer described as 1382400
+```
+
+The module stayed loaded. **The card has no scaler**: it produces at the source
+geometry and nothing else. So `VIDIOC_ENUM_FRAMESIZES` returning the whole mode
+table was itself the fault - it reads as a menu of supported resolutions, and
+every entry except the live source one is a trap that fails at STREAMON, which
+in an application looks like the driver falling over. It now reports the live
+source geometry alone, falling back to the table only when no geometry is known
+yet.
+
+This also corrects M221, which called the raw path "broken at every resolution
+except 1080p". Deriving the length from geometry was right and remains, but the
+resolutions it was fixing were never reachable in the first place.
+
+### The flicker: the token does not name the raw slot
+
+M217 picked the slot with `idx = snapshot->token & 7`, on the assumption that
+the encoded completion's token indexes the raw ring the same way it indexes the
+encoded one. Nothing ever established that, and the M212 head sampler had
+already contradicted it: across one run the four op02 slots changed **2, 219,
+217 and 230** times. Four slots taking turns produce four similar counts. These
+do not.
+
+So a token-selected slot was frequently not the one the card had just written -
+stale, which is the byte-identical duplicates M219 measured, or mid-write, which
+is the flicker. M220's OR-to-AND fix was a real bug fixed, but it only closed
+one of the ways a torn frame could arrive, which is why the flicker survived it.
+
+`mz0380_drain_raw_deliver()` now ignores the token and scans bank0's four slots,
+taking any that carries a complete frame. Bank1 is skipped outright: M215 found
+it untouched with its poison intact.
+
+### A completeness test that survives the copy
+
+Passing the sentinel test proves a whole frame was present when the sentinels
+were read. It says nothing about the two milliseconds the `memcpy` then takes,
+during which the card may begin overwriting that same slot.
+
+So the sentinels are now re-poisoned **before** the copy and re-read after it. If
+the card wrote into the slot meanwhile it will have put its own bytes back over
+them, the frame is discarded instead of delivered torn, and the vb2 buffer is
+returned to the queue rather than consumed. `raw_frames_torn` counts it.
+
+That makes the guard cover the whole window between deciding a frame is complete
+and finishing with it, which neither M217 nor M220 did.
+
+### Standing correction
+
+Three separate explanations have now been offered for this flicker - a partial
+frame passing an OR test, a wrong frame size, and a wrong slot. Only the last
+one accounts for the duplicates as well, and only the tear detector closes the
+copy window regardless of which slot the card is writing. The first two were
+real defects; neither was the reported symptom's cause.
+
+## M223 (2026-08-28): the stuck node, and admitting the flicker has not been diagnosed
+
+### The 720p report was a wedge, not a crash, and it was mine
+
+```
+frame size : 1280x720      <- what S_FMT accepted
+source     : 1920x1080     <- what the card actually produces
+pipeline   : stopped, replacement pending
+```
+
+Switching back to H.264 "did nothing" because the pixelformat was never the
+problem - `/proc` shows it was already `H264`. The **geometry** was stuck at
+720p, so every STREAMON was refused by the no-scaler check, permanently.
+
+`S_FMT` accepted a size the hardware cannot produce and nothing ever put it
+back. V4L2 requires TRY_FMT and S_FMT to return the format that will actually be
+used; for a device whose input geometry is whatever the source is sending, that
+means answering with the source geometry rather than accepting a request that
+can only fail later. `mz0380_clamp_to_source()` now does that in both, using the
+receiver's measured `capture.source_width/height`.
+
+That closes the trap at its origin: an application asking for 720p is told
+1920x1080 and uses it, instead of being accepted and then refused forever.
+
+### The flicker is still not diagnosed, and the record should say so
+
+Three causes have been proposed and three fixes shipped:
+
+| | proposed cause | outcome |
+|---|---|---|
+| M220 | partial frame passing an OR sentinel test | real bug, fixed, flicker remained |
+| M221 | frame size hardcoded to 1080p | real bug, fixed, flicker remained |
+| M222 | token does not name the raw slot; no tear detection | real bugs, fixed, flicker remained |
+
+Each was a genuine defect found by inspection. None was the reported symptom's
+cause, and each was presented with more confidence than a fix validated only by
+reasoning deserves.
+
+M222 also introduced a fourth candidate while claiming to fix the third: it
+delivered **every** landed slot per completion, in slot order. If two slots hold
+frames captured at different moments, that emits them out of time order, and
+out-of-order frames flicker exactly like torn ones.
+
+### What this change does instead of guessing again
+
+`mz0380_drain_raw_deliver()` now takes **at most one frame per completion**,
+which matches the frame clock the completions arrive on, and starts each scan
+after the slot taken last so the four are consumed in rotation. If the card
+fills a four-slot ring in rotation, consuming them in rotation preserves order
+without needing to know it.
+
+And it traces, because inspection has now been wrong three times:
+
+```
+raw scan landed=0x6 took slot 1 (multi=... torn=...)
+```
+
+- `landed` - which slots held a complete frame when the scan ran. **More than
+  one bit set means frames are queueing and ordering genuinely matters; exactly
+  one means the pacing is right; zero means the completion beat the DMA.**
+- `raw_multi_landed` and `raw_frames_torn` are in `/proc/mz0380-state`.
+
+Whether the flicker survives this is the measurement. If `landed` is usually a
+single bit and the picture is still wrong, ordering is not the cause either and
+the next suspect is the completion source itself - an encoded completion may
+simply not indicate that any raw frame is ready.
+
+## M224 (2026-08-28): the frames were never the problem - the timestamps were
+
+The M223 trace settled what three rounds of inspection could not:
+
+```
+raw scan landed=0x8 took slot 3 (multi=0 torn=0)
+raw scan landed=0x1 took slot 0 (multi=0 torn=0)
+raw scan landed=0x2 took slot 1 (multi=0 torn=0)
+raw scan landed=0x4 took slot 2 (multi=0 torn=0)
+```
+
+Exactly one slot ready per completion, rotating cleanly 0-1-2-3, `multi=0`,
+`torn=0`. So frames are not queueing, delivery order cannot be wrong, and the
+tear detector never fires.
+
+An 89-frame capture taken from the running driver confirms it from the other
+end: **no poison anywhere** (so no region of any frame went unwritten), no
+tears, luma mean flat at 121.8 across the run, chroma at 135/129, frames
+arriving in slot rotation.
+
+The delivered pictures are correct. Every content-side hypothesis is dead.
+
+### What was actually wrong
+
+```c
+vbuf->vb.vb2_buf.timestamp = snapshot->timestamp_ns;
+```
+
+That was defensible under M217, where the slot was selected **from that
+completion's token**, so the completion and the frame were the same event. M222
+stopped doing that - slots are scanned and consumed in rotation - and the line
+was left alone. From that point the timestamp stamped on a raw frame belonged to
+a different frame.
+
+Combined with delivering ~50 fps against the 60 the node advertises, what a
+renderer received was good pictures carrying other frames' timestamps at an
+irregular cadence. That presents as stutter, and stutter is what "flickering on
+every format except H.264" describes: the encoded path delivers on the very
+completion whose timestamp it stamps, so it never had the fault.
+
+Now stamped with `ktime_get_ns()` at delivery.
+
+### Method note
+
+This is the fourth explanation offered for the same symptom, and the first
+reached by measurement rather than inspection. The three before it - an OR
+sentinel test, a hardcoded frame size, a token that does not name the slot -
+were all real defects and all fixed, and none of them was the reported problem.
+The instrumentation added in M223 answered it in one run.
+
+The pattern is worth naming: each earlier fix was found by reading the code,
+confirmed by reasoning, and shipped as though reasoning were evidence. The
+counters cost one run and ended it.
