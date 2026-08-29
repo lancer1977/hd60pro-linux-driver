@@ -29,6 +29,7 @@ import sys
 
 WIDTH, HEIGHT = 1920, 1080
 Y_BYTES = WIDTH * HEIGHT
+C_BYTES = Y_BYTES // 4
 FRAME_BYTES = Y_BYTES * 3 // 2
 # A prime stride samples the whole plane without aligning to any row or block
 # boundary, and keeps this fast enough to consume 60 fps in pure Python.
@@ -37,12 +38,40 @@ STRIDE = 997
 BLACK_MAX = 20
 
 
+def plane_stats(plane):
+    sample = plane[::STRIDE]
+    return sum(sample) / len(sample), min(sample), max(sample)
+
+
 def frame_stats(buf):
     y = buf[:Y_BYTES]
-    sample = y[::STRIDE]
-    n = len(sample)
-    total = sum(sample)
-    return total / n, min(sample), max(sample)
+    u = buf[Y_BYTES:Y_BYTES + C_BYTES]
+    v = buf[Y_BYTES + C_BYTES:Y_BYTES + 2 * C_BYTES]
+    return plane_stats(y), plane_stats(u), plane_stats(v)
+
+
+def classify_blank(buf):
+    """Distinguish a black PICTURE from memory nothing wrote.
+
+    Rec.709 studio black is Y=16 with both chroma planes at 128. A frame that
+    is zero everywhere is not a picture at all - it is a slot the card never
+    filled, which the poison sentinel test cannot detect because zeros differ
+    from poison exactly the way real data does. The two call for opposite
+    fixes, so name which one this is instead of reporting "blank".
+    """
+    if not any(buf):
+        return "ALL-ZERO (slot never written; the landed test let it through)"
+    y = buf[:Y_BYTES]
+    u = buf[Y_BYTES:Y_BYTES + C_BYTES]
+    v = buf[Y_BYTES + C_BYTES:Y_BYTES + 2 * C_BYTES]
+    ymax = max(y[::STRIDE])
+    umin, umax = min(u[::STRIDE]), max(u[::STRIDE])
+    vmin, vmax = min(v[::STRIDE]), max(v[::STRIDE])
+    if 8 <= ymax <= 20 and 120 <= umin and umax <= 136 \
+            and 120 <= vmin and vmax <= 136:
+        return "STUDIO BLACK (a real black picture the card painted)"
+    return ("MIXED (y_max=%d u=%d..%d v=%d..%d - neither zeros nor studio black)"
+            % (ymax, umin, umax, vmin, vmax))
 
 
 def main():
@@ -53,11 +82,13 @@ def main():
         buf = src.read(FRAME_BYTES)
         if len(buf) < FRAME_BYTES:
             break
-        mean, lo, hi = frame_stats(buf)
+        (mean, lo, hi), (umean, _, _), (vmean, _, _) = frame_stats(buf)
         blank = hi <= BLACK_MAX
-        frames.append((mean, lo, hi, blank))
-        print("frame %5d  mean_y=%7.2f  min=%3d  max=%3d%s"
-              % (idx, mean, lo, hi, "   <-- BLANK" if blank else ""))
+        kind = classify_blank(buf) if blank else ""
+        frames.append((mean, lo, hi, blank, kind))
+        print("frame %5d  mean_y=%7.2f  min=%3d  max=%3d  u=%6.2f v=%6.2f%s"
+              % (idx, mean, lo, hi, umean, vmean,
+                 "   <-- BLANK: " + kind if blank else ""))
         idx += 1
 
     if not frames:
@@ -74,13 +105,34 @@ def main():
         gaps = [b - a for a, b in zip(blanks, blanks[1:])]
         print("blank indices     : %s%s"
               % (blanks[:40], " ..." if len(blanks) > 40 else ""))
-        if gaps:
+        if len(gaps) >= 2:
             print("spacing (frames)  : min=%d max=%d mean=%.1f"
                   % (min(gaps), max(gaps), sum(gaps) / len(gaps)))
+        elif gaps:
+            # One gap is a distance, not a period. Saying "spacing min=max"
+            # invites reading a cadence into a sample of two.
+            print("spacing (frames)  : %d (single gap - NOT evidence of a period)"
+                  % gaps[0])
+        kinds = sorted({frames[i][4] for i in blanks})
+        for k in kinds:
+            print("blank kind        : %s" % k)
         print()
-        print("VERDICT: the card is writing blank frames into the raw bank and")
-        print("the sentinel 'landed' test passes them through as good frames.")
-        print("The flashing is content the driver was handed, not a delivery bug.")
+        zero = any(k.startswith("ALL-ZERO") for k in kinds)
+        black = any(k.startswith("STUDIO BLACK") for k in kinds)
+        if zero:
+            print("VERDICT: at least one delivered frame was ALL ZEROS, which is not")
+            print("a picture. The card never wrote that slot, and the sentinel test")
+            print("cannot tell: it only checks that the poison is gone, and zeros")
+            print("differ from poison exactly the way real data does. The fix belongs")
+            print("in the completeness test, not in the content.")
+        if black:
+            print("VERDICT: at least one delivered frame was a real studio-black")
+            print("picture (Y=16, chroma 128). The card painted it, the driver")
+            print("forwarded it faithfully, and the question moves to why the card")
+            print("emits blanks - not to the delivery path.")
+        if not (zero or black):
+            print("VERDICT: blank frames found, but they match neither zeros nor")
+            print("studio black. Read the MIXED line above before theorising.")
     else:
         print()
         print("VERDICT: no blank frame was delivered in this capture. If the")
