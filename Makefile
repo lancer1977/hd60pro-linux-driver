@@ -111,8 +111,16 @@ else
 KBUILD_FLAGS ?=
 endif
 
+#
+# M=$(CURDIR), never M=$(PWD). PWD is an environment variable, and sudo's
+# env_reset drops it - so `sudo make install` passed kbuild an empty M=, which
+# it reads as "build the kernel itself" and answers with a syncconfig failure
+# about arch/arm/crypto/Kconfig. The same command works unprivileged, because
+# there the shell had exported PWD. CURDIR is set by make itself and survives
+# both.
+#
 all: kcheck
-	$(MAKE) -C $(KBUILD) M=$(PWD) $(KBUILD_FLAGS) modules
+	$(MAKE) -C $(KBUILD) M=$(CURDIR) $(KBUILD_FLAGS) modules
 
 #
 # Fail with a usable message instead of kbuild's bare "No such file or
@@ -196,7 +204,7 @@ objclean:
 # the one command that unsticks a broken tree is itself unavailable.
 clean:
 	@if [ -e "$(KBUILD)/Makefile" ]; then \
-		$(MAKE) -C $(KBUILD) M=$(PWD) $(KBUILD_FLAGS) clean; \
+		$(MAKE) -C $(KBUILD) M=$(CURDIR) $(KBUILD_FLAGS) clean; \
 	else \
 		echo "no build tree for '$(KVER)' - removing build products directly"; \
 		rm -f *.o *.ko *.mod *.mod.c .*.cmd src/*.o src/.*.cmd \

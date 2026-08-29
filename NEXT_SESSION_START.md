@@ -58,9 +58,25 @@ The placeholder work item is still **scheduled on the same cadence** in raw
 mode - it just counts instead of delivering. So one run reads out both the fix
 and the evidence for the diagnosis:
 
+`modprobe` only works once the module is installed for the running kernel, and
+a fresh kernel (or a first checkout) has nothing in `/lib/modules`. Build as
+your own user first so the tree does not fill with root-owned objects:
+
+```bash
+make
+```
+
+```bash
+sudo make install
+```
+
 ```bash
 sudo modprobe mz0380
 ```
+
+`make install` binds to one kernel; `sudo make dkms-install` instead if it
+should survive kernel upgrades. `mz0380.modprobe.conf` sets no options at all -
+only a softdep - so the defaults really are the whole configuration (M216).
 
 Select `YU12` in OBS, watch, then:
 
