@@ -14226,5 +14226,58 @@ non-zero count with the flicker gone confirms both, and a zero count falsifies
 M225 before a sixth theory can be built on it. This exists because the flicker
 had been diagnosed wrong four times from inspection alone.
 
-Status: fix and counter built clean (0 warnings); hardware confirmation
-outstanding.
+**Status: FALSIFIED on hardware, 2026-08-29.** The counter did its job. A
+~16 second `ffplay -input_format yuv420p` run on `/dev/video0` reported:
+
+```
+pixelformat: YU12
+raw frames : 637 delivered, 0 dropped, 10 stub completions skipped
+raw repeats: 129 identical-head observations, 0 torn, 0 completions with >1 slot ready
+no signal  : inactive, 0 placeholder IDRs delivered, 19 withheld from a raw node (M225)
+```
+
+The mechanism was real and live: `no_signal_fps` is 2, so 19 withheld ticks
+means the placeholder was armed for roughly 9.5 of those 16 seconds and the old
+code would have injected about 19 black frames into the stream. **And the
+flashing was unchanged.** So the placeholder was a genuine defect worth fixing -
+it cannot be allowed to hand H.264 to an I420 node - but it is not the cause,
+which makes it the fifth wrong diagnosis of this symptom.
+
+The fix and the counter stay. What the same run rules out matters more: 0
+dropped, 0 torn, 0 multi-slot, 0 placeholders delivered. The black frames reach
+userspace through the ordinary delivery path, as ordinary frames.
+
+Note also 129 identical-head observations in 637 delivered - about 20% of
+frames repeat the previous frame's first bytes. That is a separate open
+question and is judder, not flashing.
+
+## M226 (2026-08-29): the untested possibility - are the delivered frames themselves black?
+
+`mz0380_raw_probe_frame_landed` decides a slot holds a complete frame by
+checking that the poison sentinels have been overwritten. A blank frame
+overwrites them exactly as a picture does. The test therefore proves the card
+wrote *something*, and has never been able to distinguish a picture from a
+black rectangle. If the card emits an occasional blank into the raw bank - and
+nothing so far has looked - it is delivered as a good frame and presents
+precisely as intermittent flashing.
+
+Every content-side claim so far rests on one 89-frame capture described as
+having flat luma and correct colour. 89 frames is under two seconds; at the
+observed rate of flashing that is a handful of events, and a per-frame scan was
+never run.
+
+`scripts/mz0380-m226-blackframe-scan.py` reads I420 frames from stdin and
+reports per-frame luma, so nothing hits the disk:
+
+```
+ffmpeg -f v4l2 -input_format yuv420p -video_size 1920x1080 \
+       -i /dev/video0 -frames:v 600 -f rawvideo - 2>/dev/null \
+  | ./scripts/mz0380-m226-blackframe-scan.py
+```
+
+It is written to be falsifiable in both directions and says so in its own
+output: blanks found means the flashing is content the driver was handed, and
+no blanks found means the payload is innocent and the next suspect is pacing or
+the consumer - explicitly not a licence to build a fix on the file's silence.
+
+Status: script self-tested against synthetic frames; hardware run outstanding.

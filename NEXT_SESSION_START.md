@@ -4,24 +4,15 @@ _Last updated 2026-08-29. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: one hardware run to confirm M225
+## Immediate task: M226 - scan the delivered frames for blanks
 
-**Uncompressed capture works.** The driver delivers 1920x1080 I420 through
-V4L2 with no encoder in the delivery path, at ~50 fps, selectable by an
-application through `S_FMT` with no module parameters. That was the project's
-goal and it is done (M213-M218, hardware-confirmed).
+**Uncompressed capture works.** 1920x1080 I420 through V4L2, no encoder in the
+delivery path, ~50 fps, selected by an application through `S_FMT` with no
+module parameters (M213-M218). The project goal is done.
 
-Everything is committed. The tree is clean and builds with 0 warnings
-(`./scripts/mz0380-build-check.sh`).
-
-### The flicker: what it is, and why the first four theories missed
-
-The operator was asked what the symptom actually looks like. The answer:
-**frames go black or blank intermittently, and the picture is correct whenever
-it is present.** That is flashing, not stutter and not corruption - which
-retires theories one through four in one step, because all four were about the
-content or the timing of the *raw* frames, and the raw frames were already
-measured clean.
+**The raw flicker is still open, and five theories are now dead.** The symptom
+is FLASHING - intermittent black or blank frames with a correct picture in
+between. Not stutter, not tearing, not corruption.
 
 | | claimed cause | verdict |
 |---|---|---|
@@ -29,38 +20,54 @@ measured clean.
 | M221 | frame size hardcoded to 1080p | real bug, fixed, symptom remained |
 | M222 | token does not name the raw slot | real bugs, fixed, symptom remained |
 | M224 | wrong timestamp per frame | correct in itself; predicts stutter, not flashing |
-| **M225** | **H.264 placeholder delivered to an I420 node** | **fix shipped, one run to confirm** |
+| M225 | H.264 placeholder delivered to an I420 node | real bug, fixed, **falsified by its own counter** |
 
-M225 is not another theory about the raw frames. The black frames are not raw
-frames at all.
+M225 is worth reading as a method, not just a result. It shipped with a counter
+that kept the placeholder's timing and withheld only the delivery, so one run
+reported both the fix and the diagnosis. It came back `19 withheld` with the
+flashing unchanged - the mechanism was live, and it still was not the cause.
+Instrument the next one the same way.
 
-`mz0380_no_signal_work_fn` replays a canned 1920x1080 H.264 IDR from host
-memory into the shared VB2 queue. It was gated on `streaming`,
-`no_signal_active` and `h264_probe` - and on nothing about the pixel format
-the node had negotiated. Raw delivery *requires* `h264_probe` and a running
-encoder (M210b is what established that), so a raw session satisfies every one
-of those gates. The placeholder is then activated exactly as it would be for
-an encoded session, by `mz0380_start_streaming`'s persistent-pipeline
-reattachment (`src/mz0380-vb2.c`) and by every unlock or producer-silence blip
-in the receiver monitor (`src/mz0380-signal.c`). Each tick took a buffer off
-`dev->buf_list` at up to `no_signal_fps` and handed it back holding a few
-kilobytes of Annex-B with `bytesused` to match. An I420 consumer renders that
-as a black or garbage frame, between correct ones. It never showed on `H264`
-because there the placeholder is exactly what the node promised.
+### What the falsifying run measured (2026-08-29, ~16 s of ffplay)
 
-The fix withholds the placeholder whenever `dev->deliver_raw` is set; the raw
-queue simply holds, which is what a consumer expects while a source is
-unlocked.
+```
+pixelformat: YU12
+raw frames : 637 delivered, 0 dropped, 10 stub completions skipped
+raw repeats: 129 identical-head observations, 0 torn, 0 completions with >1 slot ready
+no signal  : inactive, 0 placeholder IDRs delivered, 19 withheld from a raw node
+```
 
-### The run, and what makes it decisive
+0 dropped, 0 torn, 0 multi-slot, 0 placeholders delivered. **The black frames
+arrive through the ordinary delivery path, as ordinary frames.**
 
-The placeholder work item is still **scheduled on the same cadence** in raw
-mode - it just counts instead of delivering. So one run reads out both the fix
-and the evidence for the diagnosis:
+### M226: the possibility nothing has tested
 
-`modprobe` only works once the module is installed for the running kernel, and
-a fresh kernel (or a first checkout) has nothing in `/lib/modules`. Build as
-your own user first so the tree does not fill with root-owned objects:
+`mz0380_raw_probe_frame_landed` calls a slot complete when the poison sentinels
+have been overwritten. A blank frame overwrites them exactly as a picture does,
+so that test has never been able to tell a picture from a black rectangle - it
+only proves the card wrote something. Every content-side claim so far rests on
+one 89-frame capture, which is under two seconds and was never scanned per
+frame.
+
+```bash
+ffmpeg -f v4l2 -input_format yuv420p -video_size 1920x1080 \
+       -i /dev/video0 -frames:v 600 -f rawvideo - 2>/dev/null \
+  | ./scripts/mz0380-m226-blackframe-scan.py
+```
+
+Streams through stdin, so 1.9 GB never touches the disk. Reads both ways:
+
+- blanks found -> the flashing is content the card handed us, and the landed
+  test is what lets it through. Fix belongs in the completeness test.
+- no blanks -> the payload is innocent. Next suspects are pacing and the
+  consumer. Do NOT build a fix on this file's silence.
+
+Also open, and separate: **129 identical heads in 637 frames** (~20% repeats).
+That is judder, not flashing.
+
+### Running it
+
+`modprobe` needs the module installed for the running kernel:
 
 ```bash
 make
@@ -74,35 +81,25 @@ sudo make install
 sudo modprobe mz0380
 ```
 
-`make install` binds to one kernel; `sudo make dkms-install` instead if it
-should survive kernel upgrades. `mz0380.modprobe.conf` sets no options at all -
-only a softdep - so the defaults really are the whole configuration (M216).
+`make install` binds to one kernel; `sudo make dkms-install` survives upgrades.
+`mz0380.modprobe.conf` sets no options - only a softdep - so the defaults are
+the whole configuration (M216).
 
-Select `YU12` in OBS, watch, then:
+**OBS does not offer `YU12` in its Video Format dropdown**, so an OBS session
+silently tests the encoded path instead. Two hardware runs were spent finding
+that out. Use `ffplay -f v4l2 -input_format yuv420p -video_size 1920x1080
+/dev/video0` for raw, and deactivate the OBS source first - `deliver_raw` is
+device-wide, so two clients in different formats fight over it.
 
-```bash
-grep 'no signal' /proc/mz0380-state
-```
-
-- flicker gone **and** `withheld from a raw node` non-zero -> confirmed; the
-  count is exactly the buffers the old code was corrupting.
-- `withheld` is **zero** and the flicker persists -> M225 is wrong too, and the
-  counter says so before a sixth theory is built on it. Do not guess from
-  inspection at that point; the placeholder is then not involved and the next
-  suspect is whatever else completes a buffer.
-- flicker gone and `withheld` zero -> something else changed; re-check before
-  claiming M225.
-
-`raw_frames_delivered` vs `raw_probe_stub_frames` in the same file quantifies
-the 50-vs-60 gap. ~50 fps is the PCIe x1 Gen1 ceiling
-(`3110400 * 50 = 155 MB/s`), not a driver limit.
+Confirm the node is actually in raw mode before trusting any raw result:
+`pixelformat: YU12` plus the `raw frames` and `raw repeats` lines present in
+`/proc/mz0380-state`. Those two lines only print when `deliver_raw` is set.
 
 ### Budget
 
-The tally was 14, inside the 8-18 wedge band, and a mains-off cold boot has
-since been taken - so the wedge budget is reset. Run
-`sudo scripts/mz0380-spawns.sh reset` if a load misbehaves.
-
+A mains-off cold boot was taken on 2026-08-29, so the wedge tally restarted.
+It stood at 2 spawns after the M225 run. The card wedges somewhere in 8-18 per
+power cycle; `sudo scripts/mz0380-spawns.sh reset` if a load misbehaves.
 
 ## What this session built
 
