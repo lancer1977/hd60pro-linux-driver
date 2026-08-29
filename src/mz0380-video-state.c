@@ -151,10 +151,11 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 				   (unsigned long long)dev->raw_frames_torn,
 				   (unsigned long long)dev->raw_multi_landed);
 		}
-		seq_printf(m, "  no signal : %s, %llu placeholder IDRs delivered, %llu cadence misses\n",
+		seq_printf(m, "  no signal : %s, %llu placeholder IDRs delivered, %llu cadence misses, %llu withheld from a raw node (M225)\n",
 			   READ_ONCE(dev->no_signal_active) ? "active" : "inactive",
 			   (unsigned long long)dev->no_signal_frames_delivered,
-			   (unsigned long long)dev->no_signal_frames_missed);
+			   (unsigned long long)dev->no_signal_frames_missed,
+			   (unsigned long long)dev->no_signal_frames_suppressed);
 		if (READ_ONCE(dev->last_h264_frame_stamp))
 			seq_printf(m, "  recovery  : %s, last card H.264 access unit %ums ago\n",
 				   READ_ONCE(dev->signal_recovering) ?

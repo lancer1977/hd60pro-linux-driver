@@ -437,6 +437,8 @@ struct mz0380_dev {
 	struct mutex h264_delivery_lock;
 	u64 no_signal_frames_delivered;
 	u64 no_signal_frames_missed;
+	/* M225: placeholder ticks withheld because the node is delivering raw. */
+	u64 no_signal_frames_suppressed;
 	bool no_signal_active;
 	/*
 	 * The receiver monitor is independent of encoder activity. This matters

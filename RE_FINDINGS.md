@@ -14183,3 +14183,48 @@ The instrumentation added in M223 answered it in one run.
 The pattern is worth naming: each earlier fix was found by reading the code,
 confirmed by reasoning, and shipped as though reasoning were evidence. The
 counters cost one run and ended it.
+
+## M225 (2026-08-29): the raw flicker is an H.264 placeholder delivered to an I420 node
+
+Symptom, as the operator describes it: frames go black or blank intermittently
+and the picture is correct whenever it is present. Flashing - not stutter, and
+not corruption. That distinction is what retires M220/M221/M222/M224 at once:
+each of those was a claim about the content or the timing of the raw frames,
+and an 89-frame capture off the running driver had no poison, no tears, flat
+luma and correct colour. The black frames were never raw frames.
+
+`mz0380_no_signal_work_fn` (`src/mz0380-no-signal.c`) replays a self-contained
+1920x1080 H.264 IDR from host memory into the shared VB2 queue. Its gates were
+`streaming`, `no_signal_active` and `mz0380_h264_probe`. None of them mentions
+the negotiated pixel format, and raw delivery satisfies all three: the encoder
+must keep running for the card to produce raw at all (M210b), so `h264_probe`
+is set in exactly the configuration raw needs.
+
+Activation sites reached during a normal raw session:
+
+- `mz0380_start_streaming`, persistent-pipeline reattachment - "validating HDMI
+  state at persistent reattachment" (`src/mz0380-vb2.c`).
+- the receiver monitor, on unlock and on producer silence
+  (`src/mz0380-signal.c`).
+
+Each tick took a buffer off `dev->buf_list` at up to `no_signal_fps` and
+returned it holding `mz0380_no_signal_h264_len` bytes of Annex-B with
+`bytesused` set to match. An I420 consumer renders that as a black or garbage
+frame. `H264` never showed it because there the placeholder is what the node
+promised - it is the whole point of the feature.
+
+Fix: `mz0380_no_signal_replay_allowed()` withholds the placeholder whenever
+`dev->deliver_raw` is set. The raw queue holds instead, which is the correct
+presentation for an unlocked source.
+
+Instrumentation, deliberately kept: the work item is still **scheduled on the
+same cadence** in raw mode and counts rather than delivers, so
+`no_signal_frames_suppressed` ("withheld from a raw node" in
+`/proc/mz0380-state`) reports exactly how many buffers the previous code was
+corrupting. One run therefore tests the fix and the diagnosis together - a
+non-zero count with the flicker gone confirms both, and a zero count falsifies
+M225 before a sixth theory can be built on it. This exists because the flicker
+had been diagnosed wrong four times from inspection alone.
+
+Status: fix and counter built clean (0 warnings); hardware confirmation
+outstanding.
