@@ -151,8 +151,15 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 				   (unsigned long long)dev->raw_frames_torn,
 				   (unsigned long long)dev->raw_multi_landed);
 		}
-		seq_printf(m, "  no signal : %s, %llu placeholder IDRs delivered, %llu cadence misses, %llu withheld from a raw node (M225)\n",
-			   READ_ONCE(dev->no_signal_active) ? "active" : "inactive",
+		/*
+		 * Labelled for what it is. "no signal : inactive" was read by
+		 * the operator as the driver reporting no HDMI source, when it
+		 * means the opposite - the NO SIGNAL placeholder is not being
+		 * shown, which is the healthy state.
+		 */
+		seq_printf(m, "  placeholder: %s, %llu NO SIGNAL IDRs delivered, %llu cadence misses, %llu withheld from a raw node (M225)\n",
+			   READ_ONCE(dev->no_signal_active) ?
+			   "SHOWING (no usable source)" : "not shown (source is live)",
 			   (unsigned long long)dev->no_signal_frames_delivered,
 			   (unsigned long long)dev->no_signal_frames_missed,
 			   (unsigned long long)dev->no_signal_frames_suppressed);
