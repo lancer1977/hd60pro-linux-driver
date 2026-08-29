@@ -26,8 +26,15 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# -v is this script's own flag. It must be REMOVED from the argument list, not
+# just noted: everything left in "$@" is forwarded to make, and `make -v` prints
+# the version and exits 0 without building. That produced "BUILD FAILED (make
+# exit 0)" - the one message this script exists to make impossible.
 VERBOSE=0
-[ "${1:-}" = "-v" ] && VERBOSE=1
+if [ "${1:-}" = "-v" ]; then
+	VERBOSE=1
+	shift
+fi
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/mz0380-buildcheck.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT

@@ -95,6 +95,18 @@ Confirm the node is actually in raw mode before trusting any raw result:
 `pixelformat: YU12` plus the `raw frames` and `raw repeats` lines present in
 `/proc/mz0380-state`. Those two lines only print when `deliver_raw` is set.
 
+### The running kernel has no headers (2026-08-29)
+
+A system upgrade replaced `linux-cachyos` 7.2.0-1 with 7.2.2-1 mid-session, so
+`/lib/modules/7.2.0-1-cachyos/build` is gone and **nothing can be rebuilt for
+this boot**. `kcheck` says exactly that and names the buildable kernels. The
+already-loaded module is unaffected and still carries the M225 fix, so
+diagnosis can continue on this boot - but any new driver change needs a reboot
+into 7.2.2 followed by `make && sudo make install`.
+
+Note this cost nothing only because M226 is a userspace script. Prefer
+diagnosis that does not require a rebuild while a boot is otherwise healthy.
+
 ### Budget
 
 A mains-off cold boot was taken on 2026-08-29, so the wedge tally restarted.
