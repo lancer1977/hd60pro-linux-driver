@@ -14411,7 +14411,55 @@ held back and the next completion delivers, costing one frame of an already
 black picture. The opposite trade - passing a half-filled frame - is the defect
 this exists to stop.
 
-Status: built clean (0 warnings); hardware confirmation outstanding.
+**Status: CONFIRMED on hardware, 2026-08-30.** A 1200-frame capture in `YU12`:
+
+```
+partial fills : 0
+blank frames  : 0            (luma mean range 16.91 .. 118.11)
+raw frames : 992 delivered, 0 dropped, 20 stub completions skipped
+raw fills  : 80 slots skipped because their last luma rows were still the clear byte
+raw repeats: 167 identical-head, 0 torn, 0 completions with >1 slot ready
+```
+
+Zero blank frames and zero partial fills, against 9 blanks and a dozen partial
+fills in every previous capture. The test fired 80 times, so it engaged rather
+than passing by accident. `completions with >1 slot ready` also fell from 1947
+to 0, which is the accumulating-landed pathology M228 stumbled over: rejecting
+unfilled slots stops them piling up as permanently-ready.
+
+The raw I420 payload is clean. Six theories were needed to get here and five of
+them were wrong; what closed it was measuring the delivered bytes
+(`scripts/mz0380-m226-blackframe-scan.py`) instead of reading the code.
+
+## M230 (2026-08-30): a SECOND flicker, and it is not the same defect
+
+With M229 in place the operator still reports black flicker in OBS on the
+non-`YU12` formats, lasting **0.5 to 1 second** at a time.
+
+That duration is the finding. At 60 fps it is 30 to 60 consecutive black
+frames, where M226/M229 were about single dropped-in blanks. A 1200-frame
+capture covering 20 seconds found zero blanks, so whatever this is does not
+reach the I420 payload the same way.
+
+What it could be, none of it yet tested:
+
+- OBS is not on the raw path at all for those formats. The node enumerates only
+  `H264` and `YU12`; `BGR3`/`YV12` come from libv4l2 emulation, which may fall
+  back to `H264` rather than converting from `YU12`. The H.264 path has its own
+  open defect (see below), and `pixelformat` in `/proc/mz0380-state` says which
+  path a session is really using.
+- Buffer starvation over a run of completions, which shows as
+  `raw frames ... dropped`.
+- The NO SIGNAL placeholder, which at `no_signal_fps=2` would black the picture
+  for exactly this kind of duration - but M225 withholds it from a raw node, so
+  this only applies if the session is not raw.
+
+Also open and probably related to the first bullet: after a raw session the
+encoded path came back with `0 cached SPS/PPS bytes`, 274 dropped and 0
+delivered, which is why OBS showed black on `H264` at that point.
+
+`scripts/mz0380-m230-flicker-watch.sh` samples the counters that separate these
+so one OBS session identifies which, instead of one session per guess.
 
 ### A third false pass from the build checker, and what it was
 
