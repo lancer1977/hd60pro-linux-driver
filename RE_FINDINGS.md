@@ -14533,3 +14533,43 @@ theory came from reading the raw delivery path; this came from watching two
 counters that had no obvious connection to it, in a session that also contained
 a working H.264 capture for contrast. The contrast is what made it visible.
 
+## M231 confirmed (2026-08-30), and what survived it
+
+Re-run of the M230 counter watch with the liveness stamp in place, same source,
+same session structure - H.264 capture, raw capture, H.264 capture:
+
+| | recovery events during raw | `phheld` | encoded path after the raw session |
+|---|---|---|---|
+| before M231 | flapping every 1-2s for the whole 50s | 1 -> 66 | `sps=0`, 274 dropped, 0 delivered |
+| after M231 | **2 events in 23s** (t=25s, t=33s) | 1 -> 2 | `sps=39`, delivering, **0 dropped** |
+
+The 1500 ms stall cadence is gone. The encoded path also recovers cleanly after
+a raw session now, which was a separate open item and is independent
+confirmation of the diagnosis: the spurious acquisition re-arms were what left
+the encoder without parameter sets.
+
+**Two recovery events survive**, 8 seconds apart, so they are not the stall
+timer. The remaining trigger is the other branch of `mz0380_signal_monitor`:
+`mz0380_mst3367_read_lock` returning `locked == false`. `signal_poll_ms` is
+4000, so a receiver read that reports unlocked on a live source is enough to
+declare NO SIGNAL, enter recovery, and re-arm acquisition. `rawtorn` also went
+0 -> 1 at t=33s, alongside one of the two events.
+
+Not yet established whether those reads are genuine momentary unlocks or
+misreads of a mailbox-backed I2C register while raw DMA is saturating the link.
+A single unlocked read is thin evidence for tearing down a working capture
+either way, and a consecutive-reads debounce is the obvious remedy - but the
+visible effect of two events in 23 seconds has not been measured yet, so it is
+not yet known whether this is worth fixing.
+
+## M157 answered (2026-08-30): the wedge cliff moved
+
+`mz0380-spawns.sh` reported **18 spawns on one power cycle with no wedge**, and
+flagged it as M157's open question. With `vic_fast_kill=0` - which is the
+driver default - the historical 8-to-18 wedge band did not bite.
+
+This does not license unlimited spawns; it records that the band was measured
+under a configuration that is no longer the default, and that the current
+default survived the top of it once. Treat 18 as observed-safe-once, not as a
+new ceiling, until a second power cycle repeats it.
+
