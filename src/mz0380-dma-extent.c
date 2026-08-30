@@ -224,6 +224,74 @@ bool mz0380_raw_probe_frame_landed(struct mz0380_dev *dev, u32 idx)
 }
 
 /*
+ * M229: has the card FINISHED writing this slot?
+ *
+ * mz0380_raw_probe_frame_landed answers a different question than its callers
+ * assumed. It asks whether the poison is gone, and M226 established on
+ * hardware that the card CLEARS a slot to black before filling it - luma 0x01,
+ * chroma 0x80 - so the clear removes every sentinel at once and "landed" goes
+ * true the moment the clear lands, long before the picture arrives. Delivered
+ * frames were therefore all black when the copy ran early, and picture on top
+ * with black below when it ran mid-fill, with the boundary moving between
+ * roughly row 700 and row 930 from frame to frame.
+ *
+ * No sentinel value or offset can fix that, because the clear touches every
+ * byte the sentinels could occupy. But the clear leaves its own signature, and
+ * that IS testable: if the last luma rows still read entirely as the clear
+ * byte, the fill has not reached the end of the picture.
+ *
+ * Sampled, not scanned - reading the whole tail per completion would cost more
+ * bandwidth than the copy it guards. Any single sample differing from the
+ * clear value proves the region was written, so this is deliberately
+ * permissive: it rejects only a tail that is uniformly the clear byte.
+ *
+ * The false negative is a frame whose last rows are genuinely flat black. That
+ * frame is held back for one completion and the next one delivers, which costs
+ * a frame of a black picture and cannot persist. The opposite trade - passing
+ * a half-filled frame - is the defect this exists to stop.
+ */
+#define MZ0380_RAW_FILL_SAMPLES  32
+#define MZ0380_RAW_FILL_ROWS     64
+
+bool mz0380_raw_probe_frame_filled(struct mz0380_dev *dev, u32 idx)
+{
+	const struct mz0380_raw_probe_buf *b;
+	size_t frame, luma, region, base, step;
+	u32 clear;
+	unsigned int i;
+
+	if (idx >= MZ0380_RAW_PROBE_NR_BUFS)
+		return false;
+	b = &dev->raw_probe_bufs[idx];
+	if (!b->va)
+		return false;
+
+	frame = mz0380_raw_frame_bytes(dev);
+	if (frame < 4096 || frame > MZ0380_RAW_PROBE_BUF_SIZE)
+		return false;
+
+	/* I420: the luma plane is the first two thirds of the frame. */
+	luma = frame / 3 * 2;
+	region = (size_t)MZ0380_RAW_FILL_ROWS * dev->capture.width;
+	if (!region || region > luma)
+		region = luma;
+	step = round_down(region / MZ0380_RAW_FILL_SAMPLES, 4);
+	if (step < 4)
+		return true;
+	base = round_down(luma - region, 4);
+
+	clear = 0x01010101u * (mz0380_raw_clear_byte & 0xff);
+	dma_rmb();
+	for (i = 0; i < MZ0380_RAW_FILL_SAMPLES; i++) {
+		const u32 *p = b->va + base + (size_t)i * step;
+
+		if (READ_ONCE(*p) != clear)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Re-arm only the sentinels. The rest of the buffer does not need restoring:
  * the frame is copied out to a vb2 plane, and the next transfer overwrites the
  * same bytes anyway. Re-poisoning 4.6 MB per frame to protect a test that reads

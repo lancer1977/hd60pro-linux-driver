@@ -756,71 +756,60 @@ mz0380_drain_raw_deliver(struct mz0380_dev *dev,
 			 const struct mz0380_frame_event *snapshot)
 {
 	unsigned int i, slot;
-	u8 landed = 0, ready;
+	u8 landed = 0;
 
-	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++)
-		if (dev->raw_probe_bufs[i].va &&
-		    mz0380_raw_probe_frame_landed(dev, i))
-			landed |= BIT(i);
+	/*
+	 * M229: a slot must be FILLED, not merely touched.
+	 *
+	 * mz0380_raw_probe_frame_landed only asks whether the poison is gone,
+	 * and M226 showed on hardware that the card clears a slot to black
+	 * before filling it. The clear removes every sentinel at once, so
+	 * "landed" goes true the moment the clear lands and the copy took
+	 * whatever had been written so far - an all-black frame when it ran
+	 * early, picture over black when it ran mid-fill.
+	 *
+	 * M228 tried to solve this with time instead, requiring a slot to be
+	 * seen landed on two consecutive scans. Its own counter falsified it:
+	 * one deferral in 1200 frames, because a slot the card cleared stays
+	 * landed indefinitely - only the DELIVERED slot is re-poisoned - so the
+	 * second observation was always already satisfied. The same run
+	 * recorded 1947 completions with more than one slot ready against zero
+	 * under M223, which is that fact seen from the other side. It is gone.
+	 */
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		if (!dev->raw_probe_bufs[i].va ||
+		    !mz0380_raw_probe_frame_landed(dev, i))
+			continue;
+		if (!mz0380_raw_probe_frame_filled(dev, i)) {
+			/* Cleared, not yet filled. Leave it to finish. */
+			dev->raw_incomplete_tail++;
+			continue;
+		}
+		landed |= BIT(i);
+	}
 
 	if (!landed) {
 		dev->raw_probe_stub_frames++;
-		dev->raw_prev_landed = 0;
 		return;
 	}
 	if (hweight8(landed) > 1)
 		dev->raw_multi_landed++;
 
-	/*
-	 * M228: "landed" means the card touched the slot, NOT that it finished.
-	 *
-	 * M226 measured what actually arrives. The card CLEARS a slot to black
-	 * before filling it - luma 0x01, chroma 0x80 - and only then writes the
-	 * picture, ascending. The clear overwrites all four sentinels, so the
-	 * completeness test passes the instant the clear lands and the copy
-	 * takes whatever has been filled so far: an all-black frame if it runs
-	 * early, picture on top and black below if it runs mid-fill. Captures
-	 * showed both, with the boundary moving between roughly row 700 and row
-	 * 930 from frame to frame, and the untouched tail reading 0x01 rather
-	 * than either bank poison - which is what proves the card wrote it.
-	 *
-	 * No choice of sentinel value or offset can survive that, because the
-	 * clear touches every byte of the frame. So stop asking the content
-	 * whether the transfer finished and use the clock instead: a fill takes
-	 * about 2 ms and these completions arrive about 16 ms apart, so a slot
-	 * still landed on the NEXT scan has certainly finished. That costs one
-	 * completion of latency and no pixel heuristics at all.
-	 *
-	 * The delivered slot is cleared from the record so it must be observed
-	 * twice again; the card only revisits a given slot every fourth frame,
-	 * so this never starves.
-	 */
-	ready = landed & dev->raw_prev_landed;
-	if (!ready) {
-		dev->raw_prev_landed = landed;
-		dev->raw_deferred_fills++;
-		return;
-	}
-
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
 		slot = (dev->raw_next_slot + i) % MZ0380_STREAM_NR_BUFS;
-		if (!(ready & BIT(slot)))
+		if (!(landed & BIT(slot)))
 			continue;
 		if (mz0380_raw_deliver_slot(dev, snapshot, slot)) {
 			dev->raw_next_slot = (slot + 1) %
 					     MZ0380_STREAM_NR_BUFS;
-			dev->raw_prev_landed = landed & ~BIT(slot);
-			pr_info_ratelimited("%s: raw scan landed=0x%x ready=0x%x took slot %u (multi=%llu torn=%llu deferred=%llu)\n",
-					    dev->name, landed, ready, slot,
+			pr_info_ratelimited("%s: raw scan landed=0x%x took slot %u (multi=%llu torn=%llu unfilled=%llu)\n",
+					    dev->name, landed, slot,
 					    (unsigned long long)dev->raw_multi_landed,
 					    (unsigned long long)dev->raw_frames_torn,
-					    (unsigned long long)dev->raw_deferred_fills);
-		} else {
-			dev->raw_prev_landed = landed;
+					    (unsigned long long)dev->raw_incomplete_tail);
 		}
 		return;
 	}
-	dev->raw_prev_landed = landed;
 }
 
 static void

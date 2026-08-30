@@ -43,6 +43,17 @@ trap 'rm -rf "$TMP"' EXIT
 # nothing from a previous build can be mistaken for this one's output.
 cp -r Makefile src "$TMP"/ || exit 1
 
+# ...which `cp -r src` quietly defeated. The working tree carries .o and .cmd
+# files from ordinary builds - root-owned ones after a hardware run - and
+# copying them hands kbuild objects that are NEWER than the sources. It then
+# skips compiling, links them, and the script reports a clean build for code
+# that does not compile at all. That is the third time this check has produced
+# a false pass, so strip every build product from the copy before make runs.
+find "$TMP" \( -name '*.o' -o -name '*.ko' -o -name '*.mod' \
+	-o -name '*.mod.c' -o -name '.*.cmd' -o -name 'Module.symvers' \
+	-o -name 'modules.order' -o -name 'modules.builtin*' \) \
+	-delete 2>/dev/null
+
 LOG="$TMP/build.log"
 ( cd "$TMP" && make "$@" ) >"$LOG" 2>&1
 RC=$?

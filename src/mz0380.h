@@ -439,9 +439,8 @@ struct mz0380_dev {
 	u64 no_signal_frames_missed;
 	/* M225: placeholder ticks withheld because the node is delivering raw. */
 	u64 no_signal_frames_suppressed;
-	/* M228: slots seen landed once and held back for the fill to finish. */
-	u64 raw_deferred_fills;
-	u8 raw_prev_landed;
+	/* M229: slots whose last luma rows were still the card's clear value. */
+	u64 raw_incomplete_tail;
 	bool no_signal_active;
 	/*
 	 * The receiver monitor is independent of encoder activity. This matters
@@ -864,6 +863,7 @@ extern unsigned int mz0380_edid_timeout_ms;
 extern bool mz0380_buf_poison;
 extern bool mz0380_event_require_complete;
 extern unsigned int mz0380_poison_byte;
+extern unsigned int mz0380_raw_clear_byte;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;
 extern bool mz0380_signal_confirm;

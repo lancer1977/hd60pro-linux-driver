@@ -222,6 +222,22 @@ MODULE_PARM_DESC(buf_poison,
  * bytes discriminates: a real un-written hole stays put; a collision moves
  * or disappears.
  */
+/*
+ * M229: the byte the CARD writes when it clears a slot before filling it.
+ *
+ * M226 measured it: the unfilled tail of a partially delivered frame reads
+ * 0x01 to the last row, and 0x01 is none of the poison values this driver
+ * uses (0xa5 and 0x5a for the banks, 0xaa for the frame buffers). It is luma
+ * black, written by the card. A parameter rather than a constant so a capture
+ * that shows a different clear value can be handled without a rebuild - and so
+ * setting it to something the card never writes disables the test, which is
+ * how to check whether the test itself is what changed the result.
+ */
+unsigned int mz0380_raw_clear_byte = 0x01;
+module_param_named(raw_clear_byte, mz0380_raw_clear_byte, uint, 0644);
+MODULE_PARM_DESC(raw_clear_byte,
+	"M229: byte the card writes when clearing a raw slot before filling it (def:1). A slot whose last luma rows are entirely this value has not finished filling and is not delivered");
+
 unsigned int mz0380_poison_byte = 0xaa;
 module_param_named(poison_byte, mz0380_poison_byte, uint, 0644);
 MODULE_PARM_DESC(poison_byte,

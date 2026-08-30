@@ -14364,5 +14364,67 @@ deferral never engaged and this diagnosis is wrong; if it is large and the
 scanner still reports blanks and partial fills, the clear-then-fill reading is
 wrong. `scripts/mz0380-m226-blackframe-scan.py` remains the ground truth.
 
+**Status: FALSIFIED on hardware, 2026-08-30, by its own counter.**
+
+```
+raw frames : 1001 delivered, 0 dropped, 0 stub completions skipped
+raw fills  : 1 completions deferred one scan for the card's fill to finish
+raw repeats: 277 identical-head, 0 torn, 1947 completions with >1 slot ready
+```
+
+One deferral in 1200 frames, and the scanner still reported 9 blank frames.
+The gate never closed, because the premise was wrong: a slot the card cleared
+stays "landed" indefinitely. Only the DELIVERED slot is re-poisoned, so the
+other three keep satisfying the test forever and the second observation was
+always already true. The same run recorded 1947 completions with more than one
+slot ready against zero under M223 - the same fact from the other side, and the
+number that should have been read as a warning before shipping the deferral.
+
+The measurement in M226 stands; only the M228 remedy was wrong.
+
+## M229 (2026-08-30): test for the CLEAR pattern, not for absent poison
+
+M228 failed because it reasoned about time. The clear leaves a signature that
+can be tested directly instead: if the last luma rows still read entirely as
+the card's clear byte, the fill has not reached the end of the picture.
+
+`mz0380_raw_probe_frame_filled()` samples 32 dwords across the final 64 luma
+rows and returns false only when every one of them equals the clear value. Any
+single differing sample proves the region was written, so the test is
+deliberately permissive - it rejects a uniformly-clear tail and nothing else.
+Sampled rather than scanned, because reading the whole tail per completion
+would cost more bandwidth than the copy it guards.
+
+The clear byte is `raw_clear_byte`, a writable module parameter defaulting to
+1, which is what M226 measured. It is a parameter for two reasons: a capture
+showing a different clear value needs no rebuild, and setting it to a byte the
+card never writes disables the test, which is how to check whether the test
+itself is what changed the result.
+
+`raw_incomplete_tail` in `/proc/mz0380-state` ("raw fills") counts slots
+skipped this way, and is the falsifier. Zero with the flashing still present
+means the test never fired and this is wrong too. A large count with blanks
+still reaching userspace means the tail is not where the fill ends.
+
+The false negative is a frame whose last rows are genuinely flat black: it is
+held back and the next completion delivers, costing one frame of an already
+black picture. The opposite trade - passing a half-filled frame - is the defect
+this exists to stop.
+
 Status: built clean (0 warnings); hardware confirmation outstanding.
+
+### A third false pass from the build checker, and what it was
+
+`scripts/mz0380-build-check.sh` reported "BUILD OK" for a tree that could not
+compile - `mz0380-dma-drain.c` still referenced two struct members that had
+been deleted. It copies `Makefile` and `src` into an empty directory, and
+`cp -r src` brought the working tree's `.o` and `.cmd` files with it. Those
+objects are newer than the sources, so kbuild skipped compiling, linked them,
+and produced a `.ko`.
+
+The copy now has every build product stripped from it before make runs. This is
+the third false pass from this script: first a stale `mz0380.ko` satisfying an
+`ls` test, then `-v` being forwarded to make so `make -v` exited 0 without
+building, and now copied objects. Each time the failure mode was the check
+answering a question adjacent to the one being asked.
 
