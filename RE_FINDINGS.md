@@ -14573,3 +14573,43 @@ under a configuration that is no longer the default, and that the current
 default survived the top of it once. Treat 18 as observed-safe-once, not as a
 new ceiling, until a second power cycle repeats it.
 
+## The raw flicker is CLOSED (2026-08-30)
+
+Operator confirmation on a `YU12` OBS session with M229 and M231 in place: **no
+black at all**. Two defects, closed by two different kinds of evidence.
+
+- **M229** - single black and part-black frames. Closed by measurement: 0 blank
+  frames and 0 partial fills in a 1200-frame capture, against 9 and a dozen in
+  every capture before it.
+- **M231** - the 0.5-to-1-second blacks. Closed by observation, with the
+  counters agreeing: recovery events during raw fell from continuous flapping
+  to 2 in 23 seconds, and the encoded path stopped coming back broken.
+
+It took seven attempts. Five were wrong (M220, M221, M222, M224, M225) and two
+were right (M229, M231), and the two right ones were not found by reading the
+delivery path - which is where all five wrong ones came from. M229 came from
+scanning the delivered bytes and finding the tail read 0x01, a value no poison
+in this driver uses. M231 came from watching two counters with no obvious
+connection to raw delivery, in a session that also contained a working H.264
+capture for contrast.
+
+The method that worked, for whoever is here next: measure what actually arrives,
+put a falsifier in every fix, and get a working case in the same trace as the
+broken one.
+
+### What is open after it
+
+- **Duplicate frames.** `rawdup` reached 209 identical-head observations in 1103
+  delivered, about 19%. The operator describes it as the image "not refreshing"
+  when something new enters the camera's view. This is judder, not flashing, and
+  is the next defect in the raw path.
+- **Two recovery events per ~23s of raw**, from `mz0380_mst3367_read_lock`
+  reporting unlocked on a live source. Now visually harmless; a
+  consecutive-reads debounce is the obvious remedy if it ever matters.
+- **Picture quality against Windows.** Side-by-side captures of the same scene
+  show the Linux image noisier and harsher than the Windows one. Suspects are
+  colour range and the sharpness control default (`sharp=128`), neither
+  investigated. See [[M227]] for the Windows-side settings that were captured.
+- **Format enumeration.** Windows offers XRGB/NV12/YV12/YUY2/H264; the node
+  offers H264 and YU12 (M227).
+

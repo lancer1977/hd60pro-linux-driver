@@ -1,117 +1,112 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-29. Full history in **RE_FINDINGS.md**. This file is the
+_Last updated 2026-08-30. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## Immediate task: M226 - scan the delivered frames for blanks
+## State: the raw flicker is CLOSED. Next defect is duplicate frames.
 
-**Uncompressed capture works.** 1920x1080 I420 through V4L2, no encoder in the
-delivery path, ~50 fps, selected by an application through `S_FMT` with no
-module parameters (M213-M218). The project goal is done.
+**Uncompressed capture works and no longer flickers.** 1920x1080 I420 through
+V4L2, no encoder in the delivery path, ~50 fps, chosen by the application with
+`S_FMT`, no module parameters. Confirmed on hardware 2026-08-30.
 
-**The raw flicker is still open, and five theories are now dead.** The symptom
-is FLASHING - intermittent black or blank frames with a correct picture in
-between. Not stutter, not tearing, not corruption.
+### The flicker, and how it was finally closed
 
-| | claimed cause | verdict |
+It was TWO defects wearing one symptom, which is why single-cause theories kept
+failing.
+
+| | claim | verdict |
 |---|---|---|
 | M220 | partial frame passing an OR sentinel test | real bug, fixed, symptom remained |
 | M221 | frame size hardcoded to 1080p | real bug, fixed, symptom remained |
 | M222 | token does not name the raw slot | real bugs, fixed, symptom remained |
-| M224 | wrong timestamp per frame | correct in itself; predicts stutter, not flashing |
-| M225 | H.264 placeholder delivered to an I420 node | real bug, fixed, **falsified by its own counter** |
+| M224 | wrong timestamp per frame | predicts stutter, not flashing |
+| M225 | H.264 placeholder handed to an I420 node | real bug, fixed, **falsified by its own counter** |
+| M228 | deliver only after two landed scans | **falsified by its own counter** - 1 deferral in 1200 frames |
+| **M229** | the card CLEARS a slot before filling it | **CORRECT** - 0 blanks, 0 partials in 1200 frames |
+| **M231** | raw starves the liveness stamp; monitor re-arms HDMI mid-capture | **CORRECT** - operator confirms no black at all |
 
-M225 is worth reading as a method, not just a result. It shipped with a counter
-that kept the placeholder's timing and withheld only the delivery, so one run
-reported both the fix and the diagnosis. It came back `19 withheld` with the
-flashing unchanged - the mechanism was live, and it still was not the cause.
-Instrument the next one the same way.
+Five wrong, two right. Every wrong one came from reading the delivery path.
+Neither right one did:
 
-### What the falsifying run measured (2026-08-29, ~16 s of ffplay)
+- **M229** came from scanning the delivered bytes
+  (`scripts/mz0380-m226-blackframe-scan.py`). The unfilled tail read `0x01`,
+  which is no poison this driver uses - so the card wrote it, and the card was
+  clearing slots to black before filling them. The sentinel test was firing on
+  the clear.
+- **M231** came from watching counters with no obvious link to raw delivery
+  (`scripts/mz0380-m230-flicker-watch.sh`), in a session that also held a
+  working H.264 capture for contrast. Recovery flapped for the entire raw
+  session and never once during H.264. `last_h264_frame_stamp` is only written
+  in the encoded path, so raw sessions starved it, and the monitor re-armed
+  HDMI acquisition - a write to the MST3367 - every 1.5 seconds mid-capture.
 
-```
-pixelformat: YU12
-raw frames : 637 delivered, 0 dropped, 10 stub completions skipped
-raw repeats: 129 identical-head observations, 0 torn, 0 completions with >1 slot ready
-no signal  : inactive, 0 placeholder IDRs delivered, 19 withheld from a raw node
-```
+**Use this method on the next defect.** Measure what arrives rather than
+reasoning about what should; put a falsifier in every fix and read it before
+believing the fix; and capture a working case in the same trace as the broken
+one.
 
-0 dropped, 0 torn, 0 multi-slot, 0 placeholders delivered. **The black frames
-arrive through the ordinary delivery path, as ordinary frames.**
+## Immediate task: duplicate frames
 
-### M226: the possibility nothing has tested
+`rawdup` reached **209 identical-head observations in 1103 delivered**, about
+19%. The operator describes it as the image "not refreshing" when a new object
+enters the camera's view. Judder, not flashing - a different defect from the two
+just closed, and the largest remaining one.
 
-`mz0380_raw_probe_frame_landed` calls a slot complete when the poison sentinels
-have been overwritten. A blank frame overwrites them exactly as a picture does,
-so that test has never been able to tell a picture from a black rectangle - it
-only proves the card wrote something. Every content-side claim so far rests on
-one 89-frame capture, which is under two seconds and was never scanned per
-frame.
+The counter already exists (`raw repeats` in `/proc/mz0380-state`) and counts
+frames whose first bytes match the previous frame from that slot. What is NOT
+established is whether those are the card writing the same picture twice, or the
+driver taking the same slot twice. Do not assume; the scanner can compare whole
+frames, which the counter cannot.
 
-```bash
-ffmpeg -f v4l2 -input_format yuv420p -video_size 1920x1080 \
-       -i /dev/video0 -frames:v 600 -f rawvideo - 2>/dev/null \
-  | ./scripts/mz0380-m226-blackframe-scan.py
-```
+### Also open
 
-Streams through stdin, so 1.9 GB never touches the disk. Reads both ways:
-
-- blanks found -> the flashing is content the card handed us, and the landed
-  test is what lets it through. Fix belongs in the completeness test.
-- no blanks -> the payload is innocent. Next suspects are pacing and the
-  consumer. Do NOT build a fix on this file's silence.
-
-Also open, and separate: **129 identical heads in 637 frames** (~20% repeats).
-That is judder, not flashing.
+- **Two recovery events per ~23s of raw**, from `mz0380_mst3367_read_lock`
+  reporting unlocked on a live source, polled every `signal_poll_ms=4000`.
+  Visually harmless now. A consecutive-reads debounce is the remedy if it ever
+  matters - a single unlocked read is thin grounds for tearing down a working
+  capture.
+- **Picture quality against Windows.** Same scene side by side, the Linux image
+  is noisier and harsher. Suspects: colour range, and the sharpness default
+  (`sharp=128`). Windows-side settings are captured in M227 and in
+  `/run/media/wolffyx/Work/hd60-trace/images/`.
+- **Format enumeration.** Windows offers XRGB/NV12/YV12/YUY2/H264; this node
+  offers H264 and YU12 (M227).
 
 ### Running it
 
-`modprobe` needs the module installed for the running kernel:
+`modprobe` needs the module installed for the running kernel; a fresh kernel has
+nothing in `/lib/modules`. `mz0380-live.sh load` builds and insmods from the
+tree instead, and keeps the spawn tally, which is why it is worth using:
 
 ```bash
-make
+sudo env VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 H264DIVISOR=0 PERSIST=1 ./mz0380-live.sh load
 ```
 
-```bash
-sudo make install
-```
-
-```bash
-sudo modprobe mz0380
-```
-
-`make install` binds to one kernel; `sudo make dkms-install` survives upgrades.
-`mz0380.modprobe.conf` sets no options - only a softdep - so the defaults are
-the whole configuration (M216).
+Every knob there now equals the driver default (M216), so it is verbose rather
+than wrong. Run `sudo ./mz0380-live.sh unload` when done - that is what clears
+the root-owned objects that otherwise break your next plain `make`.
 
 **OBS does not offer `YU12` in its Video Format dropdown**, so an OBS session
-silently tests the encoded path instead. Two hardware runs were spent finding
-that out. Use `ffplay -f v4l2 -input_format yuv420p -video_size 1920x1080
-/dev/video0` for raw, and deactivate the OBS source first - `deliver_raw` is
-device-wide, so two clients in different formats fight over it.
+tests the ENCODED path unless you pick it deliberately; two hardware runs were
+spent discovering that. For raw, either select `YU12` explicitly or use:
 
-Confirm the node is actually in raw mode before trusting any raw result:
-`pixelformat: YU12` plus the `raw frames` and `raw repeats` lines present in
-`/proc/mz0380-state`. Those two lines only print when `deliver_raw` is set.
+```bash
+ffplay -f v4l2 -input_format yuv420p -video_size 1920x1080 /dev/video0
+```
 
-### The running kernel has no headers (2026-08-29)
-
-A system upgrade replaced `linux-cachyos` 7.2.0-1 with 7.2.2-1 mid-session, so
-`/lib/modules/7.2.0-1-cachyos/build` is gone and **nothing can be rebuilt for
-this boot**. `kcheck` says exactly that and names the buildable kernels. The
-already-loaded module is unaffected and still carries the M225 fix, so
-diagnosis can continue on this boot - but any new driver change needs a reboot
-into 7.2.2 followed by `make && sudo make install`.
-
-Note this cost nothing only because M226 is a userspace script. Prefer
-diagnosis that does not require a rebuild while a boot is otherwise healthy.
+Always confirm the node is actually in raw mode before trusting a raw result:
+`pixelformat: YU12` plus the `raw frames` / `raw fills` / `raw repeats` lines
+present in `/proc/mz0380-state`. Those lines only print when `deliver_raw` is
+set.
 
 ### Budget
 
-A mains-off cold boot was taken on 2026-08-29, so the wedge tally restarted.
-It stood at 2 spawns after the M225 run. The card wedges somewhere in 8-18 per
-power cycle; `sudo scripts/mz0380-spawns.sh reset` if a load misbehaves.
+`mz0380-spawns.sh` recorded **18 spawns on one power cycle with no wedge** under
+the current `vic_fast_kill=0` default, which answers M157: the historical 8-18
+band was measured under a configuration that is no longer the default. Treat 18
+as observed-safe-once, not as a new ceiling, until a second power cycle repeats
+it. A wedge still costs a mains-off cold boot.
 
 ## What this session built
 
