@@ -14476,3 +14476,60 @@ the third false pass from this script: first a stale `mz0380.ko` satisfying an
 building, and now copied objects. Each time the failure mode was the check
 answering a question adjacent to the one being asked.
 
+## M231 (2026-08-30): the second flicker - raw capture starves the liveness stamp and the monitor re-arms HDMI mid-capture
+
+M230's counter watch answered it in one session. Three phases in one log, same
+source throughout, a live 1920x1080p60:
+
+```
+[35-47s]  fmt=H264  recov=idle    ph never SHOWING          h264deliv climbing
+[52-98s]  fmt=YU12  recov=active  ph=SHOWING <-> not shown   h264deliv=0
+                    flapping every 1-2s for the whole 50-second session
+[102-116s] fmt=H264 recov=idle    ph never SHOWING          h264deliv climbing
+```
+
+The receiver monitor declared "no usable source" continuously during raw
+capture and never once during encoded capture, on the same unchanged HDMI
+input.
+
+The cause is a starved timestamp. `mz0380_signal_monitor` decides a configured
+pipeline has gone silent by comparing `last_h264_frame_stamp` against
+`hotplug_stall_ms`, which defaults to **1500 ms**. Every write to that stamp
+lives in the encoded delivery path, and `mz0380_drain_frame_snapshot` returns
+early for `deliver_raw` before reaching any of them. So in a raw session the
+stamp freezes at STREAMON and is stale 1.5 seconds later, forever after, while
+raw frames arrive normally - `rawdeliv` climbed steadily right through it.
+
+1500 ms is also the observed flap period, and the operator describes the black
+as lasting 0.5 to 1 second.
+
+What the monitor then does is the damage. It is not only cosmetic: it declares
+NO SIGNAL, sets `signal_recovering`, and calls
+`mz0380_mst3367_read_lock(dev, &locked, true)` - the acquisition RE-ARM, which
+writes to the receiver - in the middle of an active capture, roughly every 1.5
+seconds for as long as raw streams. M225 keeps the placeholder frames off a raw
+node (`phdeliv=0`, `phheld` climbing 1 to 66 across the session), so what
+reached the screen was never the placeholder. It was the receiver being
+disturbed mid-capture.
+
+This is very likely the same mechanism behind the other open item: the encoded
+path coming back with `0 cached SPS/PPS bytes` and delivering nothing after a
+raw session. Dozens of unnecessary acquisition re-arms is not a state the
+encoder was expected to survive.
+
+**Fix.** A raw completion is itself proof the producer is alive, so
+`mz0380_drain_frame_snapshot` stamps `last_h264_frame_stamp` on the
+`deliver_raw` branch before dispatching. One line, in the one place the
+information exists.
+
+**Falsifier**, and it needs no new instrument: re-run
+`scripts/mz0380-m230-flicker-watch.sh` over a raw session. `recov` must stay
+`idle` and `ph` must stay `not shown` for the whole session. If they still flap,
+the stamp was not the gate. If they stop flapping and the black persists, the
+black is not the re-arm.
+
+Note the shape of this one against the six that preceded it. Every earlier
+theory came from reading the raw delivery path; this came from watching two
+counters that had no obvious connection to it, in a session that also contained
+a working H.264 capture for contrast. The contrast is what made it visible.
+

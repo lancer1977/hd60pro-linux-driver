@@ -835,6 +835,34 @@ mz0380_drain_frame_snapshot(struct mz0380_dev *dev,
 		 * card produce raw at all - its bitstream is just not delivered.
 		 */
 		if (dev->deliver_raw) {
+			/*
+			 * M231: this completion IS the proof the producer is
+			 * alive, so record it as such.
+			 *
+			 * The receiver monitor decides a configured pipeline
+			 * has gone silent by comparing last_h264_frame_stamp
+			 * against hotplug_stall_ms, and every one of the
+			 * writes to that stamp lives in the encoded delivery
+			 * path - which this branch skips. In a raw session the
+			 * stamp therefore froze at STREAMON and went stale
+			 * 1500 ms later, every time, on a perfectly live
+			 * source.
+			 *
+			 * What follows from that is not cosmetic. The monitor
+			 * responds by declaring NO SIGNAL, entering recovery,
+			 * and RE-ARMING HDMI acquisition - a write to the
+			 * MST3367 - in the middle of the capture, roughly
+			 * every 1.5 seconds for as long as raw is streaming. A
+			 * counter watch caught it flapping between "SHOWING
+			 * (no usable source)" and "not shown" for an entire
+			 * 50-second raw session while h264deliv stayed at 0,
+			 * where two H.264 sessions either side of it held
+			 * recovery idle throughout. M225 keeps the placeholder
+			 * frames off a raw node, so what reached the screen was
+			 * not the placeholder but the receiver being disturbed
+			 * mid-capture.
+			 */
+			WRITE_ONCE(dev->last_h264_frame_stamp, jiffies);
 			mz0380_drain_raw_deliver(dev, snapshot);
 			return;
 		}
