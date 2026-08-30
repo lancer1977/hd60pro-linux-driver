@@ -14313,3 +14313,56 @@ generic DirectShow analogue-decoder dialog and reads as vestigial UI for an
 HDMI capture card - worth remembering before anyone reads 525 lines as a
 statement about this hardware.
 
+## M228 (2026-08-30): the card CLEARS a slot before filling it, so "landed" fires on the clear
+
+M226 stopped the guessing by measuring. Two 1200-frame captures and one
+600-frame capture off `/dev/video0` in `YU12`:
+
+- 5 to 11 fully blank frames per 1200, classified as Y=0/1 with both chroma
+  planes at exactly 128.
+- alongside them, partially black frames: picture on top, black to the bottom,
+  with the boundary at roughly row 700, 811, 902 and 930 in different frames.
+- an 18-band luma profile of one partial frame showed real picture down to the
+  boundary and then a flat band reading **0x01**, to the last row.
+
+0x01 is the decisive number. Bank poison is 0xa5 and 0x5a, and the frame
+buffers use 0xaa; none of them is 0x01. So the tail was written by the CARD,
+and 0x01 is luma black. Chroma in the same frames reads 0x80.
+
+The card therefore clears a slot to black - luma 0x01, chroma 0x80 - and then
+fills it with the picture, ascending. `mz0380_raw_probe_frame_landed` tests
+whether four sentinels still hold poison, and the clear overwrites every byte
+of the frame including all four. So the completeness test passes the instant
+the CLEAR lands, and the copy takes whatever has been filled so far: an
+all-black frame when it runs early, picture-over-black when it runs mid-fill.
+
+That is the flicker, and it explains the whole history. The frames were never
+torn in the sense M220/M222 assumed - the tear detector was working - and the
+delivered content was exactly what the buffer held. Every earlier theory asked
+what was wrong with the frame; none asked whether the transfer had finished,
+because the sentinel test was believed to answer that.
+
+Two readings were tried and rejected on the way here, both recorded so neither
+is repeated. A constant boundary at row 811 in the first capture suggested a
+half-height 1920x540 frame, since 1920*540*3/2 is exactly 1555200 bytes, half
+of 3110400 - the band profile refuted it, because the tail would then read 128
+(chroma misread as luma) and it reads 1. And the boundary is not constant once
+more frames are examined.
+
+**Fix.** No sentinel value or offset can survive a clear that touches every
+byte, so the completeness test stops asking the content. A fill takes about
+2 ms and these completions arrive about 16 ms apart, so a slot still landed on
+the NEXT scan has certainly finished. `mz0380_drain_raw_deliver` now delivers
+only slots seen landed on two consecutive scans, costs one completion of
+latency, and clears the delivered slot from the record so it must be observed
+twice again. The card revisits a given slot every fourth frame, so this cannot
+starve.
+
+`raw_deferred_fills` in `/proc/mz0380-state` counts the completions held back.
+It is the falsifier: if the flashing survives with that counter at zero, the
+deferral never engaged and this diagnosis is wrong; if it is large and the
+scanner still reports blanks and partial fills, the clear-then-fill reading is
+wrong. `scripts/mz0380-m226-blackframe-scan.py` remains the ground truth.
+
+Status: built clean (0 warnings); hardware confirmation outstanding.
+

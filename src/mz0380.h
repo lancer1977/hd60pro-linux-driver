@@ -439,6 +439,9 @@ struct mz0380_dev {
 	u64 no_signal_frames_missed;
 	/* M225: placeholder ticks withheld because the node is delivering raw. */
 	u64 no_signal_frames_suppressed;
+	/* M228: slots seen landed once and held back for the fill to finish. */
+	u64 raw_deferred_fills;
+	u8 raw_prev_landed;
 	bool no_signal_active;
 	/*
 	 * The receiver monitor is independent of encoder activity. This matters

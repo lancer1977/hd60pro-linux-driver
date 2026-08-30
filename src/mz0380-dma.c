@@ -1068,6 +1068,13 @@ void mz0380_frame_events_start(struct mz0380_dev *dev)
 	dev->raw_probe_consecutive_full = 0;
 	dev->raw_probe_slots_seen = 0;
 	dev->raw_probe_success_reported = false;
+	/*
+	 * M228: the two-scan deferral must not carry a previous session's
+	 * observation into this one, or the first scan could deliver a slot on
+	 * the strength of a landing seen before the stream restarted.
+	 */
+	dev->raw_prev_landed = 0;
+	dev->raw_deferred_fills = 0;
 	for (i = 0; i < MZ0380_RAW_PROBE_NR_BUFS; i++) {
 		dev->raw_probe_bufs[i].last_extent = 0;
 		dev->raw_probe_bufs[i].completions = 0;
