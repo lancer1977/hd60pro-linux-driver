@@ -14281,3 +14281,35 @@ no blanks found means the payload is innocent and the next suspect is pacing or
 the consumer - explicitly not a licence to build a fix on the file's silence.
 
 Status: script self-tested against synthetic frames; hardware run outstanding.
+
+## M227 (2026-08-30): what the Windows driver offers that ours does not
+
+Screenshots of the Windows OBS property pages for "Game Capture HD60 Pro" are
+in `/run/media/wolffyx/Work/hd60-trace/images/`. The Video Format dropdown is
+populated by the Windows driver with:
+
+```
+Any, XRGB, NV12, YV12, YUY2, H264
+```
+
+Ours enumerates `H264` and `YU12` only. The raw bank payload is confirmed
+planar I420 on our side (M215/M217), and `YV12` differs from `YU12` only in
+chroma plane order while `NV12` is semi-planar, so these are most likely
+DirectShow-side conversions of one hardware format rather than six distinct
+card modes. `XRGB` and `YUY2` would need a colour conversion somewhere. None of
+this has been tested.
+
+Recorded as a capability gap, not a defect, and explicitly not to be chased
+while the raw flicker is open.
+
+Other pages, for the record: Resolution/FPS Type `Custom` -> 1920x1080; FPS
+list runs from "Match Output FPS" and "Highest FPS" down to 1; Color Space
+offers Default/Rec.709/Rec.601/Rec.2100 PQ/Rec.2100 HLG; Color Range Default;
+Buffering Auto-Detect/Enable/Disable; Audio Output Mode "Capture audio only".
+
+A separate "Video Decoder" property sheet shows Video Standard `NTSC_M` with
+`Lines detected: 525` and greyed-out "VCR Input"/"Output Enable". That is a
+generic DirectShow analogue-decoder dialog and reads as vestigial UI for an
+HDMI capture card - worth remembering before anyone reads 525 lines as a
+statement about this hardware.
+
