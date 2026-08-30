@@ -83,6 +83,34 @@ def fill_profile(buf):
     return row + 1, black_rows, (row + 1) / HEIGHT
 
 
+BANDS = 18
+
+
+def band_profile(buf):
+    """Coarse luma profile down the frame, to see WHAT the black sits under.
+
+    A constant fill boundary is not a race. 1920x540 I420 is 1555200 bytes,
+    exactly half of a 1920x1080 I420 frame, so a half-height frame written into
+    a full-height buffer lands as: 540 rows of picture, then its two chroma
+    planes read as ~270 rows of flat ~128, then unwritten zeros. That predicts
+    a FLAT MID-GREY BAND between the picture and the black, which a partially
+    completed transfer would not produce - it would leave the previous frame's
+    pixels or nothing at all there.
+
+    So print the bands and let them decide, rather than inferring a mechanism
+    from the boundary row alone.
+    """
+    y = buf[:Y_BYTES]
+    rows_per = HEIGHT // BANDS
+    out = []
+    for b in range(BANDS):
+        r0 = b * rows_per
+        r1 = r0 + rows_per
+        chunk = y[r0 * WIDTH:r1 * WIDTH:ROW_STRIDE]
+        out.append((r0, r1, sum(chunk) / len(chunk), min(chunk), max(chunk)))
+    return out
+
+
 def classify_blank(buf):
     """Distinguish a black PICTURE from memory nothing wrote.
 
@@ -119,6 +147,7 @@ def main():
     src = sys.stdin.buffer
     frames = []
     partials = []
+    first_partial_buf = None
     idx = 0
     while True:
         buf = src.read(FRAME_BYTES)
@@ -133,6 +162,8 @@ def main():
         partial = bool(prof) and not blank
         if partial:
             partials.append((idx, prof))
+            if first_partial_buf is None:
+                first_partial_buf = buf
         note = ""
         if blank:
             note = "   <-- BLANK: " + kind
@@ -155,6 +186,18 @@ def main():
         print("  frame %5d filled to row %d/%d (%.1f%%), %d black rows to the bottom"
               % (pidx, prof[0], HEIGHT, prof[2] * 100, prof[1]))
     if partials:
+        print()
+        pidx, _ = partials[0]
+        print("luma band profile of the first partial frame (frame %d):" % pidx)
+        for r0, r1, mean, lo, hi in band_profile(first_partial_buf):
+            flat = "  FLAT" if hi - lo <= 4 else ""
+            print("  rows %4d-%4d  mean=%7.2f  min=%3d  max=%3d%s"
+                  % (r0, r1 - 1, mean, lo, hi, flat))
+        print()
+        print("A flat band near 128 between the picture and the black means the")
+        print("card wrote a HALF-HEIGHT frame: its chroma planes are being read as")
+        print("luma rows, and the rest of the buffer was never written. A band that")
+        print("holds the previous frame's picture instead means a partial transfer.")
         print()
         print("A partial fill that is picture on top and black to the BOTTOM is the")
         print("signature of copying a slot mid-write. Combined with black frames")
