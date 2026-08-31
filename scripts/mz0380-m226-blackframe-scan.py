@@ -175,6 +175,14 @@ def main():
         sys.stdout.reconfigure(line_buffering=True)
     except AttributeError:
         pass
+    # Piping this into head or tail closes the pipe early, and Python turns
+    # that into a BrokenPipeError traceback that looks like a script fault.
+    # Restore the default SIGPIPE behaviour so it just exits.
+    try:
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (ImportError, AttributeError, ValueError):
+        pass
     src = sys.stdin.buffer
     # --interval N aggregates N frames per printed line instead of one line
     # per frame, so a long capture stays readable and the drift is visible.
@@ -183,6 +191,13 @@ def main():
         interval = int(sys.argv[sys.argv.index("--interval") + 1])
     bucket = []
     drift = []
+    # 1800 frames is 30s at 60fps. A drift measurement does not need full rate
+    # though - capturing at "-vf fps=2" moves 6 MB/s instead of 186 MB/s and
+    # covers five minutes in 600 frames, which is a far better test of a slow
+    # ratchet. Lower the threshold to match when capturing decimated.
+    min_frames = 1800
+    if "--min-frames" in sys.argv:
+        min_frames = int(sys.argv[sys.argv.index("--min-frames") + 1])
     frames = []
     partials = []
     # M234: limited-range video lives in 16..235 (luma) and 16..240 (chroma).
@@ -278,7 +293,7 @@ def main():
     # the windows overlap and the fit is dominated by whatever moved, which
     # is how a 60-frame sample reported "+47.9 per 1000 frames" while its own
     # first and last window were the same frames and differed by 0.00.
-    DRIFT_MIN_FRAMES = 1800
+    DRIFT_MIN_FRAMES = min_frames
     print("--- M235 brightness drift ---")
     if len(drift) < DRIFT_MIN_FRAMES:
         print("not enough frames: %d, need %d (about %d seconds at 60 fps)."
