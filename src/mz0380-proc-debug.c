@@ -619,7 +619,7 @@ int mz0380_proc_hdmi_show(struct seq_file *m, void *v)
 	seq_puts(m, "  selects confirmed V4L2/property-201 HDMI index 0, reloads EDID, and pulses HPD.\n");
 	seq_puts(m, "  It does not send SET_VIC or start the encoder; those happen only at stream start.\n");
 	seq_puts(m, "  Legacy numeric forms accept property index 0 or raw HDMI code 2 only; geometry is ignored.\n");
-	seq_puts(m, "  Raw DVI/component/SDI/auto input codes are rejected. Other commands: edid, hpd, watch, ramtest, wscan, edidhunt, gpiodump, i2cscan, edidburn.\n");
+	seq_puts(m, "  Raw DVI/component/SDI/auto input codes are rejected. Other commands: csc, edid, hpd, watch, ramtest, wscan, edidhunt, gpiodump, i2cscan, edidburn.\n");
 	seq_puts(m, "\nsink chain read-back (M43: write returns prove nothing - the\n"
 		    "firmware forces the I2C result to 0 on a NAK, so verify by reading):\n");
 	mutex_lock(&devlist);
@@ -648,6 +648,28 @@ ssize_t mz0380_proc_hdmi_write(struct file *file,
 	strim(cmd);
 	if (!strcmp(cmd, "hdmi"))
 		goto activate_hdmi;
+
+	/*
+	 * M237: "csc" re-reads the source colour space and re-applies the CSC.
+	 *
+	 * The CSC matrix is chosen from BANK2 0x48 at stream start and never
+	 * revisited, and with persistent_h264 a source mode change does not
+	 * restart the pipeline - so a camera switching between 50 and 60 Hz
+	 * keeps whatever matrix was right for the mode before it. This is both
+	 * the experiment (does 0x48 differ between modes?) and the manual
+	 * workaround if it does.
+	 */
+	if (!strcmp(cmd, "csc")) {
+		kfree(cmd);
+		mutex_lock(&devlist);
+		list_for_each_entry(dev, &mz0380_devlist, devlist) {
+			if (!mz0380_mst3367_refresh_colourspace(dev))
+				mz0380_mst3367_apply_csc_mode(dev);
+		}
+		mutex_unlock(&devlist);
+		*ppos += count;
+		return count;
+	}
 
 	/* M44: "ramtest" probes whether MST3367 BANK3 is writable RAM */
 	if (!strcmp(cmd, "ramtest")) {

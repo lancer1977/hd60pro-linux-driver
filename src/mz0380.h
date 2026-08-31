@@ -788,6 +788,7 @@ int mz0380_mst3367_bringup(struct mz0380_dev *dev);
 void mz0380_mst3367_diag(struct mz0380_dev *dev, struct seq_file *m);
 void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag);
 void mz0380_mst3367_apply_csc_mode(struct mz0380_dev *dev);
+int mz0380_mst3367_refresh_colourspace(struct mz0380_dev *dev);
 int mz0380_mst3367_ramtest(struct mz0380_dev *dev);	/* M44 */
 int mz0380_mst3367_watch(struct mz0380_dev *dev, unsigned int secs);	/* M45 */
 int mz0380_mst3367_reload_edid(struct mz0380_dev *dev);	/* M47 */

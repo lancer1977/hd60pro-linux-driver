@@ -408,6 +408,50 @@ EXPORT_SYMBOL_GPL(mz0380_mst3367_output_diag);
  * re-applied once the receiver has locked, which is why the stream-start path
  * calls it.
  */
+/*
+ * M237: re-read BANK2 0x48 and update the cache.
+ *
+ * The cache is written only by mz0380_mst3367_output_diag, which runs at
+ * stream start and stream stop. Nothing invalidates it in between, so after a
+ * source mode change - the camera switching between 50 and 60 Hz, say - the
+ * colour space reported in /proc/mz0380-state is whatever was true at the last
+ * stream start.
+ *
+ * That made the obvious experiment useless: an unchanged value cannot
+ * distinguish "the source sends the same colour space in both modes" from "the
+ * cache was never re-read". This gives a fresh read on demand, which costs a
+ * few mailbox commands and so is deliberately NOT on any polled path.
+ */
+int mz0380_mst3367_refresh_colourspace(struct mz0380_dev *dev)
+{
+	u8 b2_48;
+	int ret;
+
+	if (dev->fw_state != MZ0380_FW_STATE_READY || !dev->mst3367_ready)
+		return -ENODEV;
+
+	mutex_lock(&mst3367_lock);
+	ret = mst_bank(dev, MST3367_BANK2);
+	if (!ret)
+		ret = mst_rd(dev, 0x48, &b2_48);
+	if (!ret) {
+		dev->mst_b2_48 = b2_48;
+		dev->mst_b2_48_valid = true;
+	}
+	mst_bank(dev, MST3367_BANK0);
+	mutex_unlock(&mst3367_lock);
+
+	if (ret) {
+		pr_info("%s: MST3367 colourspace re-read failed (%d)\n",
+			dev->name, ret);
+		return ret;
+	}
+	pr_info("%s: MST3367 colourspace re-read: 0x48=%02x\n",
+		dev->name, b2_48);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mz0380_mst3367_refresh_colourspace);
+
 void mz0380_mst3367_apply_csc_mode(struct mz0380_dev *dev)
 {
 	static const char * const names[] = {
