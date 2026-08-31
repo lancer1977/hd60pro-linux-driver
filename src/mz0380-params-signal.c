@@ -233,6 +233,27 @@ MODULE_PARM_DESC(buf_poison,
  * setting it to something the card never writes disables the test, which is
  * how to check whether the test itself is what changed the result.
  */
+/*
+ * M234: what quantization the RAW node advertises.
+ *
+ * The node reported V4L2_QUANTIZATION_LIM_RANGE for every format, and a
+ * 600-frame capture measured luma reaching 254 with 4.2% of sampled pixels
+ * above 235 - which limited-range content cannot do. A full-range payload
+ * labelled limited makes every consumer expand it a second time, which is the
+ * brighter, harsher picture the operator sees against Windows.
+ *
+ * A parameter, not a silent flip, because one thing the capture could NOT
+ * establish is the black end: the darkest pixel in frame was 51, so nothing
+ * there proves where black sits. 1 selects full range (the measured answer),
+ * 0 restores the old limited-range reporting for an A/B against Windows.
+ * Affects the raw path only - the H.264 bitstream carries its own VUI and
+ * relabelling it could break a consumer that is currently correct.
+ */
+bool mz0380_raw_full_range = true;
+module_param_named(raw_full_range, mz0380_raw_full_range, bool, 0644);
+MODULE_PARM_DESC(raw_full_range,
+	"M234: advertise the raw I420 node as full range (def:1, measured - luma reaches 254 and 4.2% of pixels exceed 235). 0 restores the old LIM_RANGE reporting. Does not affect H.264, which carries its own VUI");
+
 unsigned int mz0380_raw_clear_byte = 0x01;
 module_param_named(raw_clear_byte, mz0380_raw_clear_byte, uint, 0644);
 MODULE_PARM_DESC(raw_clear_byte,

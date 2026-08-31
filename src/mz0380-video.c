@@ -376,7 +376,26 @@ static void mz0380_fill_pix_format(struct mz0380_dev *dev,
 	pix->sizeimage = mz0380_current_sizeimage(dev);
 	pix->colorspace = V4L2_COLORSPACE_REC709;
 	pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
-	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	/*
+	 * M234: report the range the payload actually uses.
+	 *
+	 * This said LIM_RANGE for every format. A 600-frame raw capture
+	 * measured luma up to 254 with 4.2% of sampled pixels above 235, which
+	 * limited-range content cannot contain, and the card writes its own
+	 * black as 0-1 rather than 16. Declaring full-range data as limited
+	 * makes every consumer expand 16..235 to 0..255 a second time, which
+	 * shows as a brighter and harsher picture than the same card produces
+	 * on Windows.
+	 *
+	 * Raw only. The H.264 bitstream carries its own VUI, so what this node
+	 * claims for it is not what a decoder obeys, and changing it could
+	 * mislead a consumer that is currently correct.
+	 */
+	if (mz0380_raw_full_range &&
+	    pix->pixelformat == V4L2_PIX_FMT_YUV420)
+		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	else
+		pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
 	pix->xfer_func = V4L2_XFER_FUNC_709;
 }
 

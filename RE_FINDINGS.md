@@ -14728,3 +14728,51 @@ auto-gain on the card itself - neither investigated.
 
 Untested on hardware.
 
+## M234 (2026-08-31): the raw node reports limited range for a full-range payload
+
+Operator report, separate from the M233 drift: the Linux picture is brighter
+than Windows from the moment the driver loads. A constant offset, not a creep.
+
+`mz0380_fill_pix_format` set `V4L2_QUANTIZATION_LIM_RANGE` for every format,
+unconditionally. A 600-frame `YU12` capture measured:
+
+```
+luma  min/max     : 51 / 254
+chroma min/max    : 49 / 169
+luma below 16     : 0 of 1248000 sampled (0.000%)
+luma above 235    : 52830 of 1248000 sampled (4.233%)
+```
+
+Limited-range luma lives in 16..235. Isolated superwhite happens, but 4.2% of
+sampled pixels above 235 with a hard maximum of 254 is a full-range payload.
+M226 separately measured the card writing its own black as 0-1 rather than 16.
+
+Declaring full-range data as limited makes every consumer expand 16..235 to
+0..255 a second time: mid-tones lift, highlights clip, and the picture reads as
+brighter and harsher - which is also the "less clear than Windows" impression
+recorded in M227.
+
+**What this capture did NOT establish**, and it matters: the black end. The
+darkest pixel in frame was 51, so nothing here proves where black sits. The
+verdict rests on the high end plus the card's clear value.
+
+**Fix.** Report full range on the raw node. It is a module parameter,
+`raw_full_range` (default 1), so the two can be compared against Windows in
+seconds without a rebuild - which is the right way to settle a question whose
+evidence is one-sided.
+
+Raw only. The H.264 bitstream carries its own VUI, so what this node claims
+about an encoded stream is not what a decoder obeys, and relabelling it could
+mislead a consumer that is currently correct.
+
+Untested on hardware. The check is whether the picture matches Windows with
+`raw_full_range=1` and regains the excess brightness at 0:
+
+```bash
+sudo sh -c 'echo 0 > /sys/module/mz0380/parameters/raw_full_range'
+```
+
+A better capture would point the camera at something genuinely black and
+re-run the M234 range check; a full-range source should then show luma near 0
+rather than near 16, which is the half of the evidence still missing.
+

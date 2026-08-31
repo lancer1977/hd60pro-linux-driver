@@ -866,6 +866,7 @@ extern bool mz0380_buf_poison;
 extern bool mz0380_event_require_complete;
 extern unsigned int mz0380_poison_byte;
 extern unsigned int mz0380_raw_clear_byte;
+extern bool mz0380_raw_full_range;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;
 extern bool mz0380_signal_confirm;
