@@ -443,6 +443,9 @@ struct mz0380_dev {
 	u64 raw_incomplete_tail;
 	/* M233: AUTO_POSITION re-arms issued, i.e. real acquisition losses. */
 	u64 mst_rearms;
+	/* M237: last CSC byte written to BANK0 0x92, and whether one ever was. */
+	u8 mst_csc_applied;
+	bool mst_csc_applied_valid;
 	bool no_signal_active;
 	/*
 	 * The receiver monitor is independent of encoder activity. This matters

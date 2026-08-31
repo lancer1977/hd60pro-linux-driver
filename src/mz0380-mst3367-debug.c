@@ -463,6 +463,8 @@ void mz0380_mst3367_apply_csc_mode(struct mz0380_dev *dev)
 
 	if (mst_wr(dev, 0x92, want))
 		goto out;
+	dev->mst_csc_applied = want;
+	dev->mst_csc_applied_valid = true;
 	pr_info("%s: MST3367 CSC 0x92 = 0x%02x (%s, input colorspace %s from 0x48=%02x, %s)\n",
 		dev->name, want,
 		mz0380_mst_csc_ctl == MZ0380_MST_CSC_CTL_AUTO ? "auto" : "forced",

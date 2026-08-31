@@ -159,6 +159,41 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 		 * means the opposite - the NO SIGNAL placeholder is not being
 		 * shown, which is the healthy state.
 		 */
+		/*
+		 * M237: both values are already in memory, so this costs no
+		 * mailbox traffic - which after M236 is the deciding factor for
+		 * anything printed on a path that gets polled.
+		 */
+		/*
+		 * M237: both values are already in memory, so this costs no
+		 * mailbox traffic - which after M236 is the deciding factor for
+		 * anything printed on a path that gets polled.
+		 *
+		 * It is here to answer one question: does the source's colour
+		 * space change when the camera switches between 50 and 60 Hz?
+		 * The CSC choice is made from 0x48 once at stream start and
+		 * never revisited, so if 0x48 differs between the two modes the
+		 * wrong matrix survives the switch - and switching back does
+		 * not restore it, which is what the operator reports.
+		 */
+		if (dev->mst_b2_48_valid) {
+			static const char * const cs_names[] = {
+				"RGB", "YUV422", "YUV444", "undefined"
+			};
+
+			seq_printf(m, "  colourspace: source %s (0x48=%02x cached)",
+				   cs_names[(dev->mst_b2_48 & 0x60) >> 5],
+				   dev->mst_b2_48);
+		} else {
+			seq_puts(m, "  colourspace: not yet read");
+		}
+		if (dev->mst_csc_applied_valid)
+			seq_printf(m, ", CSC 0x92=%02x (%s) (M237)\n",
+				   dev->mst_csc_applied,
+				   dev->mst_csc_applied ? "hdcapm RGB matrix" :
+							  "bypass");
+		else
+			seq_puts(m, ", CSC never written (M237)\n");
 		seq_printf(m, "  rearms     : %llu MST3367 AUTO_POSITION re-arms (only on real lock loss since M233)\n",
 			   (unsigned long long)dev->mst_rearms);
 		seq_printf(m, "  placeholder: %s, %llu NO SIGNAL IDRs delivered, %llu cadence misses, %llu withheld from a raw node (M225)\n",
