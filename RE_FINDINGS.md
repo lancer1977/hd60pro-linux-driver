@@ -14813,3 +14813,56 @@ second instead of 0.2, overridable with `INTERVAL=`.
 Re-measuring the residual M233 lock losses with the probe gated is worth doing
 before anyone treats them as real.
 
+## M234 RETRACTED, and M235: the brightness STEPS, it does not drift (2026-08-31)
+
+A 600-frame capture decimated to 2 fps - five minutes of the same scene, with
+the M236 mailbox probe gated off so nothing was competing for the card:
+
+```
+frames  10-279 : mean 78.24 .. 78.29      flat to +/-0.03 over two minutes
+frames 280-299 : 79.43 -> 80.76           one step, +2.6
+frames 300-479 : mean 80.74 .. 81.00      flat again
+frames 480-599 : mean 81.05 .. 81.21      small second step, then flat
+```
+
+**The picture is not ratcheting.** It holds to within 0.03 luma for minutes and
+then changes in discrete jumps. That is something adjusting once per scene
+change - which is what auto-exposure does - and it is the behaviour the
+operator described as colours shifting when a hand passes over the camera.
+Nothing in the driver is known to do this, and the camera is the obvious
+candidate, but that has not been proven and would be settled by repeating the
+hand-wave on Windows.
+
+The scanner reported "drifting at +7.091 luma per 1000 frames" for that trace,
+which is a line fitted to a step function - a confident drift rate for
+something that is not drifting. It now measures the largest window-to-window
+step against the total spread and says STEPPED or continuous accordingly,
+self-tested against both shapes.
+
+### M234 is retracted
+
+Same capture, range check:
+
+| | M234's capture | this capture |
+|---|---|---|
+| luma above 235 | 52830 of 1248000 (**4.233%**) | 15 of 1248000 (**0.001%**) |
+| luma max | 254 | 237 |
+
+**The 4.2% is not reproducible.** It was measured while the picture was still
+in its drifted-bright state, so the superwhite that the full-range conclusion
+rested on was an artifact of the very brightness problem being investigated.
+`below 16` is 0.096% and confined to the first bucket, i.e. a startup frame.
+
+`raw_full_range` therefore defaults to 0 again - limited range, as before M234.
+The parameter stays, because the question is unproven rather than settled. What
+would settle it is a capture with something genuinely black in frame: a
+full-range source reads near 0 there, a limited one near 16. No capture so far
+has contained real black, which is the same gap the original M234 commit
+flagged and then shipped a default on anyway.
+
+**The lesson, for the next person and for me.** M234 was measured during a
+known-unstable condition and shipped on one statistic whose weakness was
+recorded in its own commit message. The frame scanner was right both times; the
+error was drawing a conclusion from a capture taken while a separate defect was
+active.
+

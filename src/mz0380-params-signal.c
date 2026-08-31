@@ -242,17 +242,25 @@ MODULE_PARM_DESC(buf_poison,
  * labelled limited makes every consumer expand it a second time, which is the
  * brighter, harsher picture the operator sees against Windows.
  *
- * A parameter, not a silent flip, because one thing the capture could NOT
- * establish is the black end: the darkest pixel in frame was 51, so nothing
- * there proves where black sits. 1 selects full range (the measured answer),
- * 0 restores the old limited-range reporting for an A/B against Windows.
- * Affects the raw path only - the H.264 bitstream carries its own VUI and
- * relabelling it could break a consumer that is currently correct.
+ * RETRACTED 2026-08-31, default now 0. That 4.2% is not reproducible. A later
+ * 600-frame capture of the same scene, taken after the picture had stopped
+ * drifting bright, measured 0.001% above 235 - fifteen samples out of 1.25
+ * million - with a maximum of 237. The original reading was an artifact of
+ * capturing while the brightness was still elevated, so the evidence for
+ * calling this payload full range is gone.
+ *
+ * The parameter stays because the question is not settled, only unproven: 1
+ * advertises full range, 0 is the limited-range default that matches the rest
+ * of the driver. What would actually settle it is a capture with something
+ * genuinely black in frame - a full-range source reads near 0 there, a limited
+ * one near 16 - which no capture so far has contained.
+ *
+ * Affects the raw path only; the H.264 bitstream carries its own VUI.
  */
-bool mz0380_raw_full_range = true;
+bool mz0380_raw_full_range;	/* M234 RETRACTED - see below. Default limited. */
 module_param_named(raw_full_range, mz0380_raw_full_range, bool, 0644);
 MODULE_PARM_DESC(raw_full_range,
-	"M234: advertise the raw I420 node as full range (def:1, measured - luma reaches 254 and 4.2% of pixels exceed 235). 0 restores the old LIM_RANGE reporting. Does not affect H.264, which carries its own VUI");
+	"M234 (RETRACTED): advertise the raw I420 node as full range (def:0). The 4.2%-above-235 measurement behind the original default was not reproducible - a later capture showed 0.001% - so limited range is the default again. Set 1 only with fresh evidence. Does not affect H.264, which carries its own VUI");
 
 unsigned int mz0380_raw_clear_byte = 0x01;
 module_param_named(raw_clear_byte, mz0380_raw_clear_byte, uint, 0644);

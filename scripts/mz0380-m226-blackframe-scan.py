@@ -308,13 +308,40 @@ def main():
         print("mean luma first/last quarter : %.2f -> %.2f  (delta %+.2f, %d frames each)"
               % (first, last, last - first, win))
         print("slope                        : %+.3f luma per 1000 frames" % slope)
-        if abs(slope) < 0.05 and abs(last - first) < 1.0:
-            print("DRIFT VERDICT: flat. No measurable brightening over this capture.")
+
+        # A slope alone cannot tell a steady ratchet from a picture that sits
+        # flat and then jumps once. Fitting a line to a step function reports a
+        # confident drift rate for something that is not drifting at all, which
+        # is exactly what this script did before: it called a trace "drifting
+        # at +7.091 per 1000 frames" while the mean held to within 0.03 for two
+        # minutes either side of a single 2.6-luma step.
+        nwin = 20
+        size = max(len(drift) // nwin, 1)
+        wins = [sum(v for _, v in drift[i:i + size]) / len(drift[i:i + size])
+                for i in range(0, len(drift) - size + 1, size)]
+        steps = [abs(b - a) for a, b in zip(wins, wins[1:])]
+        biggest = max(steps) if steps else 0.0
+        spread = max(wins) - min(wins) if wins else 0.0
+        quiet = sorted(steps)[len(steps) // 2] if steps else 0.0
+
+        print("largest window-to-window step: %.2f luma (total spread %.2f, median step %.2f)"
+              % (biggest, spread, quiet))
+        if spread < 0.5:
+            print("DRIFT VERDICT: flat. No measurable brightness change.")
+        elif biggest > spread * 0.4:
+            print("DRIFT VERDICT: STEPPED, not drifting. The picture holds steady")
+            print("and changes in discrete jumps - the biggest is %.2f luma of a"
+                  % biggest)
+            print("%.2f total spread, with a median window-to-window move of %.2f."
+                  % (spread, quiet))
+            print("That is something adjusting once per scene change, which is what")
+            print("auto-exposure does. Ignore the slope above; a line fitted to a")
+            print("step function reports a drift rate that nothing is doing.")
         else:
-            print("DRIFT VERDICT: drifting at %+.3f per 1000 frames, about %+.2f"
-                  % (slope, slope * 3.6))
-            print("luma per minute at 60 fps. Keep the scene STILL for this to")
-            print("mean anything, and correlate it with the rearms counter.")
+            print("DRIFT VERDICT: continuous drift at %+.3f per 1000 frames. The"
+                  % slope)
+            print("change is spread across the capture rather than concentrated in")
+            print("a step, so it is a ratchet. Correlate with the rearms counter.")
     print()
     print("--- M234 range check (limited range is luma 16..235, chroma 16..240) ---")
     print("luma  min/max     : %d / %d" % (y_lo, y_hi))
