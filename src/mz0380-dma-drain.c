@@ -785,6 +785,17 @@ mz0380_drain_raw_deliver(struct mz0380_dev *dev,
 			dev->raw_incomplete_tail++;
 			continue;
 		}
+		/*
+		 * M238: luma finishing does not mean chroma has. I420 is
+		 * planar and the card fills ascending, so a slot can hold a
+		 * complete picture with its colour planes still cleared -
+		 * which arrives as an occasional frame with correct detail
+		 * and a magenta or green cast.
+		 */
+		if (!mz0380_raw_probe_chroma_filled(dev, i)) {
+			dev->raw_incomplete_chroma++;
+			continue;
+		}
 		landed |= BIT(i);
 	}
 

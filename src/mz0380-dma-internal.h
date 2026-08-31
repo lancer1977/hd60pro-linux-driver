@@ -44,6 +44,7 @@ int mz0380_infer_frame_length(struct mz0380_dev *dev, u32 idx,
 			      size_t *length);
 bool mz0380_raw_probe_frame_landed(struct mz0380_dev *dev, u32 idx);
 bool mz0380_raw_probe_frame_filled(struct mz0380_dev *dev, u32 idx);
+bool mz0380_raw_probe_chroma_filled(struct mz0380_dev *dev, u32 idx);
 void mz0380_raw_probe_sentinel_repoison(struct mz0380_dev *dev, u32 idx);
 int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
 				  size_t *length);

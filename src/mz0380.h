@@ -441,6 +441,8 @@ struct mz0380_dev {
 	u64 no_signal_frames_suppressed;
 	/* M229: slots whose last luma rows were still the card's clear value. */
 	u64 raw_incomplete_tail;
+	/* M238: slots whose luma was complete but whose CHROMA was not. */
+	u64 raw_incomplete_chroma;
 	/* M233: AUTO_POSITION re-arms issued, i.e. real acquisition losses. */
 	u64 mst_rearms;
 	/* M237: last CSC byte written to BANK0 0x92, and whether one ever was. */
@@ -872,6 +874,7 @@ extern bool mz0380_event_require_complete;
 extern unsigned int procfs_verbosity;
 extern unsigned int mz0380_poison_byte;
 extern unsigned int mz0380_raw_clear_byte;
+extern unsigned int mz0380_raw_clear_chroma;
 extern bool mz0380_raw_full_range;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;

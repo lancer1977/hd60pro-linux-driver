@@ -146,8 +146,9 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 				   (unsigned long long)dev->raw_probe_stub_frames,
 				   mz0380_post_skip, mz0380_post_skip + 1,
 				   mz0380_raw_frame_bytes(dev));
-			seq_printf(m, "  raw fills  : %llu slots skipped because their last luma rows were still the card's clear byte (M229)\n",
-				   (unsigned long long)dev->raw_incomplete_tail);
+			seq_printf(m, "  raw fills  : %llu slots skipped with luma still clear (M229), %llu with luma done but CHROMA still clear (M238)\n",
+				   (unsigned long long)dev->raw_incomplete_tail,
+				   (unsigned long long)dev->raw_incomplete_chroma);
 			seq_printf(m, "  raw repeats: %llu identical-head observations, %llu torn frames discarded mid-copy, %llu completions with >1 slot ready (M222/M223)\n",
 				   (unsigned long long)dev->raw_dup_content,
 				   (unsigned long long)dev->raw_frames_torn,

@@ -262,6 +262,19 @@ module_param_named(raw_full_range, mz0380_raw_full_range, bool, 0644);
 MODULE_PARM_DESC(raw_full_range,
 	"M234 (RETRACTED): advertise the raw I420 node as full range (def:0). The 4.2%-above-235 measurement behind the original default was not reproducible - a later capture showed 0.001% - so limited range is the default again. Set 1 only with fresh evidence. Does not affect H.264, which carries its own VUI");
 
+/*
+ * M238: the byte the card clears the CHROMA planes to.
+ *
+ * M226 measured 0x80 there while luma cleared to 0x01, which is what neutral
+ * black looks like in I420. Separate from raw_clear_byte because the two
+ * planes clear to different values and the completeness test has to check
+ * both - see mz0380_raw_probe_frame_filled.
+ */
+unsigned int mz0380_raw_clear_chroma = 0x80;
+module_param_named(raw_clear_chroma, mz0380_raw_clear_chroma, uint, 0644);
+MODULE_PARM_DESC(raw_clear_chroma,
+	"M238: byte the card writes when clearing the chroma planes of a raw slot (def:0x80). A slot whose chroma tail is entirely this value has not finished filling, and delivering it gives correct luma with wrong colour");
+
 unsigned int mz0380_raw_clear_byte = 0x01;
 module_param_named(raw_clear_byte, mz0380_raw_clear_byte, uint, 0644);
 MODULE_PARM_DESC(raw_clear_byte,

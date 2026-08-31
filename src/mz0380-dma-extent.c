@@ -292,6 +292,61 @@ bool mz0380_raw_probe_frame_filled(struct mz0380_dev *dev, u32 idx)
 }
 
 /*
+ * M238: the same question for the CHROMA planes, which M229 did not ask.
+ *
+ * I420 is planar - Y, then U, then V - and the card fills ascending, so luma
+ * finishing says nothing about chroma. M229 sampled only the last luma rows,
+ * which lets a frame through with a complete picture and chroma still holding
+ * the clear value. That delivers correct luminance detail with the colour of
+ * whatever the clear leaves behind, which is how an occasional frame arrives
+ * with a magenta or green cast while the picture itself looks right.
+ *
+ * The chroma clear is 0x80, and neutral chroma in real content is also 0x80,
+ * so this test has a genuine false-negative case that the luma one does not:
+ * a frame whose bottom is truly colourless is held back for one completion.
+ * That costs a frame and cannot persist, which is the same trade M229 made,
+ * and it is the right direction - a deferred frame is invisible, a
+ * wrong-coloured one is not.
+ */
+bool mz0380_raw_probe_chroma_filled(struct mz0380_dev *dev, u32 idx)
+{
+	const struct mz0380_raw_probe_buf *b;
+	size_t frame, luma, chroma, base, step;
+	u32 clear;
+	unsigned int i;
+
+	if (idx >= MZ0380_RAW_PROBE_NR_BUFS)
+		return false;
+	b = &dev->raw_probe_bufs[idx];
+	if (!b->va)
+		return false;
+
+	frame = mz0380_raw_frame_bytes(dev);
+	if (frame < 4096 || frame > MZ0380_RAW_PROBE_BUF_SIZE)
+		return false;
+
+	/* The V plane is the final sixth of an I420 frame. */
+	luma = frame / 3 * 2;
+	chroma = frame - luma;
+	if (chroma < 4)
+		return true;
+	step = round_down(chroma / MZ0380_RAW_FILL_SAMPLES, 4);
+	if (step < 4)
+		return true;
+	base = round_down(luma, 4);
+
+	clear = 0x01010101u * (mz0380_raw_clear_chroma & 0xff);
+	dma_rmb();
+	for (i = 0; i < MZ0380_RAW_FILL_SAMPLES; i++) {
+		const u32 *p = b->va + base + (size_t)i * step;
+
+		if (READ_ONCE(*p) != clear)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Re-arm only the sentinels. The rest of the buffer does not need restoring:
  * the frame is copied out to a vb2 plane, and the next transfer overwrites the
  * same bytes anyway. Re-poisoning 4.6 MB per frame to protect a test that reads

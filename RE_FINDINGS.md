@@ -14866,3 +14866,41 @@ recorded in its own commit message. The frame scanner was right both times; the
 error was drawing a conclusion from a capture taken while a separate defect was
 active.
 
+## M238 (2026-08-31): M229 only checked luma, so chroma could still be cleared
+
+Operator captured an occasional frame with a magenta/green cast over the
+picture while the luminance detail was intact - the board and the noisy
+background both correctly resolved, only the colour wrong. Two neighbouring
+frames from the same session were normal.
+
+Correct luma with wrong chroma is a plane-level fault, and it points straight
+at M229. I420 is planar - Y, then U, then V - and the card fills a slot
+ascending after clearing it. `mz0380_raw_probe_frame_filled` samples only the
+final 64 rows of the LUMA plane, so it answers "has the picture arrived" and
+says nothing about the two chroma planes that follow it in memory. A slot
+whose luma has landed but whose chroma is still the clear value passes the
+test and is delivered with correct detail and the colour of the clear.
+
+That is a defect in the M229 fix, not in the code it replaced: the old
+sentinel at `frame - 4` was in the V plane and did cover chroma, and choosing
+the luma tail traded that coverage away without noticing.
+
+**Fix.** `mz0380_raw_probe_chroma_filled` applies the same test to the final
+sixth of the frame against the chroma clear value, `raw_clear_chroma` (0x80,
+measured in M226). A slot is delivered only when both planes are past their
+clear.
+
+The chroma test has a false-negative case the luma one does not: neutral
+chroma in real content is also 0x80, so a frame whose bottom is genuinely
+colourless is held back for one completion. That costs one frame and cannot
+persist, and it is the right direction - a deferred frame is invisible, a
+wrong-coloured one is not.
+
+`raw fills` in `/proc/mz0380-state` now reports the two rejections separately.
+`raw_incomplete_chroma` is the falsifier: if tinted frames persist while it
+stays at 0, chroma completeness is not the cause and the next suspect is the
+CSC path (M237), which would tint every frame in a session rather than
+occasional ones.
+
+Untested on hardware.
+

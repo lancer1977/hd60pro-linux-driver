@@ -1073,6 +1073,7 @@ void mz0380_frame_events_start(struct mz0380_dev *dev)
 	 * as evidence about this one.
 	 */
 	dev->raw_incomplete_tail = 0;
+	dev->raw_incomplete_chroma = 0;
 	for (i = 0; i < MZ0380_RAW_PROBE_NR_BUFS; i++) {
 		dev->raw_probe_bufs[i].last_extent = 0;
 		dev->raw_probe_bufs[i].completions = 0;
