@@ -14904,3 +14904,29 @@ occasional ones.
 
 Untested on hardware.
 
+## M237 REFUTED (2026-08-31): the source colour space does not change with the mode
+
+With the `csc` command forcing a fresh BANK2 0x48 read either side of a
+50/60 Hz change:
+
+```
+colourspace: source YUV444 (0x48=d2 cached), CSC 0x92=00 (bypass)
+colourspace: source YUV444 (0x48=d2 cached), CSC 0x92=00 (bypass)
+```
+
+Identical, and the operator reports no meaningful brightness difference at
+60 Hz on this attempt. The stale-cache asymmetry in `apply_csc_mode` is real -
+the CSC is chosen once at stream start and `mst_b2_48_valid` is never cleared -
+but it is not what changes the brightness, because the value it caches does not
+change.
+
+The staleness remains a latent bug worth fixing if a source ever does switch
+colour space, and the `csc` command remains the manual escape. Neither is
+urgent.
+
+What this leaves for the 50/60 Hz brightness: `mst3367_commit_digital_output`,
+which writes different BANK0/AB values per mode and is the other thing a
+timing change runs. Not investigated. Note also that the operator's most recent
+attempt did not reproduce the symptom strongly, so before spending more runs on
+it, confirm it still reproduces at all.
+
