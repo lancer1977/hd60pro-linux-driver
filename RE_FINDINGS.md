@@ -14613,3 +14613,71 @@ broken one.
 - **Format enumeration.** Windows offers XRGB/NV12/YV12/YUY2/H264; the node
   offers H264 and YU12 (M227).
 
+## M232 (2026-08-31): a dead persistent encoder has no escape path
+
+Reported as "the card video does load very hard or not at all", with a black
+image in OBS. `/proc/mz0380-state` at the time:
+
+```
+pixelformat: YU12
+pipeline   : running, VB2 detached, 20 attachment(s), 0 cached SPS/PPS bytes
+h264 frames: 0 delivered      raw frames : 0 delivered, 0 stub skipped
+raw fills  : 0                placeholder: 188 withheld from a raw node
+recovery   : idle, last card H.264 access unit 12863ms ago
+```
+
+Zero completions of either kind, so nothing downstream of a completion ran -
+M225, M229 and M231 all live there and none of them could have executed. `raw
+fills : 0` in particular proves the M229 test never rejected anything.
+
+The kernel log shows the loop, repeated for attachments 15 through 20:
+
+```
+VB2 detached; persistent H.264 pipeline ... remain active (no STOP, no SET_VIC budget spent)
+NO SIGNAL state entered (validating HDMI state at persistent reattachment): node is
+    delivering raw, so no placeholder is sent and the queue holds
+VB2 attached to persistent H.264 pipeline (attachment 20, SET_VIC spawns remain 1)
+MST3367 signal: 1920x1080p [host units] (htot=2200 vtot=1125 hact=1920 R55=0x7f)
+HDMI reconnect lock on recovery attempt 1: 1920x1080p@60; persistent encoder
+    unchanged, holding NO SIGNAL until clean live IDR
+```
+
+The receiver was locked and reporting perfect timing the whole time. The
+producer was silent for 12.8 seconds. The driver confirmed the lock about twenty
+times, concluded "persistent encoder unchanged", and never restarted it.
+**There is no path that respawns a persistent encoder that has gone silent**,
+short of a module reload - which did fix it immediately.
+
+M225 did not cause this and did make it visible. Before it, the placeholder was
+pushed into the raw queue, so a consumer received frames - wrong-format garbage,
+but frames - and stayed attached. Withholding them correctly means a consumer
+gets nothing, times out, and reattaches, and each reattachment re-enters NO
+SIGNAL. That is the "loads very hard" behaviour: OBS cycling once a second
+against a pipeline that will never produce.
+
+**Not reproduced since.** A clean reload, then a 33-second OBS session in
+`YU12`, ran healthy: one attachment, `rawdeliv` 887 -> 2486 at about 64 fps,
+`rawdrop` 8, recovery idle apart from three momentary blips, `phheld` 4 against
+188 in the failing session. `ffplay` never triggered it at all.
+
+No fix is proposed yet, because the trigger is unknown - what killed the
+producer in the first place is not in the captured log, which begins after the
+silence started. Two candidates when it recurs: a bounded escape that stops and
+restarts the pipeline after a good lock plus sustained silence (costs one
+SET_VIC from the wedge budget, so it needs a hard limit), or refusing the
+reattachment shortcut when the pipeline has produced nothing since the last
+attach. Capture the log from BEFORE the first silent second next time; the
+existing `scripts/mz0380-m230-flicker-watch.sh` running from before OBS starts
+is enough.
+
+Workaround meanwhile: `sudo ./mz0380-live.sh unload && ... load` clears it, and
+`ffplay -f v4l2 -input_format yuv420p -video_size 1920x1080 /dev/video0` is the
+known-good raw consumer.
+
+### Duplicate frames confirmed at ~20%
+
+The healthy session also quantified the next defect: `rawdup` climbed 1026 ->
+1345 while `rawdeliv` climbed 899 -> 2486, so 319 duplicates in 1587 delivered
+frames, about 20%. Consistent with the earlier 209 in 1103. This is what the
+operator sees as the image "not refreshing" when a new object enters view.
+
