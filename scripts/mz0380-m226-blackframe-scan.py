@@ -143,8 +143,38 @@ def classify_blank(buf):
             % (ymax, umin, umax, vmin, vmax))
 
 
+def drift_slope(points):
+    """Least-squares slope of mean luma against frame index.
+
+    An eye cannot tell a slow ratchet from a stable picture over a couple of
+    minutes, which is exactly the question left open after M233: the fast
+    component of the brightening is gone, but "seems stable" is not a
+    measurement. A slope in luma-per-1000-frames answers it, and at 60 fps
+    1000 frames is under 17 seconds, so a few minutes of capture makes even a
+    small drift unambiguous.
+    """
+    n = len(points)
+    if n < 2:
+        return 0.0
+    sx = sum(i for i, _ in points)
+    sy = sum(v for _, v in points)
+    sxx = sum(i * i for i, _ in points)
+    sxy = sum(i * v for i, v in points)
+    denom = n * sxx - sx * sx
+    if not denom:
+        return 0.0
+    return (n * sxy - sx * sy) / denom * 1000.0
+
+
 def main():
     src = sys.stdin.buffer
+    # --interval N aggregates N frames per printed line instead of one line
+    # per frame, so a long capture stays readable and the drift is visible.
+    interval = 0
+    if "--interval" in sys.argv:
+        interval = int(sys.argv[sys.argv.index("--interval") + 1])
+    bucket = []
+    drift = []
     frames = []
     partials = []
     # M234: limited-range video lives in 16..235 (luma) and 16..240 (chroma).
@@ -186,8 +216,21 @@ def main():
             note = ("   <-- PARTIAL: filled to row %d/%d (%.0f%%), %d black rows"
                     % (prof[0], HEIGHT, prof[2] * 100, prof[1]))
         frames.append((mean, lo, hi, blank, kind))
-        print("frame %5d  mean_y=%7.2f  min=%3d  max=%3d  u=%6.2f v=%6.2f%s"
-              % (idx, mean, lo, hi, umean, vmean, note))
+        drift.append((idx, mean))
+        if interval:
+            bucket.append((mean, lo, hi))
+            if len(bucket) >= interval:
+                bmean = sum(b[0] for b in bucket) / len(bucket)
+                print("frames %6d-%6d  mean_y=%7.2f  min=%3d  max=%3d"
+                      % (idx - len(bucket) + 1, idx, bmean,
+                         min(b[1] for b in bucket),
+                         max(b[2] for b in bucket)))
+                bucket = []
+            if note:
+                print("  frame %5d %s" % (idx, note.strip()))
+        else:
+            print("frame %5d  mean_y=%7.2f  min=%3d  max=%3d  u=%6.2f v=%6.2f%s"
+                  % (idx, mean, lo, hi, umean, vmean, note))
         idx += 1
 
     if not frames:
@@ -222,6 +265,22 @@ def main():
     means = [f[0] for f in frames]
     print()
     print("frames read       : %d" % len(frames))
+    print()
+    slope = drift_slope(drift)
+    first = sum(v for _, v in drift[:60]) / max(len(drift[:60]), 1)
+    last = sum(v for _, v in drift[-60:]) / max(len(drift[-60:]), 1)
+    print("--- M235 brightness drift ---")
+    print("mean luma first 60 / last 60 : %.2f -> %.2f  (delta %+.2f)"
+          % (first, last, last - first))
+    print("slope                        : %+.3f luma per 1000 frames" % slope)
+    if abs(slope) < 0.05:
+        print("DRIFT VERDICT: flat. No measurable brightening over this capture.")
+    else:
+        print("DRIFT VERDICT: the picture IS drifting at %+.3f per 1000 frames,"
+              % slope)
+        print("about %+.2f luma per minute at 60 fps. Not visible in a short"
+              % (slope * 3.6))
+        print("look, but it accumulates - correlate it with the rearms counter.")
     print()
     print("--- M234 range check (limited range is luma 16..235, chroma 16..240) ---")
     print("luma  min/max     : %d / %d" % (y_lo, y_hi))
