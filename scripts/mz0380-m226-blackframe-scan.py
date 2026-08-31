@@ -266,21 +266,32 @@ def main():
     print()
     print("frames read       : %d" % len(frames))
     print()
-    slope = drift_slope(drift)
-    first = sum(v for _, v in drift[:60]) / max(len(drift[:60]), 1)
-    last = sum(v for _, v in drift[-60:]) / max(len(drift[-60:]), 1)
+    # A drift slope needs enough frames to outlast scene motion. Below this
+    # the windows overlap and the fit is dominated by whatever moved, which
+    # is how a 60-frame sample reported "+47.9 per 1000 frames" while its own
+    # first and last window were the same frames and differed by 0.00.
+    DRIFT_MIN_FRAMES = 1800
     print("--- M235 brightness drift ---")
-    print("mean luma first 60 / last 60 : %.2f -> %.2f  (delta %+.2f)"
-          % (first, last, last - first))
-    print("slope                        : %+.3f luma per 1000 frames" % slope)
-    if abs(slope) < 0.05:
-        print("DRIFT VERDICT: flat. No measurable brightening over this capture.")
+    if len(drift) < DRIFT_MIN_FRAMES:
+        print("not enough frames: %d, need %d (about %d seconds at 60 fps)."
+              % (len(drift), DRIFT_MIN_FRAMES, DRIFT_MIN_FRAMES // 60))
+        print("NO DRIFT VERDICT from this capture - a short sample of a moving")
+        print("scene produces a slope that is scene motion, not brightening.")
     else:
-        print("DRIFT VERDICT: the picture IS drifting at %+.3f per 1000 frames,"
-              % slope)
-        print("about %+.2f luma per minute at 60 fps. Not visible in a short"
-              % (slope * 3.6))
-        print("look, but it accumulates - correlate it with the rearms counter.")
+        win = len(drift) // 4
+        first = sum(v for _, v in drift[:win]) / win
+        last = sum(v for _, v in drift[-win:]) / win
+        slope = drift_slope(drift)
+        print("mean luma first/last quarter : %.2f -> %.2f  (delta %+.2f, %d frames each)"
+              % (first, last, last - first, win))
+        print("slope                        : %+.3f luma per 1000 frames" % slope)
+        if abs(slope) < 0.05 and abs(last - first) < 1.0:
+            print("DRIFT VERDICT: flat. No measurable brightening over this capture.")
+        else:
+            print("DRIFT VERDICT: drifting at %+.3f per 1000 frames, about %+.2f"
+                  % (slope, slope * 3.6))
+            print("luma per minute at 60 fps. Keep the scene STILL for this to")
+            print("mean anything, and correlate it with the rearms counter.")
     print()
     print("--- M234 range check (limited range is luma 16..235, chroma 16..240) ---")
     print("luma  min/max     : %d / %d" % (y_lo, y_hi))
