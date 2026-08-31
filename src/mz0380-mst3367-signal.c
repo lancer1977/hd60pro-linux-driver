@@ -625,8 +625,31 @@ int mz0380_mst3367_read_lock(struct mz0380_dev *dev, bool *locked,
 		ret = mst_rd(dev, MST3367_B0_DETECT, &detect);
 	if (!ret) {
 		*locked = mst3367_status_locked(detect);
-		if (rearm_acquisition)
+		/*
+		 * M233: never re-arm a receiver that is already locked.
+		 *
+		 * AUTO_POSITION starts a continuous position/phase hunt, and
+		 * this path only ever turns it ON. mz0380_mst3367_read_signal
+		 * pairs its enable with the disable at its `matched:` label, so
+		 * there the hunt is bounded; here nothing ever cleared it, and
+		 * the receiver was left auto-adjusting for the rest of the
+		 * capture. The operator sees that as the picture growing
+		 * steadily brighter on a 60 Hz source, which Windows does not
+		 * do - it does not re-arm mid-capture at all.
+		 *
+		 * The M74 guard in mst3367_set_auto_position was meant to stop
+		 * exactly this, but it exempts signal_recovering, and the
+		 * recovery worker sets that flag immediately before calling
+		 * here. So the one caller the guard needed to catch was the one
+		 * it let through.
+		 *
+		 * A locked receiver has nothing to re-acquire. Re-arm only on
+		 * an actual loss, which is what the flag was for.
+		 */
+		if (rearm_acquisition && !*locked) {
+			dev->mst_rearms++;
 			ret = mst3367_set_auto_position(dev, true);
+		}
 	}
 	mutex_unlock(&mst3367_lock);
 	return ret;

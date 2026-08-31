@@ -14681,3 +14681,50 @@ The healthy session also quantified the next defect: `rawdup` climbed 1026 ->
 frames, about 20%. Consistent with the earlier 209 in 1103. This is what the
 operator sees as the image "not refreshing" when a new object enters view.
 
+## M233 (2026-08-31): the picture brightens steadily because AUTO_POSITION is latched on during capture
+
+Operator report: with the camera at 60 Hz the image gets brighter continuously
+over a capture. Windows does not do this.
+
+`MST3367_B0_AUTO_POSITION` (BANK0 0xe2, ON = 0x80) starts the receiver's
+position/phase hunt. Two callers use it, and only one of them is symmetric:
+
+- `mz0380_mst3367_read_signal` enables it while hunting for a mode and
+  **disables it at the `matched:` label** before committing digital output. The
+  hunt is bounded.
+- `mz0380_mst3367_read_lock(dev, &locked, rearm_acquisition=true)` turns it ON
+  and **never turns it off**. Nothing else clears it, so the receiver was left
+  auto-adjusting for the remainder of the capture.
+
+That second caller is the recovery re-arm. `mst3367_set_auto_position` carries
+the M74 guard that exists to prevent exactly this - "never re-arm acquisition
+while the encoder is capturing... can only disturb the very frames we are trying
+to capture" - but the guard exempts `signal_recovering`, and
+`mz0380_signal_monitor` sets that flag immediately before calling. The one
+caller the guard needed to catch is the one it lets through.
+
+Note how this compounds with M231. Before M231 the monitor declared the producer
+silent every 1500 ms during raw capture, so this latch was being re-applied
+several times a second; M231 cut that to roughly one event per ten seconds,
+which is why the symptom reads as a slow steady drift rather than instability.
+The two remaining recovery events per 23 seconds recorded there are enough to
+keep re-arming a receiver that never needed it.
+
+**Fix.** A locked receiver has nothing to re-acquire, so re-arm only when the
+lock byte says the signal is actually lost:
+
+```c
+if (rearm_acquisition && !*locked)
+```
+
+This keeps re-acquisition on genuine loss, which is what the flag was for, and
+stops the write reaching a receiver that is mid-capture and locked.
+
+`mst_rearms` in `/proc/mz0380-state` counts the re-arms that still happen, and
+is the falsifier. On a healthy locked capture it must stay at 0. If the
+brightening persists with that counter at 0, AUTO_POSITION was not the cause and
+the next suspects are the CSC/range path (`mz0380_mst3367_apply_csc_mode`) or an
+auto-gain on the card itself - neither investigated.
+
+Untested on hardware.
+

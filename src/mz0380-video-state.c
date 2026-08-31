@@ -159,6 +159,8 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 		 * means the opposite - the NO SIGNAL placeholder is not being
 		 * shown, which is the healthy state.
 		 */
+		seq_printf(m, "  rearms     : %llu MST3367 AUTO_POSITION re-arms (only on real lock loss since M233)\n",
+			   (unsigned long long)dev->mst_rearms);
 		seq_printf(m, "  placeholder: %s, %llu NO SIGNAL IDRs delivered, %llu cadence misses, %llu withheld from a raw node (M225)\n",
 			   READ_ONCE(dev->no_signal_active) ?
 			   "SHOWING (no usable source)" : "not shown (source is live)",

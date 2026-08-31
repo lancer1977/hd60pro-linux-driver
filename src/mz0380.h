@@ -441,6 +441,8 @@ struct mz0380_dev {
 	u64 no_signal_frames_suppressed;
 	/* M229: slots whose last luma rows were still the card's clear value. */
 	u64 raw_incomplete_tail;
+	/* M233: AUTO_POSITION re-arms issued, i.e. real acquisition losses. */
+	u64 mst_rearms;
 	bool no_signal_active;
 	/*
 	 * The receiver monitor is independent of encoder activity. This matters
