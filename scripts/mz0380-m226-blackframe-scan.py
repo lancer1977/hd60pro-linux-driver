@@ -147,13 +147,28 @@ def main():
     src = sys.stdin.buffer
     frames = []
     partials = []
+    # M234: limited-range video lives in 16..235 (luma) and 16..240 (chroma).
+    # Anything outside that says the payload is FULL range, and the node
+    # currently advertises LIM_RANGE unconditionally - which makes every player
+    # expand it a second time and show a brighter, harsher picture.
+    y_lo, y_hi = 255, 0
+    c_lo, c_hi = 255, 0
+    y_below16 = y_above235 = y_total = 0
     first_partial_buf = None
     idx = 0
     while True:
         buf = src.read(FRAME_BYTES)
         if len(buf) < FRAME_BYTES:
             break
-        (mean, lo, hi), (umean, _, _), (vmean, _, _) = frame_stats(buf)
+        (mean, lo, hi), (umean, ulo, uhi), (vmean, vlo, vhi) = frame_stats(buf)
+        y_lo = min(y_lo, lo)
+        y_hi = max(y_hi, hi)
+        c_lo = min(c_lo, ulo, vlo)
+        c_hi = max(c_hi, uhi, vhi)
+        ysample = buf[:Y_BYTES:STRIDE]
+        y_total += len(ysample)
+        y_below16 += sum(1 for b in ysample if b < 16)
+        y_above235 += sum(1 for b in ysample if b > 235)
         blank = hi <= BLACK_MAX
         kind = classify_blank(buf) if blank else ""
         # The row profile is the expensive measurement, so it runs only on
@@ -207,6 +222,23 @@ def main():
     means = [f[0] for f in frames]
     print()
     print("frames read       : %d" % len(frames))
+    print()
+    print("--- M234 range check (limited range is luma 16..235, chroma 16..240) ---")
+    print("luma  min/max     : %d / %d" % (y_lo, y_hi))
+    print("chroma min/max    : %d / %d" % (c_lo, c_hi))
+    print("luma below 16     : %d of %d sampled (%.3f%%)"
+          % (y_below16, y_total, 100.0 * y_below16 / max(y_total, 1)))
+    print("luma above 235    : %d of %d sampled (%.3f%%)"
+          % (y_above235, y_total, 100.0 * y_above235 / max(y_total, 1)))
+    if y_hi > 235 or y_lo < 16:
+        print("RANGE VERDICT: payload uses values OUTSIDE 16..235, so it is FULL")
+        print("range. The node advertises V4L2_QUANTIZATION_LIM_RANGE, so every")
+        print("player expands it again - brighter and harsher than the source.")
+    else:
+        print("RANGE VERDICT: payload stays inside 16..235, consistent with the")
+        print("advertised LIM_RANGE. Do not change the quantization on this")
+        print("evidence; look for the brightness difference elsewhere.")
+    print()
     print("luma mean range   : %.2f .. %.2f" % (min(means), max(means)))
     print("blank frames      : %d (max luma <= %d)" % (len(blanks), BLACK_MAX))
     if blanks:
