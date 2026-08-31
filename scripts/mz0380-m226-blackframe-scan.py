@@ -167,6 +167,14 @@ def drift_slope(points):
 
 
 def main():
+    # Python block-buffers stdout when it is a pipe, so at roughly 55 bytes a
+    # line the first flush needs about 74 lines - over a minute of capture
+    # showing nothing at all, which reads exactly like a hung command. A live
+    # trace is the whole point of --interval, so make it line buffered.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
     src = sys.stdin.buffer
     # --interval N aggregates N frames per printed line instead of one line
     # per frame, so a long capture stays readable and the drift is visible.
