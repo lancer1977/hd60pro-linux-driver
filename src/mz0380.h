@@ -864,6 +864,8 @@ extern unsigned int mz0380_edid_opcode;
 extern unsigned int mz0380_edid_timeout_ms;
 extern bool mz0380_buf_poison;
 extern bool mz0380_event_require_complete;
+/* Also declared in mz0380-internal.h; needed here for mz0380-fw.c (M236). */
+extern unsigned int procfs_verbosity;
 extern unsigned int mz0380_poison_byte;
 extern unsigned int mz0380_raw_clear_byte;
 extern bool mz0380_raw_full_range;

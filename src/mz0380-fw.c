@@ -85,7 +85,25 @@ void mz0380_fw_info_dump(struct seq_file *m, struct mz0380_dev *dev)
 	 * Dump a few candidate bridge regs read-only for RE correlation
 	 * rather than asserting a signal state we cannot trust.
 	 */
-	if (dev->fw_state == MZ0380_FW_STATE_READY) {
+	/*
+	 * M236: verbosity 3, not on every read.
+	 *
+	 * Each of these is a full mailbox command - write params, ring the
+	 * doorbell, wait for the event bit, ack - and there are five of them.
+	 * A status poll at 5 Hz therefore issued 25 mailbox transactions per
+	 * second against a running 60 fps capture, which froze the machine for
+	 * about a second at a time.
+	 *
+	 * The worse cost was to the evidence. A diagnostic that competes for
+	 * the mailbox is a participant in what it measures, so recovery events
+	 * and lock losses counted while polling cannot be attributed cleanly to
+	 * the driver. Before/after comparisons at the same polling rate remain
+	 * valid; absolute counts from those traces do not.
+	 *
+	 * The probe is labelled UNVERIFIED and exists for RE correlation, so it
+	 * has no business on the path a watch script reads. Ask for it.
+	 */
+	if (dev->fw_state == MZ0380_FW_STATE_READY && procfs_verbosity > 2) {
 		/*
 		 * Non-clearing chip-0x90 regs only: the ISR treats 0x13/0x14/
 		 * 0x15 (and re-reads 0x10) as read-to-clear, so cat'ing them

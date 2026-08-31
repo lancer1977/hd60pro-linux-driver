@@ -14776,3 +14776,40 @@ A better capture would point the camera at something genuinely black and
 re-run the M234 range check; a full-range source should then show luma near 0
 rather than near 16, which is the half of the evidence still missing.
 
+## M236 (2026-08-31): the watch script was freezing the machine, and perturbing its own measurements
+
+Operator report: `scripts/mz0380-m230-flicker-watch.sh` froze the desktop for
+about a second, every one to two seconds.
+
+Every read of `/proc/mz0380-state` ran the chip-0x90 bridge probe in
+`mz0380_fw_info_dump` - **five `mz0380_periph_read` calls, each a full mailbox
+command**: write params, ring the doorbell, wait on the event bit, ack. The
+watcher polled at 5 Hz, so 25 mailbox transactions per second were competing
+with a running 60 fps capture for the same mailbox.
+
+The freeze is the visible cost. The methodological cost is worse and is the
+reason this is recorded rather than quietly patched: **a diagnostic that
+competes for the mailbox is a participant in what it measures.** Recovery
+events, lock losses and `rearms` counted while polling at 5 Hz cannot be
+attributed cleanly to the driver - the instrument may have provoked some of
+them.
+
+What that does and does not invalidate:
+
+- **M231 stands.** Its evidence is a before/after contrast recorded at the same
+  polling rate, with a working H.264 capture in the same trace as the broken raw
+  one. A constant perturbation cannot explain a difference that tracks the
+  format.
+- **Absolute counts from those traces are suspect.** "Two recovery events in 23
+  seconds" (M231) and the residual lock losses behind M233 were measured under
+  this load. They may be lower, or absent, when nobody is polling.
+- **M226/M229/M234 are unaffected.** Those come from the frame scanner reading
+  delivered bytes, which touches no mailbox.
+
+Fixes: the bridge probe now requires `procfs_verbosity=3`, so it is opt-in for
+RE work rather than running on every status read; and the watcher polls at 1
+second instead of 0.2, overridable with `INTERVAL=`.
+
+Re-measuring the residual M233 lock losses with the probe gated is worth doing
+before anyone treats them as real.
+

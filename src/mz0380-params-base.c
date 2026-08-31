@@ -8,7 +8,7 @@
 unsigned int procfs_verbosity = 1;
 module_param(procfs_verbosity, int, 0644);
 MODULE_PARM_DESC(procfs_verbosity,
-		 "procfs debug level; wide BAR scans are disabled as unsafe");
+	"/proc/mz0380-state detail (def:1). 2 adds the PCI config dump. 3 adds the chip-0x90 bridge probe, which costs FIVE mailbox commands per read - do not poll /proc at that level while capturing (M236). Wide BAR scans are disabled as unsafe");
 
 unsigned int debug;
 module_param(debug, int, 0644);

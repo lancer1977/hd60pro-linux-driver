@@ -38,7 +38,13 @@
 # it costs no encoder spawn.
 set -u
 STATE=/proc/mz0380-state
-INTERVAL=${INTERVAL:-0.2}
+# M236: one second, not 0.2. Reading /proc/mz0380-state is not free - at
+# procfs_verbosity=3 it issues five mailbox commands, and even below that it
+# walks the whole device state. Polling five times a second against a running
+# capture froze the machine for about a second at a time. Override with
+# INTERVAL= if a finer trace is genuinely needed, and keep procfs_verbosity
+# below 3 while capturing.
+INTERVAL=${INTERVAL:-1}
 
 [ -r "$STATE" ] || { echo "$STATE not readable - is the driver loaded?"; exit 1; }
 
