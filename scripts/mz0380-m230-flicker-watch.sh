@@ -50,6 +50,7 @@ sample() {
 		-e 's/^  raw frames : \([0-9]*\) delivered, \([0-9]*\) dropped.*/rawdeliv=\1 rawdrop=\2/p' \
 		-e 's/^  raw fills  : \([0-9]*\) .*/rawunfilled=\1/p' \
 		-e 's/^  raw repeats: \([0-9]*\) identical-head[^,]*, \([0-9]*\) torn.*/rawdup=\1 rawtorn=\2/p' \
+		-e 's/^  rearms     : \([0-9]*\) .*/rearms=\1/p' \
 		-e 's/^  placeholder: \([^,]*\), \([0-9]*\) NO SIGNAL IDRs delivered, \([0-9]*\) cadence misses, \([0-9]*\).*/ph=\1 phdeliv=\2 phmiss=\3 phheld=\4/p' \
 		-e 's/^  h264 frames: \([0-9]*\) delivered, \([0-9]*\) dropped.*/h264deliv=\1 h264drop=\2/p' \
 		-e 's/^  pipeline   : \([^,]*\), \([^,]*\), [^,]*, \([0-9]*\) cached SPS\/PPS.*/pipe=\1 vb2=\2 sps=\3/p' \
