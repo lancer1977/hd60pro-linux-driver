@@ -65,6 +65,20 @@ def poison_hits(buf):
     return hits
 
 
+# M242: a fingerprint dense enough to identify a frame, cheap enough for 60 fps.
+#
+# The driver's raw_dup_content counter compares only each frame's first bytes,
+# so it cannot tell a card repeating a whole picture from a driver re-taking a
+# slot whose head happens to match. Those need opposite fixes. Sampling across
+# the entire frame - luma and both chroma planes - makes a duplicate mean the
+# whole picture repeated.
+FINGERPRINT_STRIDE = 743
+
+
+def fingerprint(buf):
+    return hash(bytes(buf[::FINGERPRINT_STRIDE]))
+
+
 def plane_stats(plane):
     sample = plane[::STRIDE]
     return sum(sample) / len(sample), min(sample), max(sample)
@@ -228,6 +242,7 @@ def main():
     frames = []
     partials = []
     poisoned = []
+    prints = []
     # M234: limited-range video lives in 16..235 (luma) and 16..240 (chroma).
     # Anything outside that says the payload is FULL range, and the node
     # currently advertises LIM_RANGE unconditionally - which makes every player
@@ -267,6 +282,7 @@ def main():
             note = ("   <-- PARTIAL: filled to row %d/%d (%.0f%%), %d black rows"
                     % (prof[0], HEIGHT, prof[2] * 100, prof[1]))
         frames.append((mean, lo, hi, blank, kind))
+        prints.append(fingerprint(buf))
         hits = poison_hits(buf)
         if hits:
             poisoned.append((idx, hits))
@@ -325,6 +341,56 @@ def main():
     # is how a 60-frame sample reported "+47.9 per 1000 frames" while its own
     # first and last window were the same frames and differed by 0.00.
     DRIFT_MIN_FRAMES = min_frames
+    # Run lengths of identical consecutive frames, and how far apart repeats of
+    # the same picture sit. A slot-rotation fault repeats at the bank period;
+    # a card genuinely re-sending a picture does not have to.
+    runs = []
+    cur = 1
+    for a, b in zip(prints, prints[1:]):
+        if a == b:
+            cur += 1
+        else:
+            if cur > 1:
+                runs.append(cur)
+            cur = 1
+    if cur > 1:
+        runs.append(cur)
+    dup_frames = sum(r - 1 for r in runs)
+
+    last_seen = {}
+    gaps = {}
+    for i, fp in enumerate(prints):
+        if fp in last_seen:
+            g = i - last_seen[fp]
+            gaps[g] = gaps.get(g, 0) + 1
+        last_seen[fp] = i
+
+    print("--- M242 duplicate frames (whole-frame fingerprint) ---")
+    print("frames                     : %d" % len(prints))
+    print("distinct pictures          : %d" % len(set(prints)))
+    print("frames identical to previous: %d (%.1f%%)"
+          % (dup_frames, 100.0 * dup_frames / max(len(prints) - 1, 1)))
+    if runs:
+        print("repeat run lengths         : max %d, mean %.2f over %d runs"
+              % (max(runs), sum(runs) / len(runs), len(runs)))
+    if gaps:
+        top = sorted(gaps.items(), key=lambda kv: -kv[1])[:5]
+        print("most common repeat spacing : %s"
+              % ", ".join("%d frames x%d" % (g, n) for g, n in top))
+    if not dup_frames:
+        print("VERDICT: no whole-frame duplicates. Any raw_dup_content the driver")
+        print("reports is head-collision only, not a repeated picture.")
+    elif runs and max(runs) == 2 and gaps and \
+            sorted(gaps.items(), key=lambda kv: -kv[1])[0][0] in (1, 4, 8):
+        print("VERDICT: duplicates come in PAIRS at the bank period, which is the")
+        print("driver re-delivering a slot the card has not rewritten - a")
+        print("delivery-side fault, not the card repeating a picture.")
+    else:
+        print("VERDICT: duplicates are present. Read the run lengths and spacing")
+        print("above: repeats at the 4-slot bank period point at slot rotation,")
+        print("while long runs or irregular spacing point at the card genuinely")
+        print("sending the same picture again.")
+    print()
     print("--- M239 sentinel poison in delivered frames ---")
     print("frames carrying poison at a sentinel offset: %d of %d"
           % (len(poisoned), len(frames)))
