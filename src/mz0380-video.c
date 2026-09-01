@@ -1178,7 +1178,12 @@ int mz0380_video_register(struct mz0380_dev *dev)
 				V4L2_CAP_STREAMING |
 				V4L2_CAP_READWRITE;
 	dev->vdev.dev_parent = &dev->pci->dev;
-	strscpy(dev->vdev.name, "mz0380 H.264", sizeof(dev->vdev.name));
+	/*
+	 * M240: the node name is what applications list, so it should name the
+	 * device, not one of the formats it can produce. "mz0380 H.264" made a
+	 * card that captures uncompressed video look like a codec node.
+	 */
+	strscpy(dev->vdev.name, "HD60 Pro HDMI capture", sizeof(dev->vdev.name));
 	video_set_drvdata(&dev->vdev, dev);
 
 	err = video_register_device(&dev->vdev,

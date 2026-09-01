@@ -34,7 +34,19 @@ MODULE_PARM_DESC(probe_windows,
  * not have to be set as well. Like raw_bank_observe it is read at insmod - the
  * banks come from mz0380_dma_setup() at PCI probe.
  */
-bool mz0380_raw_deliver;
+/*
+ * M240: DEFAULT 1. Raw is the format a camera should offer first.
+ *
+ * ENUM_FMT returns this format at index 0, and most camera consumers -
+ * browsers, PipeWire, video-conferencing apps - take the first entry or ignore
+ * H.264 entirely. With H.264 first the node reads as a capture-card oddity
+ * rather than a webcam, which is also how two hardware runs were spent testing
+ * the encoded path by accident while trying to reproduce a raw defect in OBS.
+ *
+ * The encoded path is unchanged and one S_FMT away. What flips is only what an
+ * application gets when it does not ask.
+ */
+bool mz0380_raw_deliver = true;
 module_param_named(raw_deliver, mz0380_raw_deliver, bool, 0444);
 
 /*
@@ -51,7 +63,7 @@ module_param_named(raw_capable, mz0380_raw_capable, bool, 0444);
 MODULE_PARM_DESC(raw_capable,
 		 "M218: allocate the raw banks so I420 can be selected at runtime through S_FMT (def:1). 0 saves the allocation and makes raw reachable only via raw_deliver=1 at load");
 MODULE_PARM_DESC(raw_deliver,
-		 "M217/M218: make I420 raw the STARTUP delivery format rather than H.264 (def:0). Either way both formats are enumerated and an application can pick with S_FMT, so this only decides what it gets without asking. post_mask bit 0 is forced on whenever raw is live, so no other parameter is needed");
+		 "M217/M218/M240: make I420 raw the STARTUP delivery format and the first ENUM_FMT entry (def:1 since M240 - most camera applications take the first format or cannot use H.264 at all). 0 restores H.264 first. Either way both formats are enumerated and an application can pick with S_FMT. post_mask bit 0 is forced on whenever raw is live, so no other parameter is needed");
 
 bool mz0380_h264_probe = true;	/* M216: this is the capture path */
 module_param_named(h264_probe, mz0380_h264_probe, bool, 0644);

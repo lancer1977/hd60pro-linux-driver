@@ -99,7 +99,12 @@ H264PROBE=0 RAWBANKS=1 RAWTAIL=1 RAW30="${FPS30:-0}" \
 NODE=""
 for name_file in /sys/class/video4linux/video*/name; do
 	[ -r "$name_file" ] || continue
-	[ "$(cat "$name_file")" = "mz0380 H.264" ] || continue
+	# M240 renamed the node; accept the old name so this script works
+	# against a module built before or after that change.
+	case "$(cat "$name_file")" in
+	"HD60 Pro HDMI capture"|"mz0380 H.264") ;;
+	*) continue ;;
+	esac
 	node=${name_file%/name}
 	NODE="/dev/${node##*/}"
 	break
