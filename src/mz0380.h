@@ -410,6 +410,8 @@ struct mz0380_dev {
 	 */
 	bool raw_capable;
 	bool deliver_raw;
+	/* M241: which raw layout S_FMT selected - I420, YV12 or NV12. */
+	u32 raw_fourcc;
 	/* M217: raw delivery to V4L2. */
 	u64 raw_probe_stub_frames;
 	u64 raw_dup_token;

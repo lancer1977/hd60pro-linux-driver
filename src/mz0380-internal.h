@@ -133,6 +133,7 @@ ssize_t mz0380_proc_cmd_write(struct file *file,
 u32 mz0380_current_sizeimage(struct mz0380_dev *dev);
 
 u32 mz0380_current_pixelformat(struct mz0380_dev *dev);
+bool mz0380_is_raw_fourcc(u32 fourcc);
 extern const struct vb2_ops mz0380_qops;
 
 #endif

@@ -339,7 +339,7 @@ u32 mz0380_current_pixelformat(struct mz0380_dev *dev)
 	 * not a module parameter; the parameter only seeds it.
 	 */
 	if (dev && dev->deliver_raw)
-		return V4L2_PIX_FMT_YUV420;
+		return dev->raw_fourcc ? dev->raw_fourcc : V4L2_PIX_FMT_YUV420;
 	if (mz0380_h264_probe)
 		return V4L2_PIX_FMT_H264;
 	if (mz0380_stream_nosg)
@@ -503,22 +503,54 @@ static int mz0380_enum_fmt_vid_cap(struct file *file, void *priv,
 		return 0;
 	}
 
-	if (f->index > 1)
+	/*
+	 * M241: three raw layouts, then H.264.
+	 *
+	 * The card writes I420. YV12 is the same data with the chroma planes
+	 * exchanged and NV12 with them interleaved, so both come free of any
+	 * pixel conversion - and both are formats the Windows driver offers
+	 * (M227) and that many applications expect. The re-ordering happens in
+	 * mz0380_raw_copy_frame during the copy that already had to occur.
+	 */
+	if (f->index > 3)
 		return -EINVAL;
 
 	raw_first = mz0380_raw_deliver;
-	if (f->index == (raw_first ? 0 : 1)) {
-		f->pixelformat = V4L2_PIX_FMT_YUV420;
-		f->flags = 0;
-		strscpy(f->description, "I420 raw (uncompressed)",
-			sizeof(f->description));
-	} else {
+	if (f->index == (raw_first ? 3 : 0)) {
 		f->pixelformat = V4L2_PIX_FMT_H264;
 		f->flags = V4L2_FMT_FLAG_COMPRESSED;
 		strscpy(f->description, "H.264 bytestream",
 			sizeof(f->description));
+		return 0;
 	}
+
+	switch (raw_first ? f->index : f->index - 1) {
+	case 0:
+		f->pixelformat = V4L2_PIX_FMT_YUV420;
+		strscpy(f->description, "I420 raw (uncompressed)",
+			sizeof(f->description));
+		break;
+	case 1:
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+		strscpy(f->description, "NV12 raw (uncompressed)",
+			sizeof(f->description));
+		break;
+	default:
+		f->pixelformat = V4L2_PIX_FMT_YVU420;
+		strscpy(f->description, "YV12 raw (uncompressed)",
+			sizeof(f->description));
+		break;
+	}
+	f->flags = 0;
 	return 0;
+}
+
+/* M241: the three layouts the raw path can emit from one I420 source. */
+bool mz0380_is_raw_fourcc(u32 fourcc)
+{
+	return fourcc == V4L2_PIX_FMT_YUV420 ||
+	       fourcc == V4L2_PIX_FMT_YVU420 ||
+	       fourcc == V4L2_PIX_FMT_NV12;
 }
 
 static int mz0380_g_fmt_vid_cap(struct file *file, void *priv,
@@ -556,12 +588,16 @@ static int mz0380_try_fmt_vid_cap(struct file *file, void *priv,
 	mz0380_clamp_to_source(dev, &f->fmt.pix.width, &f->fmt.pix.height);
 
 	if (dev->raw_capable) {
-		bool want_raw = f->fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420;
+		bool want_raw = mz0380_is_raw_fourcc(f->fmt.pix.pixelformat);
 		bool saved_raw = dev->deliver_raw;
+		u32 saved_fourcc = dev->raw_fourcc;
 
 		dev->deliver_raw = want_raw;
+		if (want_raw)
+			dev->raw_fourcc = f->fmt.pix.pixelformat;
 		mz0380_apply_try_fmt(dev, f);
 		dev->deliver_raw = saved_raw;
+		dev->raw_fourcc = saved_fourcc;
 		dev->capture = saved;
 		return 0;
 	}
@@ -597,7 +633,16 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 	mz0380_clamp_to_source(dev, &f->fmt.pix.width, &f->fmt.pix.height);
 
 	if (dev->raw_capable) {
-		bool want_raw = f->fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420;
+		bool want_raw = mz0380_is_raw_fourcc(f->fmt.pix.pixelformat);
+
+		/*
+		 * M241: a switch BETWEEN raw layouts needs none of the
+		 * pipeline work below - the card keeps writing I420 either
+		 * way and only the copy re-orders - so record it and fall
+		 * through without disturbing a running stream.
+		 */
+		if (want_raw)
+			dev->raw_fourcc = f->fmt.pix.pixelformat;
 
 		if (want_raw != dev->deliver_raw) {
 			if (vb2_is_busy(&dev->vb_queue))
@@ -622,7 +667,7 @@ static int mz0380_s_fmt_vid_cap(struct file *file, void *priv,
 				WRITE_ONCE(dev->pipeline_reconfigure_pending,
 					   true);
 			pr_info("%s: delivery format set to %s%s\n", dev->name,
-				want_raw ? "I420 raw" : "H.264",
+				want_raw ? "raw (uncompressed)" : "H.264",
 				READ_ONCE(dev->pipeline_running) ?
 					"; encoder pipeline will be replaced at the next attachment" :
 					"");

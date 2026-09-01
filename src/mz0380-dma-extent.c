@@ -392,11 +392,50 @@ void mz0380_raw_probe_sentinel_save(struct mz0380_dev *dev, u32 idx, u32 out[4])
 		out[i] = READ_ONCE(*(const u32 *)(b->va + off[i]));
 }
 
+/*
+ * M241: put a saved byte back where the CHOSEN LAYOUT keeps it.
+ *
+ * The sentinel offsets are positions in the card's I420 buffer. Once the copy
+ * can also emit YV12 (chroma planes swapped) or NV12 (chroma interleaved), the
+ * pixel that was at source offset X is somewhere else in the destination, and
+ * restoring at X would repair four bytes of the wrong plane while leaving the
+ * poison visible. Map each byte individually - NV12 splits a single source
+ * dword across eight destination bytes, so there is no coarser unit that works.
+ */
+static void mz0380_raw_restore_byte(void *dst, u32 fourcc, size_t frame,
+				    size_t off, u8 val)
+{
+	size_t luma = frame / 3 * 2;
+	size_t csize = (frame - luma) / 2;
+	size_t idx;
+
+	if (off < luma || fourcc == V4L2_PIX_FMT_YUV420) {
+		((u8 *)dst)[off] = val;		/* luma, or no re-ordering */
+		return;
+	}
+
+	if (off < luma + csize) {
+		idx = off - luma;		/* a U sample */
+		if (fourcc == V4L2_PIX_FMT_YVU420)
+			((u8 *)dst)[luma + csize + idx] = val;
+		else				/* NV12: U is the even byte */
+			((u8 *)dst)[luma + 2 * idx] = val;
+		return;
+	}
+
+	idx = off - luma - csize;		/* a V sample */
+	if (fourcc == V4L2_PIX_FMT_YVU420)
+		((u8 *)dst)[luma + idx] = val;
+	else					/* NV12: V is the odd byte */
+		((u8 *)dst)[luma + 2 * idx + 1] = val;
+}
+
 void mz0380_raw_probe_sentinel_restore(struct mz0380_dev *dev, void *dst,
 				       const u32 in[4])
 {
 	size_t frame, off[4];
-	unsigned int i;
+	unsigned int i, b;
+	u32 fourcc;
 
 	if (!dst)
 		return;
@@ -404,10 +443,57 @@ void mz0380_raw_probe_sentinel_restore(struct mz0380_dev *dev, void *dst,
 	if (frame < 4096 || frame > MZ0380_RAW_PROBE_BUF_SIZE)
 		return;
 
+	fourcc = dev->raw_fourcc ? dev->raw_fourcc : V4L2_PIX_FMT_YUV420;
 	mz0380_raw_sentinel_offsets(frame, off);
 	for (i = 0; i < 4; i++)
-		*(u32 *)(dst + off[i]) = in[i];
+		for (b = 0; b < 4; b++)
+			mz0380_raw_restore_byte(dst, fourcc, frame,
+						off[i] + b,
+						(in[i] >> (8 * b)) & 0xff);
 }
+
+/*
+ * M241: copy one raw frame out, re-ordering chroma into the chosen layout.
+ *
+ * The card writes I420 - Y, then U, then V. YV12 is the same planes with the
+ * two chroma ones exchanged, and NV12 interleaves them into a single plane.
+ * Both are what the Windows driver offers (M227) and what many applications
+ * expect, and neither costs a conversion of the pixel values themselves.
+ *
+ * Done during the copy rather than as a second pass over 3 MB: the luma plane
+ * is a straight memcpy either way, and chroma is either two memcpys with
+ * swapped destinations or one interleave loop.
+ */
+void mz0380_raw_copy_frame(struct mz0380_dev *dev, void *dst, const void *src,
+			   size_t frame)
+{
+	size_t luma = frame / 3 * 2;
+	size_t csize = (frame - luma) / 2;
+	const u8 *u = (const u8 *)src + luma;
+	const u8 *v = u + csize;
+	u8 *out;
+	size_t i;
+
+	memcpy(dst, src, luma);
+
+	switch (dev->raw_fourcc) {
+	case V4L2_PIX_FMT_YVU420:
+		memcpy((u8 *)dst + luma, v, csize);
+		memcpy((u8 *)dst + luma + csize, u, csize);
+		return;
+	case V4L2_PIX_FMT_NV12:
+		out = (u8 *)dst + luma;
+		for (i = 0; i < csize; i++) {
+			*out++ = u[i];
+			*out++ = v[i];
+		}
+		return;
+	default:
+		memcpy((u8 *)dst + luma, u, 2 * csize);
+		return;
+	}
+}
+EXPORT_SYMBOL_GPL(mz0380_raw_copy_frame);
 
 void mz0380_raw_probe_sentinel_repoison(struct mz0380_dev *dev, u32 idx)
 {

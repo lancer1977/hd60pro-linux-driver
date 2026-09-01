@@ -49,6 +49,8 @@ void mz0380_raw_probe_sentinel_repoison(struct mz0380_dev *dev, u32 idx);
 void mz0380_raw_probe_sentinel_save(struct mz0380_dev *dev, u32 idx, u32 out[4]);
 void mz0380_raw_probe_sentinel_restore(struct mz0380_dev *dev, void *dst,
 				       const u32 in[4]);
+void mz0380_raw_copy_frame(struct mz0380_dev *dev, void *dst, const void *src,
+			   size_t frame);
 int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
 				  size_t *length);
 

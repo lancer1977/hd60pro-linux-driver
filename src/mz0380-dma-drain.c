@@ -684,7 +684,7 @@ static bool mz0380_raw_deliver_slot(struct mz0380_dev *dev,
 	mz0380_raw_probe_sentinel_save(dev, idx, sentinels);
 	mz0380_raw_probe_sentinel_repoison(dev, idx);
 	dma_rmb();
-	memcpy(dst, raw->va, frame);
+	mz0380_raw_copy_frame(dev, dst, raw->va, frame);
 
 	if (mz0380_raw_probe_frame_landed(dev, idx)) {
 		/*
