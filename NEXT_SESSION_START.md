@@ -34,12 +34,13 @@ and read it before believing the fix.**
 
 ## Open, in the order I would take them
 
-1. **Duplicate frames.** `raw_dup_content` reached 45% (792 of 1758). That
-   counter compares only frame heads, which cannot separate the card repeating
-   a picture from the driver re-taking a slot - opposite fixes.
-   `scripts/mz0380-m226-blackframe-scan.py` now fingerprints whole frames and
-   reports run lengths and repeat spacing (M242); pairs at the four-slot bank
-   period mean delivery-side, long or irregular runs mean the card.
+1. ~~**Duplicate frames.**~~ **CLOSED (M242): not a defect.** Whole-frame
+   fingerprints at two sampling rates both imply ~30 fps of real content on a
+   60 Hz link, with duplicates as adjacent pairs. The camera sends each frame
+   twice and the driver delivers what it is given. `raw_dup_content` is a
+   source-rate indicator, not an error counter. This also retires the old
+   "61 completions/s against a receiver reading 30 fps" puzzle - the receiver
+   was right, the content is 30 fps and the signal is 60 Hz.
 2. **M238 unverified.** The chroma completeness check has never fired - both
    counters read 0 in the only session that tested it. Neither confirmed nor
    refuted.

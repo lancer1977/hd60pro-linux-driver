@@ -15007,3 +15007,40 @@ card writes I420, YV12 exchanges the chroma planes and NV12 interleaves them.
 `YUYV` and `XRGB`, which Windows also offers (M227), would need real pixel
 conversion and are not implemented.
 
+## M242 (2026-09-01): the duplicate frames are the SOURCE's frame rate, not a driver fault
+
+`raw_dup_content` had been reading 20% and latterly 45%, and was carried as the
+largest remaining defect in the raw path. It is not a defect.
+
+Whole-frame fingerprints at two sampling rates:
+
+| sampled at | distinct | adjacent duplicates | implied unique rate |
+|---|---|---|---|
+| 60 fps | 345 / 600 | 42.6% | 34.5 fps |
+| 34 fps | 288 / 340 | 15.3% | 28.8 fps |
+
+Both point at roughly **30 fps of real content**. In both captures the
+duplicates are almost entirely ADJACENT PAIRS - run length 2.00-2.02, spacing 1
+- which is what a source sending each frame twice on a 60 Hz link produces.
+
+The two numbers differ (34.5 against 28.8) in the direction the method
+predicts: the fingerprint is an exact byte match, so sensor noise makes some
+genuine repeats compare as different. The duplicate count is therefore a lower
+bound and the distinct count an upper one, and the error is largest at the
+higher sampling rate where more true duplicates exist to be missed. Sampling a
+30 fps source at 34 fps predicts about 12% duplicates; 15.3% was measured.
+
+**The driver is delivering exactly what the card gives it.** The operator's
+"image not refreshing when a new object enters view" is the camera's own frame
+rate showing through, not a delivery fault.
+
+This also retires the M209-era puzzle recorded in the handoff - "209 raw
+completions at 16.3 ms apart (~61/s) against a receiver reading of 30 fps and
+60 encoded frames". The receiver was right: the CONTENT is 30 fps while the
+SIGNAL is 60 Hz. Nothing was ever dropping half the frames.
+
+`raw_dup_content` should be read as a source-rate indicator rather than an
+error counter. Its head-only comparison also makes it noisier than the
+whole-frame fingerprint, so prefer
+`scripts/mz0380-m226-blackframe-scan.py --fps <rate>` when the number matters.
+
