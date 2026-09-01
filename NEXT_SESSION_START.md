@@ -1,112 +1,82 @@
 # NEXT SESSION START
 
-_Last updated 2026-08-30. Full history in **RE_FINDINGS.md**. This file is the
+_Last updated 2026-09-01. Full history in **RE_FINDINGS.md**. This file is the
 handoff only. Everything below was verified on hardware unless it says
 otherwise._
 
-## State: the raw flicker is CLOSED. Next defect is duplicate frames.
+## State (2026-09-01): raw capture works and presents as a camera
 
-**Uncompressed capture works and no longer flickers.** 1920x1080 I420 through
-V4L2, no encoder in the delivery path, ~50 fps, chosen by the application with
-`S_FMT`, no module parameters. Confirmed on hardware 2026-08-30.
+1920x1080 uncompressed through V4L2, ~50-60 fps, no module parameters needed.
+The node enumerates `YU12`, `NV12`, `YV12`, `H264` in that order and is named
+`HD60 Pro HDMI capture`.
 
-### The flicker, and how it was finally closed
+### Closed this session, confirmed on hardware
 
-It was TWO defects wearing one symptom, which is why single-cause theories kept
-failing.
-
-| | claim | verdict |
+| | defect | how it was found |
 |---|---|---|
-| M220 | partial frame passing an OR sentinel test | real bug, fixed, symptom remained |
-| M221 | frame size hardcoded to 1080p | real bug, fixed, symptom remained |
-| M222 | token does not name the raw slot | real bugs, fixed, symptom remained |
-| M224 | wrong timestamp per frame | predicts stutter, not flashing |
-| M225 | H.264 placeholder handed to an I420 node | real bug, fixed, **falsified by its own counter** |
-| M228 | deliver only after two landed scans | **falsified by its own counter** - 1 deferral in 1200 frames |
-| **M229** | the card CLEARS a slot before filling it | **CORRECT** - 0 blanks, 0 partials in 1200 frames |
-| **M231** | raw starves the liveness stamp; monitor re-arms HDMI mid-capture | **CORRECT** - operator confirms no black at all |
+| M229 | card CLEARS a slot before filling it, so the sentinel test fired on the clear | scanning delivered bytes - the tail read 0x01, a value no poison here uses |
+| M231 | raw sessions starved the liveness stamp, so the monitor re-armed HDMI mid-capture every 1.5s | counter watch with a working H.264 capture in the same trace for contrast |
+| M239 | the tear detector's poison was copied into **every** delivered frame | predicting the pixel (960,674) from the sentinel offsets, then measuring 600/600 |
+| M240 | H.264 enumerated first, node named after a codec | reading ENUM_FMT against what camera apps actually do |
 
-Five wrong, two right. Every wrong one came from reading the delivery path.
-Neither right one did:
+### Retracted or refuted, and why - read before re-proposing any of them
 
-- **M229** came from scanning the delivered bytes
-  (`scripts/mz0380-m226-blackframe-scan.py`). The unfilled tail read `0x01`,
-  which is no poison this driver uses - so the card wrote it, and the card was
-  clearing slots to black before filling them. The sentinel test was firing on
-  the clear.
-- **M231** came from watching counters with no obvious link to raw delivery
-  (`scripts/mz0380-m230-flicker-watch.sh`), in a session that also held a
-  working H.264 capture for contrast. Recovery flapped for the entire raw
-  session and never once during H.264. `last_h264_frame_stamp` is only written
-  in the encoded path, so raw sessions starved it, and the monitor re-armed
-  HDMI acquisition - a write to the MST3367 - every 1.5 seconds mid-capture.
+- **M228** deferral: its own counter said 1 in 1200. A slot the card cleared
+  stays "landed" forever, so the second observation was always already true.
+- **M234** full-range labelling: rested on 4.2% of luma above 235, measured
+  while the picture was drifting bright. A later capture read 0.001%.
+- **M237** CSC staleness: real asymmetry, but 0x48 reads `d2` (YUV444) at both
+  50 and 60 Hz, so it cannot explain the brightness.
 
-**Use this method on the next defect.** Measure what arrives rather than
-reasoning about what should; put a falsifier in every fix and read it before
-believing the fix; and capture a working case in the same trace as the broken
-one.
+The pattern in all three: a number measured while another defect was active, or
+a fix shipped before its own falsifier was read. **Put a counter in every fix
+and read it before believing the fix.**
 
-## Immediate task: duplicate frames
+## Open, in the order I would take them
 
-`rawdup` reached **209 identical-head observations in 1103 delivered**, about
-19%. The operator describes it as the image "not refreshing" when a new object
-enters the camera's view. Judder, not flashing - a different defect from the two
-just closed, and the largest remaining one.
+1. **Duplicate frames.** `raw_dup_content` reached 45% (792 of 1758). That
+   counter compares only frame heads, which cannot separate the card repeating
+   a picture from the driver re-taking a slot - opposite fixes.
+   `scripts/mz0380-m226-blackframe-scan.py` now fingerprints whole frames and
+   reports run lengths and repeat spacing (M242); pairs at the four-slot bank
+   period mean delivery-side, long or irregular runs mean the card.
+2. **M238 unverified.** The chroma completeness check has never fired - both
+   counters read 0 in the only session that tested it. Neither confirmed nor
+   refuted.
+3. **M232.** A silent persistent encoder has no recovery path; only a module
+   reload clears it. Not reproduced since. Capture the watcher log from BEFORE
+   the consumer opens - both existing traces start after the silence.
+4. **Brightness.** Steps on scene changes rather than drifting, which is what
+   auto-exposure does, and no driver-side evidence supports otherwise. The
+   free test is the same camera through the USB path.
+5. **v4l2-compliance** has never been run clean. Do it non-streaming first;
+   the streaming tests open/close repeatedly and burn encoder spawns.
 
-The counter already exists (`raw repeats` in `/proc/mz0380-state`) and counts
-frames whose first bytes match the previous frame from that slot. What is NOT
-established is whether those are the card writing the same picture twice, or the
-driver taking the same slot twice. Do not assume; the scanner can compare whole
-frames, which the counter cannot.
+## Deliberately NOT done
 
-### Also open
+**Zero-copy delivery.** The 3.1 MB memcpy per frame is 186 MB/s and the
+largest cost in the driver, but the four raw slots are DMA targets programmed
+once by `SET_BUF` at probe. Eliminating the copy means re-pointing the card at
+each vb2 buffer per frame - a mailbox command in the delivery path, on a card
+that wedges within 8-18 encoder spawns. The copy is the safe half of that
+trade. Scope it properly if it is ever wanted; do not slip it in beside other
+changes.
 
-- **Two recovery events per ~23s of raw**, from `mz0380_mst3367_read_lock`
-  reporting unlocked on a live source, polled every `signal_poll_ms=4000`.
-  Visually harmless now. A consecutive-reads debounce is the remedy if it ever
-  matters - a single unlocked read is thin grounds for tearing down a working
-  capture.
-- **Picture quality against Windows.** Same scene side by side, the Linux image
-  is noisier and harsher. Suspects: colour range, and the sharpness default
-  (`sharp=128`). Windows-side settings are captured in M227 and in
-  `/run/media/wolffyx/Work/hd60-trace/images/`.
-- **Format enumeration.** Windows offers XRGB/NV12/YV12/YUY2/H264; this node
-  offers H264 and YU12 (M227).
+**Pruning the 146 module parameters.** Most are RE-era probes, but which ones
+are still reached for is the operator's knowledge, not the code's. Mark
+deprecated rather than delete.
 
-### Running it
+## Tools worth keeping
 
-`modprobe` needs the module installed for the running kernel; a fresh kernel has
-nothing in `/lib/modules`. `mz0380-live.sh load` builds and insmods from the
-tree instead, and keeps the spawn tally, which is why it is worth using:
+- `scripts/mz0380-m226-blackframe-scan.py` - reads delivered bytes. Blank and
+  partial frames, fill boundary, luma/chroma range, brightness drift vs steps,
+  sentinel poison, whole-frame duplicates. Touches no mailbox.
+- `scripts/mz0380-m230-flicker-watch.sh` - counter watch, prints only on
+  change. Polls at 1s since M236; do NOT raise `procfs_verbosity` to 3 while
+  capturing, that costs five mailbox commands per read and froze the desktop.
 
-```bash
-sudo env VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 H264DIVISOR=0 PERSIST=1 ./mz0380-live.sh load
-```
-
-Every knob there now equals the driver default (M216), so it is verbose rather
-than wrong. Run `sudo ./mz0380-live.sh unload` when done - that is what clears
-the root-owned objects that otherwise break your next plain `make`.
-
-**OBS does not offer `YU12` in its Video Format dropdown**, so an OBS session
-tests the ENCODED path unless you pick it deliberately; two hardware runs were
-spent discovering that. For raw, either select `YU12` explicitly or use:
-
-```bash
-ffplay -f v4l2 -input_format yuv420p -video_size 1920x1080 /dev/video0
-```
-
-Always confirm the node is actually in raw mode before trusting a raw result:
-`pixelformat: YU12` plus the `raw frames` / `raw fills` / `raw repeats` lines
-present in `/proc/mz0380-state`. Those lines only print when `deliver_raw` is
-set.
-
-### Budget
-
-`mz0380-spawns.sh` recorded **18 spawns on one power cycle with no wedge** under
-the current `vic_fast_kill=0` default, which answers M157: the historical 8-18
-band was measured under a configuration that is no longer the default. Treat 18
-as observed-safe-once, not as a new ceiling, until a second power cycle repeats
-it. A wedge still costs a mains-off cold boot.
+Both were what closed M229, M231 and M239. Reading the code produced five wrong
+theories; measuring what arrives produced every right one.
 
 ## What this session built
 
