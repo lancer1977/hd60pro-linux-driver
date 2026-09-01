@@ -38,6 +38,33 @@ STRIDE = 997
 BLACK_MAX = 20
 
 
+# M239: the driver's own sentinel offsets and poison values.
+#
+# mz0380_raw_sentinel_offsets places four dwords at frame-4, frame-frame/16,
+# frame-frame/4 and frame/2, and re-poisons them after every copy with 0xa5
+# (bank 0) or 0x5a (bank 1). Three of those land inside the chroma planes, so a
+# poison dword that survives into a delivered frame paints a small coloured
+# blob at a FIXED position - which is what an isolated red dot looks like.
+#
+# Deterministic offsets make this an exact test rather than a heuristic: either
+# those bytes hold poison in delivered frames or they do not.
+POISON = (0xa5, 0x5a)
+
+
+def sentinel_offsets(frame):
+    return (frame - 4, frame - frame // 16, frame - frame // 4, frame // 2)
+
+
+def poison_hits(buf):
+    hits = []
+    for off in sentinel_offsets(FRAME_BYTES):
+        dword = buf[off:off + 4]
+        if len(dword) == 4 and dword[0] in POISON and \
+                dword[0] == dword[1] == dword[2] == dword[3]:
+            hits.append((off, dword[0]))
+    return hits
+
+
 def plane_stats(plane):
     sample = plane[::STRIDE]
     return sum(sample) / len(sample), min(sample), max(sample)
@@ -200,6 +227,7 @@ def main():
         min_frames = int(sys.argv[sys.argv.index("--min-frames") + 1])
     frames = []
     partials = []
+    poisoned = []
     # M234: limited-range video lives in 16..235 (luma) and 16..240 (chroma).
     # Anything outside that says the payload is FULL range, and the node
     # currently advertises LIM_RANGE unconditionally - which makes every player
@@ -239,6 +267,9 @@ def main():
             note = ("   <-- PARTIAL: filled to row %d/%d (%.0f%%), %d black rows"
                     % (prof[0], HEIGHT, prof[2] * 100, prof[1]))
         frames.append((mean, lo, hi, blank, kind))
+        hits = poison_hits(buf)
+        if hits:
+            poisoned.append((idx, hits))
         drift.append((idx, mean))
         if interval:
             bucket.append((mean, lo, hi))
@@ -294,6 +325,23 @@ def main():
     # is how a 60-frame sample reported "+47.9 per 1000 frames" while its own
     # first and last window were the same frames and differed by 0.00.
     DRIFT_MIN_FRAMES = min_frames
+    print("--- M239 sentinel poison in delivered frames ---")
+    print("frames carrying poison at a sentinel offset: %d of %d"
+          % (len(poisoned), len(frames)))
+    for pidx, hits in poisoned[:10]:
+        print("  frame %5d: %s" % (pidx, ", ".join(
+            "offset %d = 0x%02x" % (o, v) for o, v in hits)))
+    if poisoned:
+        print("VERDICT: the driver's own poison is reaching userspace. Three of")
+        print("the four sentinel offsets sit in the chroma planes, so each one")
+        print("paints a small coloured blob at a fixed position. The re-poison")
+        print("after a copy is landing in a frame that is then delivered.")
+    else:
+        print("VERDICT: no poison found at any sentinel offset. Coloured dots are")
+        print("NOT the driver writing its sentinels into delivered frames - look")
+        print("at the source or the card, and compare against another capture")
+        print("path for the same camera before blaming this driver.")
+    print()
     print("--- M235 brightness drift ---")
     if len(drift) < DRIFT_MIN_FRAMES:
         print("not enough frames: %d, need %d (about %d seconds at 60 fps)."
