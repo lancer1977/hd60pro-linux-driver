@@ -14930,3 +14930,49 @@ timing change runs. Not investigated. Note also that the operator's most recent
 attempt did not reproduce the symptom strongly, so before spending more runs on
 it, confirm it still reproduces at all.
 
+## M239 (2026-09-01): the driver was painting its own poison into every delivered frame
+
+Operator report: isolated red dots in the picture, one near the middle.
+
+`mz0380_raw_deliver_slot` armed the tear detector and then copied:
+
+```c
+/* Arm the tear detector, then copy. */
+mz0380_raw_probe_sentinel_repoison(dev, idx);
+dma_rmb();
+memcpy(dst, raw->va, frame);
+```
+
+The poison goes into the SOURCE buffer, and the memcpy then copies the whole
+slot - poison included - into the vb2 plane. Every delivered raw frame carried
+four dwords of 0xa5 or 0x5a at fixed offsets. Measured: **600 frames of 600,
+all four offsets**, no exceptions.
+
+Three of the four sentinels sit in the chroma planes, so each paints a small
+coloured blob at a deterministic pixel. For 1920x1080:
+
+| offset | plane | luma pixel |
+|---|---|---|
+| `frame-4` | V | (1912, 1078) |
+| `frame-frame/16` | V | **(960, 674)** |
+| `frame-frame/4` | U | (0, 540) |
+| `frame/2` | Y | (0, 810) |
+
+(960,674) is horizontally centred, which is what "one close to middle" was.
+Predicting the pixel before looking is what made this findable in one capture
+rather than by argument.
+
+This has been true since the raw path shipped. Every luma statistic in
+M226/M229/M234/M235 included these sixteen corrupted bytes - negligible against
+3110400, but real, and worth knowing when re-reading those numbers.
+
+**Fix.** The detector genuinely needs the poison present in the source while
+the copy runs, so it is not reordered. `mz0380_raw_probe_sentinel_save` records
+the four real dwords before arming, and `mz0380_raw_probe_sentinel_restore`
+writes them back into the DESTINATION once the copy is known not to be torn.
+Tear detection is unchanged; only the delivered pixels are repaired.
+
+`scripts/mz0380-m226-blackframe-scan.py` checks all four offsets in every frame
+and is the falsifier: after this, no delivered frame should carry poison. If
+dots remain with that count at zero, they are not ours.
+

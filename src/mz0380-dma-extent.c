@@ -352,6 +352,63 @@ bool mz0380_raw_probe_chroma_filled(struct mz0380_dev *dev, u32 idx)
  * same bytes anyway. Re-poisoning 4.6 MB per frame to protect a test that reads
  * sixteen of them is the same trade the scan above was rejected for.
  */
+/*
+ * M239: keep the tear detector, stop it corrupting the picture.
+ *
+ * mz0380_raw_deliver_slot poisons the sentinels to arm the tear check and then
+ * memcpy's the whole slot - poison included - into the vb2 plane. Every
+ * delivered raw frame therefore carried four dwords of 0xa5 or 0x5a at fixed
+ * offsets. A capture measured it at 600 frames out of 600, all four offsets.
+ *
+ * Three of the four sit in the chroma planes, so each paints a small coloured
+ * blob at a fixed pixel: (1912,1078), (960,674), (0,540) and (0,810) for a
+ * 1920x1080 frame. The operator reported "some red dots, one close to middle",
+ * and (960,674) is horizontally centred - which is what made this findable.
+ *
+ * The detector needs the poison in the SOURCE while the copy runs, so the fix
+ * is not to reorder it: save the four real dwords first, then repair them in
+ * the DESTINATION once the copy is known good.
+ */
+void mz0380_raw_probe_sentinel_save(struct mz0380_dev *dev, u32 idx, u32 out[4])
+{
+	const struct mz0380_raw_probe_buf *b;
+	size_t frame, off[4];
+	unsigned int i;
+
+	for (i = 0; i < 4; i++)
+		out[i] = 0;
+	if (idx >= MZ0380_RAW_PROBE_NR_BUFS)
+		return;
+	b = &dev->raw_probe_bufs[idx];
+	if (!b->va)
+		return;
+	frame = mz0380_raw_frame_bytes(dev);
+	if (frame < 4096 || frame > MZ0380_RAW_PROBE_BUF_SIZE)
+		return;
+
+	mz0380_raw_sentinel_offsets(frame, off);
+	dma_rmb();
+	for (i = 0; i < 4; i++)
+		out[i] = READ_ONCE(*(const u32 *)(b->va + off[i]));
+}
+
+void mz0380_raw_probe_sentinel_restore(struct mz0380_dev *dev, void *dst,
+				       const u32 in[4])
+{
+	size_t frame, off[4];
+	unsigned int i;
+
+	if (!dst)
+		return;
+	frame = mz0380_raw_frame_bytes(dev);
+	if (frame < 4096 || frame > MZ0380_RAW_PROBE_BUF_SIZE)
+		return;
+
+	mz0380_raw_sentinel_offsets(frame, off);
+	for (i = 0; i < 4; i++)
+		*(u32 *)(dst + off[i]) = in[i];
+}
+
 void mz0380_raw_probe_sentinel_repoison(struct mz0380_dev *dev, u32 idx)
 {
 	struct mz0380_raw_probe_buf *b;

@@ -623,6 +623,7 @@ static bool mz0380_raw_deliver_slot(struct mz0380_dev *dev,
 	struct mz0380_vb_buffer *vbuf;
 	unsigned long flags;
 	size_t frame = mz0380_raw_frame_bytes(dev);
+	u32 sentinels[4];
 	void *dst;
 	size_t plane;
 
@@ -667,7 +668,20 @@ static bool mz0380_raw_deliver_slot(struct mz0380_dev *dev,
 		return false;
 	}
 
-	/* Arm the tear detector, then copy. */
+	/*
+	 * M239: save the real pixels under the sentinels before arming.
+	 *
+	 * Poisoning the source and then copying the whole slot put four dwords
+	 * of 0xa5/0x5a into EVERY delivered frame - measured at 600 of 600,
+	 * all four offsets. Three of them land in the chroma planes, so each
+	 * painted a small coloured blob at a fixed pixel; (960,674) is the one
+	 * the operator saw "close to middle".
+	 *
+	 * The detector genuinely needs the poison present in the source while
+	 * the copy runs, so it is not reordered. The real values are put back
+	 * into the destination after the copy is known not to be torn.
+	 */
+	mz0380_raw_probe_sentinel_save(dev, idx, sentinels);
 	mz0380_raw_probe_sentinel_repoison(dev, idx);
 	dma_rmb();
 	memcpy(dst, raw->va, frame);
@@ -686,6 +700,9 @@ static bool mz0380_raw_deliver_slot(struct mz0380_dev *dev,
 		spin_unlock_irqrestore(&dev->buf_lock, flags);
 		return false;
 	}
+
+	/* The copy is good; put back the pixels the sentinels were sitting on. */
+	mz0380_raw_probe_sentinel_restore(dev, dst, sentinels);
 
 	vb2_set_plane_payload(&vbuf->vb.vb2_buf, 0, frame);
 	/*
