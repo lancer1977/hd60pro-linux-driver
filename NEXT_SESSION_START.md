@@ -18,6 +18,8 @@ The node enumerates `YU12`, `NV12`, `YV12`, `H264` in that order and is named
 | M231 | raw sessions starved the liveness stamp, so the monitor re-armed HDMI mid-capture every 1.5s | counter watch with a working H.264 capture in the same trace for contrast |
 | M239 | the tear detector's poison was copied into **every** delivered frame | predicting the pixel (960,674) from the sentinel offsets, then measuring 600/600 |
 | M240 | H.264 enumerated first, node named after a codec | reading ENUM_FMT against what camera apps actually do |
+| M241 | only I420 offered | NV12 and YV12 are free re-orderings of it; NV12 confirmed rendering |
+| M242 | 45% "duplicate frames" | whole-frame fingerprints at two rates - **not a defect**, the source is 30 fps on a 60 Hz link |
 
 ### Retracted or refuted, and why - read before re-proposing any of them
 
@@ -52,6 +54,47 @@ and read it before believing the fix.**
    free test is the same camera through the USB path.
 5. **v4l2-compliance** has never been run clean. Do it non-streaming first;
    the streaming tests open/close repeatedly and burn encoder spawns.
+
+## Running it
+
+`modprobe` needs the module installed for the running kernel. `mz0380-live.sh`
+builds and insmods from the tree instead, and keeps the spawn tally, which is
+why it is worth using:
+
+```bash
+sudo env VICFW=7 H264PROBE=1 POLLDRAIN=0 WINSEQ=1 OP6=1 POSTMASK=0 FASTKILL=0 H264DIVISOR=0 PERSIST=1 ./mz0380-live.sh load
+```
+
+Every knob there equals the driver default (M216), so it is verbose rather than
+wrong. `sudo ./mz0380-live.sh unload` when done - that is what clears the
+root-owned objects that otherwise break the next plain `make`.
+
+**The node number is not stable** - a USB camera can take video0. Resolve it by
+name:
+
+```bash
+ffplay -f v4l2 -input_format yuv420p -video_size 1920x1080 "$(grep -l 'HD60 Pro HDMI capture' /sys/class/video4linux/video*/name | sed 's|/sys/class/video4linux/|/dev/|; s|/name||')"
+```
+
+**OBS does not offer `YU12` in its Video Format dropdown**, so an OBS session
+can silently test the encoded path; two hardware runs were spent that way.
+Since M240 raw is the default, but confirm with `pixelformat` in
+`/proc/mz0380-state` before trusting any raw result - the `raw frames`,
+`raw fills` and `raw repeats` lines only print when raw is live.
+
+## Budget - READ BEFORE ANY HARDWARE RUN
+
+The card wedges somewhere in **8-18 encoder spawns per power cycle**, and a
+wedge costs a mains-off cold boot. `scripts/mz0380-spawns.sh` keeps the tally
+in `/run`, so a reboot resets it automatically.
+
+One power cycle reached **18 spawns with no wedge** under the current
+`vic_fast_kill=0` default, which answers M157: the 8-18 band was measured on a
+configuration that is no longer the default. Treat 18 as observed-safe-once,
+not a new ceiling.
+
+Every OBS reopen is a spawn. `ffplay` is the cheaper consumer for testing, and
+an OBS retry loop can burn several spawns in seconds.
 
 ## Deliberately NOT done
 
