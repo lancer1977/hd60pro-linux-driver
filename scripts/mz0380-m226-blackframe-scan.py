@@ -377,19 +377,40 @@ def main():
         top = sorted(gaps.items(), key=lambda kv: -kv[1])[:5]
         print("most common repeat spacing : %s"
               % ", ".join("%d frames x%d" % (g, n) for g, n in top))
+    # The decisive number is not the duplicate percentage but the rate of
+    # DISTINCT pictures. A 30 fps source on a 60 Hz link sends every frame
+    # twice, and a driver delivering all 60 is then correct - the duplicates
+    # are in the signal, not the delivery. Report the implied content rate so
+    # that case is not mistaken for a defect.
+    fps = 60.0
+    if "--fps" in sys.argv:
+        fps = float(sys.argv[sys.argv.index("--fps") + 1])
+    unique_rate = len(set(prints)) / (len(prints) / fps) if prints else 0.0
+    adjacent = gaps.get(1, 0)
+
+    print("implied unique content rate: %.1f fps (delivering %.0f fps)"
+          % (unique_rate, fps))
     if not dup_frames:
         print("VERDICT: no whole-frame duplicates. Any raw_dup_content the driver")
         print("reports is head-collision only, not a repeated picture.")
-    elif runs and max(runs) == 2 and gaps and \
-            sorted(gaps.items(), key=lambda kv: -kv[1])[0][0] in (1, 4, 8):
-        print("VERDICT: duplicates come in PAIRS at the bank period, which is the")
-        print("driver re-delivering a slot the card has not rewritten - a")
-        print("delivery-side fault, not the card repeating a picture.")
+    elif adjacent > dup_frames * 0.8 and runs and \
+            sum(runs) / len(runs) < 2.6:
+        print("VERDICT: duplicates are ADJACENT PAIRS, and the unique content")
+        print("rate is %.1f fps against %.0f delivered." % (unique_rate, fps))
+        print("If the source genuinely sends %.0f fps on a %.0f Hz link - which"
+              % (unique_rate, fps))
+        print("cameras routinely do - then every frame arrives twice and the")
+        print("driver is delivering exactly what it is given. That is NOT a")
+        print("defect. Confirm by capturing with '-vf fps=%.0f': if the"
+              % unique_rate)
+        print("duplicates vanish there, the repeats were in the signal. Only")
+        print("if they persist at that rate is this the driver re-taking a")
+        print("slot the card has not rewritten.")
     else:
-        print("VERDICT: duplicates are present. Read the run lengths and spacing")
-        print("above: repeats at the 4-slot bank period point at slot rotation,")
-        print("while long runs or irregular spacing point at the card genuinely")
-        print("sending the same picture again.")
+        print("VERDICT: duplicates are present but not simple adjacent pairs.")
+        print("Long runs or irregular spacing point at the card re-sending a")
+        print("picture; repeats at the four-slot bank period point at slot")
+        print("rotation on the delivery side.")
     print()
     print("--- M239 sentinel poison in delivered frames ---")
     print("frames carrying poison at a sentinel offset: %d of %d"
