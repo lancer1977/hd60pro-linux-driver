@@ -337,10 +337,11 @@ def main():
         print("paints a small coloured blob at a fixed position. The re-poison")
         print("after a copy is landing in a frame that is then delivered.")
     else:
-        print("VERDICT: no poison found at any sentinel offset. Coloured dots are")
-        print("NOT the driver writing its sentinels into delivered frames - look")
-        print("at the source or the card, and compare against another capture")
-        print("path for the same camera before blaming this driver.")
+        print("VERDICT: no poison at any sentinel offset - which is the expected")
+        print("result since M239, not evidence about anything else. If coloured")
+        print("dots are still VISIBLE with this at zero, they are not the driver")
+        print("writing sentinels into frames; compare the same camera through")
+        print("another capture path before blaming this driver.")
     print()
     print("--- M235 brightness drift ---")
     if len(drift) < DRIFT_MIN_FRAMES:

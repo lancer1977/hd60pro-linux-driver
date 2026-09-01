@@ -14976,3 +14976,7 @@ Tear detection is unchanged; only the delivered pixels are repaired.
 and is the falsifier: after this, no delivered frame should carry poison. If
 dots remain with that count at zero, they are not ours.
 
+**Status: CONFIRMED on hardware, 2026-09-01.** The same 600-frame capture that
+read 600 of 600 before the fix reads **0 of 600** after it. Whether the visible
+red dots are gone is the operator's call - the counter proves only that the
+driver is no longer the source of poison at those offsets.
