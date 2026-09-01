@@ -14980,3 +14980,30 @@ dots remain with that count at zero, they are not ours.
 read 600 of 600 before the fix reads **0 of 600** after it. Whether the visible
 red dots are gone is the operator's call - the counter proves only that the
 driver is no longer the source of poison at those offsets.
+
+## M240/M241 CONFIRMED (2026-09-01): the node presents as a camera
+
+```
+[0]: 'YU12' (Planar YUV 4:2:0)
+[1]: 'NV12' (Y/UV 4:2:0)
+[2]: 'YV12' (Planar YVU 4:2:0)
+[3]: 'H264' (H.264, compressed)
+```
+
+Raw at index 0, H.264 last, node named `HD60 Pro HDMI capture`. NV12 negotiated
+and **rendered correctly** - operator confirms it matches YU12, so the
+interleave and the byte-wise sentinel restore that had to follow it are both
+right.
+
+This matters more than it looks. Most camera consumers take the first
+enumerated format or cannot use H.264 at all, and with H.264 first the node
+read as a capture-card oddity. It is also how two hardware runs were spent
+testing the encoded path by accident while trying to reproduce a raw defect in
+OBS - the format order was silently choosing the wrong path for the
+experiment.
+
+The three raw layouts cost nothing beyond the copy that already happened: the
+card writes I420, YV12 exchanges the chroma planes and NV12 interleaves them.
+`YUYV` and `XRGB`, which Windows also offers (M227), would need real pixel
+conversion and are not implemented.
+
