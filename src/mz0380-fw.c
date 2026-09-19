@@ -31,9 +31,151 @@
  *  Nothing here uploads, and no part of the upload protocol survives anywhere
  *  in the tree - not the opcodes, not the BAR0 aperture define, not the module
  *  parameter, not the .HEX blob names. Do not re-add any of it.
+ *
+ *  #56 EXCEPTION - fw_upload_path, opt-in, default OFF: the "card console"
+ *  instrument needs to run a modified rootfs image (etc/rc.local redirecting
+ *  daemon stdout to /mnt/flash/PIC_ENC) to get visibility into the on-card
+ *  audio daemon, and the only way to get a modified image running is to
+ *  upload it once. This re-adds the upload state machine this file's header
+ *  used to forbid, but ONLY behind an explicit module parameter that
+ *  defaults to empty/off - an unset fw_upload_path is byte-for-byte the same
+ *  load path as before this change. The implementation is copied from the
+ *  pre-removal upload code (commit 6b1d434, "feat: firmware upload and boot
+ *  via BAR0 mailbox", opcodes/offsets RE-confirmed against the Windows
+ *  driver there) rather than re-derived, so it carries the same verified
+ *  BEGIN_FW_DL / memcpy-into-BAR0 / COMMIT_FW / ~21s-boot-wait behaviour.
+ *  It still forces the same ~21s reboot and the same brick risk that got the
+ *  original path deleted - see RUNBOOK.md before ever setting this param.
  */
 
 #include "mz0380.h"
+#include <linux/kernel_read_file.h>
+#include <linux/jiffies.h>
+#include <linux/vmalloc.h>
+
+/*
+ * #56 opt-in upload path. Default empty = OFF = no behaviour change at all.
+ * Set to an absolute host filesystem path (not a /lib/firmware name - this
+ * is read directly with kernel_read_file_from_path, not request_firmware,
+ * because the console-instrument image lives in a build/scratch dir, not
+ * the firmware search path) to upload that file to the card and reboot it
+ * into it before the normal handshake proceeds.
+ *
+ * 0444: settable only at insmod time (module param, not sysfs-writable at
+ * runtime) - an upload is a one-shot boot-time decision, not something to
+ * flip live against a running card.
+ */
+static char *fw_upload_path = "";
+module_param(fw_upload_path, charp, 0444);
+MODULE_PARM_DESC(fw_upload_path,
+	"#56 card-console instrument, OPT-IN, DEFAULT EMPTY (=off, no behaviour change): "
+	"absolute host path to an MZ0380.HD.HEX-shaped image to upload via the "
+	"BEGIN_FW_DL/COMMIT_FW mailbox opcodes at load time, exactly as the "
+	"pre-removal upload path did (see mz0380-fw.c header, commit 6b1d434). "
+	"DANGER: forces a ~21s card reboot and carries brick risk - this is why "
+	"the original path was removed. Never set outside a deliberate "
+	"console-instrument run with a verified /mnt/flash/yuan_demo_sdi_bak.");
+
+/* Pre-removal upload protocol constants (RE-confirmed from e60MZ0380.X64.SYS,
+ * see RE_FINDINGS.md and commit 6b1d434's log). Scoped to this file only -
+ * not restored to mz0380-reg.h - so the opt-in nature of fw_upload_path is
+ * visible from a single diff instead of spreading upload plumbing back
+ * through the shared register header.
+ */
+#define MZ0380_FW_UPLOAD_MB_FW_BUFFER    0x60    /* firmware blob aperture (BAR0) */
+#define MZ0380_FW_UPLOAD_CMD_BEGIN       0x0b    /* BEGIN_FIRMWARE_DOWNLOAD, param0 = byte count */
+#define MZ0380_FW_UPLOAD_CMD_COMMIT      0x0c    /* COMMIT_FW: card reboots into the new image, no completion posted */
+#define MZ0380_FW_UPLOAD_BOOT_TIMEOUT_MS 60000   /* boot observed at ~21s on hardware */
+
+/*
+ * Copy the whole firmware blob into the BAR0 download aperture as 32-bit
+ * little-endian writes. This mirrors the Windows driver, which memcpy's the
+ * entire blob into BAR0+0x60 between the BEGIN and COMMIT mailbox commands -
+ * there is no chunk/seq/ack protocol (see RE_FINDINGS.md). Copied verbatim
+ * (mz0380_fw_write_buffer) from the pre-removal implementation.
+ */
+static void mz0380_fw_upload_write_buffer(struct mz0380_dev *dev,
+					  const u8 *data, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i + 4 <= len; i += 4)
+		mz_mmio_write(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER + i,
+			      get_unaligned_le32(data + i));
+
+	if (i < len) {
+		u8 tail[4] = { 0 };
+
+		memcpy(tail, data + i, len - i);
+		mz_mmio_write(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER + i,
+			      get_unaligned_le32(tail));
+	}
+
+	wmb();
+}
+
+/*
+ * BEGIN_FW_DL -> push blob -> COMMIT_FW -> wait for the card to reboot into
+ * it. Copied from the pre-removal mz0380_fw_upload_blob(), same opcode
+ * sequence, same fire-and-forget COMMIT (it never posts a completion), same
+ * ack-every-tick boot wait.
+ */
+static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
+				 const void *data, size_t size)
+{
+	u32 params[1];
+	u32 status;
+	u32 result;
+	int ret;
+	unsigned long deadline;
+
+	pr_warn("%s: fw_upload_path set - UPLOADING %zu bytes and forcing a card reboot (~21s). #56 console-instrument opt-in path, NOT standing driver behaviour.\n",
+		dev->name, size);
+
+	params[0] = (u32)size;
+	ret = mz0380_send_command(dev, MZ0380_FW_UPLOAD_CMD_BEGIN,
+				  params, 1, &status, 2000);
+	if (ret) {
+		pr_err("%s: fw_upload_path: BEGIN_FW_DL failed (%d)\n",
+		       dev->name, ret);
+		return ret;
+	}
+
+	mz0380_fw_upload_write_buffer(dev, data, size);
+
+	ret = mz0380_send_command(dev, MZ0380_FW_UPLOAD_CMD_COMMIT,
+				  NULL, 0, &status, 0);
+	if (ret) {
+		pr_err("%s: fw_upload_path: COMMIT_FW failed (%d)\n",
+		       dev->name, ret);
+		return ret;
+	}
+
+	msleep(100);
+	result = mz_mmio_read(dev, MZ0380_MB_RESULT);
+	deadline = jiffies + msecs_to_jiffies(MZ0380_FW_UPLOAD_BOOT_TIMEOUT_MS);
+	while (time_before(jiffies, deadline)) {
+		u32 event = mz_mmio_read(dev, MZ0380_MB_EVENT);
+
+		mz0380_mb_ack_event(dev);
+		if (event)
+			pr_info("%s: fw_upload_path: EVENT=0x%08x during boot wait, acked\n",
+				dev->name, event);
+		result = mz_mmio_read(dev, MZ0380_MB_RESULT);
+		if (result == 0)
+			break;
+		msleep(1);
+	}
+
+	if (result != 0) {
+		pr_err("%s: fw_upload_path: boot timed out (result=0x%08x)\n",
+		       dev->name, result);
+		return -ETIMEDOUT;
+	}
+
+	pr_info("%s: fw_upload_path: image booted\n", dev->name);
+	return 0;
+}
 
 const char *mz0380_fw_state_name(enum mz0380_fw_state s)
 {
@@ -197,6 +339,45 @@ int mz0380_firmware_load(struct mz0380_dev *dev)
 		pr_info("%s: card runs firmware %u.%u (no upload attempted)\n",
 			dev->name, dev->fw_version_major,
 			dev->fw_version_minor);
+
+	/*
+	 * #56 opt-in only. fw_upload_path defaults to "" - this block is a
+	 * no-op and every line above/below it behaves exactly as before this
+	 * change when the param is unset.
+	 */
+	if (fw_upload_path && fw_upload_path[0]) {
+		void *data = NULL;
+		size_t size = 0;
+		ssize_t rret;
+
+		rret = kernel_read_file_from_path(fw_upload_path, 0, &data, 0,
+						  &size, READING_FIRMWARE);
+		if (rret < 0) {
+			pr_err("%s: fw_upload_path=%s: read failed (%zd), NOT uploading - continuing with the card's own image\n",
+			       dev->name, fw_upload_path, rret);
+		} else {
+			ret = mz0380_fw_upload_blob(dev, data, size);
+			vfree(data);
+			if (ret) {
+				dev->fw_state = MZ0380_FW_STATE_FAILED;
+				mutex_unlock(&dev->fw_lock);
+				return ret;
+			}
+
+			/* Card just rebooted into the uploaded image - redo the handshake. */
+			ret = mz0380_card_init(dev);
+			if (ret) {
+				pr_err("%s: fw_upload_path: post-upload handshake failed (%d)\n",
+				       dev->name, ret);
+				dev->fw_state = MZ0380_FW_STATE_FAILED;
+				mutex_unlock(&dev->fw_lock);
+				return ret;
+			}
+			pr_info("%s: fw_upload_path: post-upload card runs firmware %u.%u\n",
+				dev->name, dev->fw_version_major,
+				dev->fw_version_minor);
+		}
+	}
 
 	dev->fw_state = MZ0380_FW_STATE_READY;
 	mutex_unlock(&dev->fw_lock);
