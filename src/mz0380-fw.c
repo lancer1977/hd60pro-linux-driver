@@ -447,12 +447,27 @@ int mz0380_firmware_load(struct mz0380_dev *dev)
 		size_t size = 0;
 		ssize_t rret;
 
-		rret = kernel_read_file_from_path(fw_upload_path, 0, &data, 0,
+		/*
+		 * buf_size must be the read limit, not 0: kernel_read_file()
+		 * allocates a file-sized buffer and reports the file size in
+		 * *file_size, but only copies `buf_size` bytes into it. With 0
+		 * it returns 0 (not an error) and leaves a zero-filled buffer,
+		 * which is what runs C1-C5 pushed to the card (found by the
+		 * read-back instrument: word0 exp=00000000 for a gzip image).
+		 * INT_MAX is what the firmware loader passes for a whole file.
+		 */
+		rret = kernel_read_file_from_path(fw_upload_path, 0, &data, INT_MAX,
 						  &size, READING_FIRMWARE);
-		if (rret < 0) {
-			pr_err("%s: fw_upload_path=%s: read failed (%zd), NOT uploading - continuing with the card's own image\n",
-			       dev->name, fw_upload_path, rret);
+		if (rret < 0 || (size_t)rret != size) {
+			pr_err("%s: fw_upload_path=%s: read failed (%zd of %zu bytes), NOT uploading - continuing with the card's own image\n",
+			       dev->name, fw_upload_path, rret, size);
+			if (rret >= 0)
+				vfree(data);
 		} else {
+			pr_info("%s: fw_upload_path: read %zu bytes, first words %08x %08x\n",
+				dev->name, size,
+				size >= 4 ? get_unaligned_le32(data) : 0,
+				size >= 8 ? get_unaligned_le32((u8 *)data + 4) : 0);
 			ret = mz0380_fw_upload_blob(dev, data, size);
 			vfree(data);
 			if (ret) {
