@@ -88,6 +88,8 @@ static int mz0380_dev_setup(struct mz0380_dev *dev)
 	atomic_set(&dev->irq_video_count, 0);
 	atomic_set(&dev->irq_audio_count, 0);
 	atomic_set(&dev->irq_signal_count, 0);
+	for (i = 0; i < ARRAY_SIZE(dev->event_bit_histogram); i++)
+		atomic_set(&dev->event_bit_histogram[i], 0);
 
 	dev->nr = mz0380_devcount++;
 	snprintf(dev->name, sizeof(dev->name), "mz0380[%u]", dev->nr);

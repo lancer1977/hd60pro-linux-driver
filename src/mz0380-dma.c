@@ -281,6 +281,96 @@ err:
 }
 
 /*
+ * hd-pro60 #56: audio DMA-target probe. Copies mz0380_h264_bufs_alloc_iova()
+ * exactly, at a 4 GiB-aligned IOVA above every other slot set (H.264 occupies
+ * MZ0380_STREAM_NR_BUFS..2*MZ0380_STREAM_NR_BUFS-1, raw banks occupy
+ * 2*MZ0380_STREAM_NR_BUFS..2*MZ0380_STREAM_NR_BUFS+MZ0380_RAW_PROBE_NR_BUFS-1),
+ * so this never aliases a live producer. Diagnostic only - never wired to any
+ * ALSA delivery path.
+ */
+void mz0380_audio_probe_bufs_free(struct mz0380_dev *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(&dev->pci->dev);
+	unsigned int order = get_order(mz0380_audio_probe_slot_bytes);
+	unsigned int i;
+
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		struct mz0380_stream_buf *b = &dev->audio_probe_bufs[i];
+
+		if (!b->va)
+			continue;
+		if (b->pages) {
+			if (b->dma && domain)
+				iommu_unmap(domain, b->dma,
+					    mz0380_audio_probe_slot_bytes);
+			__free_pages(b->pages, order);
+			b->pages = NULL;
+		} else {
+			dma_free_coherent(&dev->pci->dev,
+					  mz0380_audio_probe_slot_bytes,
+					  b->va, b->dma);
+		}
+		b->va = NULL;
+		b->dma = 0;
+		b->delivered = 0;
+	}
+}
+
+static int mz0380_audio_probe_bufs_alloc_iova(struct mz0380_dev *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(&dev->pci->dev);
+	unsigned int order = get_order(mz0380_audio_probe_slot_bytes);
+	unsigned int i;
+	int ret;
+
+	if (!mz0380_dma_iova_remap || !domain)
+		return -ENODEV;
+
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		struct mz0380_stream_buf *b = &dev->audio_probe_bufs[i];
+		dma_addr_t iova = mz0380_dma_iova_base +
+			((u64)(MZ0380_STREAM_NR_BUFS + 4 + i) << 32);
+		phys_addr_t phys;
+
+		b->pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+		if (!b->pages) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		b->va = page_address(b->pages);
+		phys = page_to_phys(b->pages);
+
+		if (iommu_iova_to_phys(domain, iova)) {
+			pr_err("%s: audio probe IOVA 0x%llx is already mapped\n",
+			       dev->name, (unsigned long long)iova);
+			ret = -EBUSY;
+			goto err;
+		}
+		ret = iommu_map(domain, iova, phys, mz0380_audio_probe_slot_bytes,
+				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+		if (ret) {
+			pr_err("%s: audio probe iommu_map(0x%llx -> %pa, %u) failed (%d)\n",
+			       dev->name, (unsigned long long)iova, &phys,
+			       mz0380_audio_probe_slot_bytes, ret);
+			goto err;
+		}
+		b->dma = iova;
+		memset(b->va, MZ0380_AUDIO_PROBE_POISON_BYTE,
+		       mz0380_audio_probe_slot_bytes);
+		pr_info("%s: audio probe buf[%u] phys=%pa mapped at IOVA 0x%llx (%u bytes, poison=0x%02x)\n",
+			dev->name, i, &phys, (unsigned long long)iova,
+			mz0380_audio_probe_slot_bytes,
+			MZ0380_AUDIO_PROBE_POISON_BYTE);
+	}
+	wmb();
+	return 0;
+
+err:
+	mz0380_audio_probe_bufs_free(dev);
+	return ret;
+}
+
+/*
  * M26. Put buffer i at IOVA (dma_iova_base + (i << 32)) so its low 32 bits are
  * zero, because that is the only half of the host target the card's outbound
  * window actually latches (M25, proven on hw: host_addr == (word0 << 32) +
@@ -423,6 +513,51 @@ int mz0380_h264_program_bufs(struct mz0380_dev *dev)
 		dev->name, MZ0380_H264_SET_BUF_SIZE, ret);
 	return ret;
 }
+
+/*
+ * hd-pro60 #56: register the audio probe slots with SET_BUF opcode
+ * audio_probe_op (3 or 5, Windows' registration table). Diagnostic only -
+ * no-op unless audio_probe_op is set and the buffers allocated cleanly.
+ * Caller places this after mz0380_stream_program_bufs() and before SET_AIC,
+ * same window video's own buffers land in, because op 0x06 is what latches
+ * channels[] into the outbound iATU.
+ */
+int mz0380_audio_probe_register(struct mz0380_dev *dev)
+{
+	u32 params[2 + 2 * MZ0380_STREAM_NR_BUFS] = { 0 };
+	unsigned int i;
+	int ret;
+
+	if (!mz0380_audio_probe_op)
+		return 0;
+
+	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
+	params[1] = mz0380_audio_probe_size_word;
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		struct mz0380_stream_buf *b = &dev->audio_probe_bufs[i];
+		u64 target = b->dma;
+
+		if (!b->va || !target) {
+			pr_warn("%s: hd-pro60 #56 audio probe buffers not allocated - skipping registration (audio_probe_op=%u had no effect)\n",
+				dev->name, mz0380_audio_probe_op);
+			return 0;
+		}
+		memset(b->va, MZ0380_AUDIO_PROBE_POISON_BYTE,
+		       mz0380_audio_probe_slot_bytes);
+		params[2 + 2 * i] = upper_32_bits(target);
+		params[2 + 2 * i + 1] = lower_32_bits(target);
+	}
+	wmb();
+
+	ret = mz0380_send_command(dev, mz0380_audio_probe_op, params,
+				  ARRAY_SIZE(params), NULL, 2000);
+	pr_info("%s: hd-pro60 #56 audio probe SET_BUF(op 0x%02x, size=0x%x) params=%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x ret=%d\n",
+		dev->name, mz0380_audio_probe_op, mz0380_audio_probe_size_word,
+		params[0], params[1], params[2], params[3], params[4],
+		params[5], params[6], params[7], params[8], params[9], ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mz0380_audio_probe_register);
 
 static int mz0380_raw_probe_program_bufs(struct mz0380_dev *dev)
 {
@@ -905,6 +1040,20 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 		}
 	}
 
+	if (mz0380_audio_probe_op) {
+		ret = mz0380_audio_probe_bufs_alloc_iova(dev);
+		if (ret) {
+			pr_err("%s: hd-pro60 #56 audio probe buffer alloc failed (%d); continuing without it (audio_probe_op will no-op)\n",
+			       dev->name, ret);
+		} else {
+			pr_info("%s: hd-pro60 #56 audio probe enabled: op=0x%02x, %u slots x %u bytes (size word 0x%x)\n",
+				dev->name, mz0380_audio_probe_op,
+				MZ0380_STREAM_NR_BUFS,
+				mz0380_audio_probe_slot_bytes,
+				mz0380_audio_probe_size_word);
+		}
+	}
+
 	pr_info("%s: %u stream buffers x %u KiB (buf0 @ %pad)\n",
 		dev->name, MZ0380_STREAM_NR_BUFS,
 		MZ0380_STREAM_BUF_SIZE >> 10, &dev->stream_bufs[0].dma);
@@ -963,6 +1112,42 @@ void mz0380_handle_event_snapshot(struct mz0380_dev *dev, u32 event)
 	u16 next;
 	bool dropped = false;
 	bool ack_now = false;
+
+	/*
+	 * hd-pro60 #56: observe every EVENT bit outside the ones we already
+	 * understand (video completion, command-done). Upstream's disassembly
+	 * of store_channel_done() narrows an audio completion to shift
+	 * ch+15/ch+16 (bits 15-23 for channel 0), so any of those firing here
+	 * is the second half of the acceptance criteria. Observation only -
+	 * this does not change what gets acked or how; mz0380_mb_ack_event()
+	 * is untouched, so video keeps working exactly as before.
+	 */
+	if (mz0380_audio_probe_op &&
+	    (event & ~(MZ0380_VIDEO_EVENT_BIT | MZ0380_MB_EVENT_CMD_DONE))) {
+		u32 extra = event & ~(MZ0380_VIDEO_EVENT_BIT | MZ0380_MB_EVENT_CMD_DONE);
+		int bit;
+
+		atomic_inc(&dev->irq_audio_count);
+		for (bit = 0; bit < 32; bit++)
+			if (extra & BIT(bit))
+				atomic_inc(&dev->event_bit_histogram[bit]);
+
+		/*
+		 * MZ0380_MB_ENC_STATUS (0x50) is itself a single 32-bit
+		 * register whose four bytes are the per-channel statuses
+		 * (see MZ0380_MB_ENC_STAT_IDX) - "0x50..0x53" in the issue
+		 * contract is this one word, not four separately addressable
+		 * ones; reading at unaligned +1/+2/+3 offsets would just be
+		 * an unaligned readl() into the same bytes shifted.
+		 */
+		pr_info_ratelimited("%s: hd-pro60 #56 audio probe: unclaimed EVENT bits 0x%08x (full event=0x%08x) 0x40=%08x 0x44=%08x 0x48=%08x 0x4c=%08x 0x50..0x53=%08x\n",
+			dev->name, extra, event,
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD0),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2),
+			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3),
+			mz_mmio_read(dev, MZ0380_MB_ENC_STATUS));
+	}
 
 	if (!(event & MZ0380_VIDEO_EVENT_BIT) ||
 	    !READ_ONCE(dev->frame_events_accepting))

@@ -500,6 +500,12 @@
 #define MZ0380_RAW_PROBE_BANK1_POISON   0x5a
 
 /*
+ * hd-pro60 #56: audio DMA-target probe. Poisoned before registration so any
+ * card write is unambiguous; the contract asks for exactly 0x5a.
+ */
+#define MZ0380_AUDIO_PROBE_POISON_BYTE  0x5a
+
+/*
  * M36/M37 (proven on hw): the fake-frame path lands ONE fully contiguous raw
  * burst of exactly 1920 x 1107 x 1.5 bytes (0x30a5c0) in buf0 within 450 ms
  * of START, then the card's encoder loop parks (M39: a fresh spawn yields

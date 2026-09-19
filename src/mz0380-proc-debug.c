@@ -483,6 +483,23 @@ static void mz0380_dump_events(struct seq_file *m, struct mz0380_dev *dev)
 		   mz_mmio_read(dev, MZ0380_MB_STATUS),
 		   mz_cfg_read(dev, MZ0380_CFG_INT_FLAG));
 
+	if (mz0380_audio_probe_op) {
+		int bit;
+
+		seq_printf(m,
+			   "  hd-pro60 #56 audio probe: op=0x%02x irq_audio_count=%d\n",
+			   mz0380_audio_probe_op,
+			   atomic_read(&dev->irq_audio_count));
+		seq_puts(m, "  event_bit_histogram (non-zero only):");
+		for (bit = 0; bit < 32; bit++) {
+			int c = atomic_read(&dev->event_bit_histogram[bit]);
+
+			if (c)
+				seq_printf(m, " bit%d=%d", bit, c);
+		}
+		seq_puts(m, "\n");
+	}
+
 	snap = kmalloc_array(MZ0380_EVENT_RING_SIZE, sizeof(*snap), GFP_KERNEL);
 	if (!snap) {
 		seq_puts(m, "  (out of memory)\n");

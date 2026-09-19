@@ -531,6 +531,19 @@ vic_done:
 	}
 
 	/*
+	 * hd-pro60 #56: register the audio probe slots right after every other
+	 * buffer set, before SET_AIC and START_STREAMING, for the same reason
+	 * the video buffers land here - op 0x06 latches channels[] into the
+	 * outbound iATU. No-op unless audio_probe_op is set.
+	 */
+	ret = mz0380_audio_probe_register(dev);
+	if (ret) {
+		pr_warn("%s: hd-pro60 #56 audio probe SET_BUF(op 0x%02x) failed (%d) - continuing without it\n",
+			dev->name, mz0380_audio_probe_op, ret);
+		ret = 0;
+	}
+
+	/*
 	 * Real H.264 needs an owned poison suffix for bounded length inference.
 	 * NOSG keeps the older live extent diagnostic; its fixed raw size does not
 	 * use the completion FIFO or inferred-length path.
@@ -836,6 +849,27 @@ void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 		mz0380_stream_bufs_dump(dev, "stop");
 		mz0380_raw_probe_bufs_dump(dev, "stop");
 		mz0380_h264_bufs_dump(dev, "stop");
+		if (mz0380_audio_probe_op) {
+			int bit;
+			char hist[256];
+			size_t hp = 0;
+
+			hist[0] = '\0';
+			for (bit = 0; bit < 32; bit++) {
+				int c = atomic_read(&dev->event_bit_histogram[bit]);
+
+				if (!c)
+					continue;
+				hp += scnprintf(hist + hp, sizeof(hist) - hp,
+						"%sbit%d=%d", hp ? " " : "",
+						bit, c);
+			}
+			pr_info("%s: hd-pro60 #56 audio probe stop dump: op=0x%02x irq_audio_count=%d event_bit_histogram=[%s]\n",
+				dev->name, mz0380_audio_probe_op,
+				atomic_read(&dev->irq_audio_count),
+				hp ? hist : "none");
+			mz0380_audio_probe_bufs_dump(dev, "stop");
+		}
 		if (mz0380_h264_probe)
 			pr_info("%s: H.264 V4L2 totals: %llu delivered, %llu dropped for lack of a userspace buffer\n",
 				dev->name,

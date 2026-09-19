@@ -824,6 +824,57 @@ void mz0380_h264_bufs_dump(struct mz0380_dev *dev, const char *tag)
 	}
 }
 
+/*
+ * hd-pro60 #56: same inference as mz0380_h264_written_extent() /
+ * mz0380_infer_frame_length() - scan from the end for the last byte that is
+ * not the poison value. A non-zero changed-prefix length on an unclaimed
+ * SET_BUF window is the acceptance-criteria signal that the card actually
+ * DMA'd audio there.
+ */
+static size_t mz0380_audio_probe_written_extent(const u8 *p, size_t size)
+{
+	size_t off;
+
+	for (off = size; off; off--)
+		if (READ_ONCE(p[off - 1]) != MZ0380_AUDIO_PROBE_POISON_BYTE)
+			return off;
+	return 0;
+}
+
+void mz0380_audio_probe_bufs_dump(struct mz0380_dev *dev, const char *tag)
+{
+	unsigned int i;
+
+	if (!mz0380_audio_probe_op)
+		return;
+
+	dma_rmb();
+	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
+		const u8 *p = dev->audio_probe_bufs[i].va;
+		size_t extent, touched = 0, off;
+		size_t size = mz0380_audio_probe_slot_bytes;
+
+		if (!p)
+			continue;
+		extent = mz0380_audio_probe_written_extent(p, size);
+		for (off = 0; off < size; off += PAGE_SIZE)
+			if (READ_ONCE(p[off]) != MZ0380_AUDIO_PROBE_POISON_BYTE)
+				touched++;
+
+		pr_info("%s: %s hd-pro60 #56 audio probe (op 0x%02x) buf[%u] @%pad changed-prefix=0x%zx (%zu bytes), %zu/%lu sampled pages touched, head=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			dev->name, tag, mz0380_audio_probe_op, i,
+			&dev->audio_probe_bufs[i].dma, extent, extent, touched,
+			size / PAGE_SIZE,
+			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+		if (!extent)
+			continue;
+		print_hex_dump(KERN_INFO, "mz0380 audio probe: ",
+			       DUMP_PREFIX_OFFSET, 16, 1, p,
+			       min_t(size_t, extent, 64), false);
+	}
+}
+
 void mz0380_dma_teardown(struct mz0380_dev *dev)
 {
 	if (dev->dma_armed) {
@@ -836,6 +887,7 @@ void mz0380_dma_teardown(struct mz0380_dev *dev)
 	mz0380_raw_probe_bufs_free(dev);
 	mz0380_h264_bufs_free(dev);
 	mz0380_stream_bufs_free(dev);
+	mz0380_audio_probe_bufs_free(dev);
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_teardown);
 

@@ -328,6 +328,13 @@ struct mz0380_dev {
 	atomic_t irq_video_count;
 	atomic_t irq_audio_count;
 	atomic_t irq_signal_count;
+	/*
+	 * hd-pro60 #56: per-bit histogram of every EVENT bit seen outside
+	 * the known video-completion/command-done bits, so an audio
+	 * completion signal (hypothesised bit 15-23) is visible even if it
+	 * never lines up with a full snapshot.
+	 */
+	atomic_t event_bit_histogram[32];
 
 	/* Command channel serialisation */
 	struct mutex cmd_lock;
@@ -377,6 +384,12 @@ struct mz0380_dev {
 	 * These must not alias: the two producers rotate independently.
 	 */
 	struct mz0380_stream_buf h264_bufs[MZ0380_STREAM_NR_BUFS];
+	/*
+	 * hd-pro60 #56: diagnostic-only audio DMA-target probe. Registered
+	 * with SET_BUF opcode audio_probe_op (0=off) on an IOVA window above
+	 * every other slot set; poisoned 0x5a so any card write is visible.
+	 */
+	struct mz0380_stream_buf audio_probe_bufs[MZ0380_STREAM_NR_BUFS];
 	/* Opt-in Windows-parity window-0 banks: op 0x02 then independent op 0x08. */
 	struct mz0380_raw_probe_buf {
 		void *va;
@@ -912,6 +925,9 @@ extern unsigned int mz0380_aic_freq;
 extern unsigned int mz0380_aic_period_frames;
 extern unsigned int mz0380_aic_periods;
 extern unsigned int mz0380_aic_int_mode;
+extern unsigned int mz0380_audio_probe_op;
+extern unsigned int mz0380_audio_probe_slot_bytes;
+extern unsigned int mz0380_audio_probe_size_word;
 /*
  * M82: no legal saturation value can exceed 255, so a sentinel above the byte
  * range means "leave vic_color_info untouched".

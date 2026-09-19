@@ -321,3 +321,30 @@ module_param_named(audio_ring_entry_size, mz0380_audio_ring_entry_size,
 		   uint, 0444);
 MODULE_PARM_DESC(audio_ring_entry_size,
 		 "reserved until the audio DMA ABI is implemented (default 32 KiB)");
+
+/*
+ * hd-pro60 #56: diagnostic-only audio DMA-target spike. Windows' buffer
+ * registration table for this board (RE_FINDINGS.md :11485-11510) advertises
+ * opcode 0x03 (window 3/control, 4 slots x 0x2000 bytes) and opcode 0x05
+ * (window 2, 4 slots x 0x34bd00), neither ever sent by this driver in normal
+ * operation. This registers the audio probe slots with one of those opcodes
+ * so we can look for card-written PCM and the completion EVENT bit that goes
+ * with it. Default 0 = off, byte-identical to before. No ALSA delivery
+ * change - #57's territory, not this one's.
+ */
+unsigned int mz0380_audio_probe_op;
+module_param_named(audio_probe_op, mz0380_audio_probe_op, uint, 0644);
+MODULE_PARM_DESC(audio_probe_op,
+		 "hd-pro60 #56: SET_BUF opcode to register the audio probe slots with (0=off/default, 3 or 5 per Windows' registration table)");
+
+unsigned int mz0380_audio_probe_slot_bytes = 0x10000;
+module_param_named(audio_probe_slot_bytes, mz0380_audio_probe_slot_bytes,
+		   uint, 0444);
+MODULE_PARM_DESC(audio_probe_slot_bytes,
+		 "hd-pro60 #56: host backing size per audio probe slot (def:0x10000)");
+
+unsigned int mz0380_audio_probe_size_word = 0x2000;
+module_param_named(audio_probe_size_word, mz0380_audio_probe_size_word,
+		   uint, 0644);
+MODULE_PARM_DESC(audio_probe_size_word,
+		 "hd-pro60 #56: SET_BUF command size word sent to the card (def:0x2000, Windows' advertised value for op 3)");
