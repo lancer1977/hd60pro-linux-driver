@@ -49,7 +49,7 @@ driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
 Not implemented or not yet proved:
 
 - Audio capture limitations: audio-only start unsupported (trigger returns
-  `-EAGAIN` with a one-time dmesg hint); only 2-channel 48 kHz S16_LE; no
+  `-EIO` with a one-time dmesg hint); only 2-channel 48 kHz S16_LE; no
   A/V sync; 8-channel mode not wired.
 - Resolutions other than 1920x1080.
 - Native webcam-style compatibility with every camera application. The live

@@ -117,10 +117,15 @@ static int mz0380_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
+		/*
+		 * -EIO, not -EAGAIN: arecord treats EAGAIN from a start as
+		 * "wait 100 ms and retry" and spins forever (seen on mugen,
+		 * C14); EIO makes it print "read error" and exit.
+		 */
 		if (!READ_ONCE(dev->pipeline_running) || !dev->audio_bufs_registered) {
 			pr_info_once("%s: audio capture requires the video pipeline to be started (open /dev/video0 first)\n",
 				     dev->name);
-			return -EAGAIN;
+			return -EIO;
 		}
 		/*
 		 * Trigger runs under ALSA's stream lock with IRQs already off:
