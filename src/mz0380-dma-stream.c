@@ -164,6 +164,8 @@ static void mz0380_aic_payload(u32 aic[4])
 		 ((u32)(mz0380_aic_bits & 0xffff) << 16);
 	if (mz0380_aic_raw_dword0_set)
 		aic[0] = mz0380_aic_raw_dword0;
+	else if (mz0380_enable_audio)
+		aic[0] = MZ0380_AIC_DWORD0_STEREO;
 	aic[1] = mz0380_aic_freq;
 	aic[2] = (mz0380_aic_period_frames & 0xffff) |
 		 ((u32)(mz0380_aic_periods & 0xffff) << 16);
@@ -561,6 +563,14 @@ vic_done:
 		ret = 0;
 	}
 
+	/* Register audio capture buffers if enabled. */
+	ret = mz0380_audio_program_bufs(dev);
+	if (ret) {
+		pr_warn("%s: audio SET_BUF(op 0x03) failed (%d) - continuing without audio\n",
+			dev->name, ret);
+		ret = 0;
+	}
+
 	/*
 	 * Real H.264 needs an owned poison suffix for bounded length inference.
 	 * NOSG keeps the older live extent diagnostic; its fixed raw size does not
@@ -836,6 +846,7 @@ void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 	if (dev->dma_armed && READ_ONCE(dev->pipeline_running)) {
 		if (mz0380_stop_on_streamoff || verbose) {
 			stop_ret = mz0380_stream_stop_all(dev, 2000);
+			dev->audio_bufs_registered = false;
 			pr_info("%s: final pipeline stop: STOP_STREAMING(all channels) ret=%d after %u userspace attachment(s) and %u SET_VIC spawn(s)\n",
 				dev->name, stop_ret, dev->pipeline_attach_count,
 				dev->encoder_spawns);

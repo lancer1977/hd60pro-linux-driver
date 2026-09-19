@@ -296,7 +296,7 @@ MODULE_PARM_DESC(dma_handshake,
 bool mz0380_enable_audio;
 module_param_named(enable_audio, mz0380_enable_audio, bool, 0444);
 MODULE_PARM_DESC(enable_audio,
-		 "register the experimental ALSA scaffold (PCM DMA is not implemented; def:0)");
+		 "register the ALSA capture device (2-ch S16_LE 48 kHz; needs the video pipeline running; def:0)");
 
 unsigned int mz0380_video_ring_entries = 16;
 module_param_named(video_ring_entries, mz0380_video_ring_entries,
@@ -309,18 +309,6 @@ module_param_named(video_ring_entry_size, mz0380_video_ring_entry_size,
 		   uint, 0444);
 MODULE_PARM_DESC(video_ring_entry_size,
 		 "reserved legacy ring knob, not used by SET_BUF video (default 512 KiB)");
-
-unsigned int mz0380_audio_ring_entries = 8;
-module_param_named(audio_ring_entries, mz0380_audio_ring_entries,
-		   uint, 0444);
-MODULE_PARM_DESC(audio_ring_entries,
-		 "reserved until the audio DMA ABI is implemented (default 8)");
-
-unsigned int mz0380_audio_ring_entry_size = 32768;
-module_param_named(audio_ring_entry_size, mz0380_audio_ring_entry_size,
-		   uint, 0444);
-MODULE_PARM_DESC(audio_ring_entry_size,
-		 "reserved until the audio DMA ABI is implemented (default 32 KiB)");
 
 /*
  * hd-pro60 #56: diagnostic-only audio DMA-target spike. Windows' buffer

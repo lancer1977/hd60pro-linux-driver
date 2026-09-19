@@ -18,7 +18,10 @@ exposes the result as a V4L2 capture device.
 > 1920x1080 I420 frames - no encoder in the delivery path. `post_skip` throttles
 > the rate: the card's preview bitmap step is `post_skip+1`, and full-rate raw
 > at 1080p60 is ~186 MB/s against a link this card negotiates as PCIe x1 Gen1.
-> Audio is not implemented.
+> 
+> **Audio capture (2-channel S16_LE, 48 kHz)** is available behind
+> `enable_audio=1` and requires the video pipeline to be running (hd-pro60
+> #56/#57 — open `/dev/video0` or start an ffmpeg/v4l2 capture first).
 
 This is reverse-engineered development code, not a mainline or production
 driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
@@ -45,7 +48,9 @@ driver. Read the [spawn-budget warning](#encoder-spawn-budget) before testing.
 
 Not implemented or not yet proved:
 
-- Audio PCM DMA. `enable_audio=1` registers only an inert ALSA scaffold.
+- Audio capture limitations: audio-only start unsupported (trigger returns
+  `-EAGAIN` with a one-time dmesg hint); only 2-channel 48 kHz S16_LE; no
+  A/V sync; 8-channel mode not wired.
 - Resolutions other than 1920x1080.
 - Native webcam-style compatibility with every camera application. The live
   V4L2 node currently advertises compressed H.264; applications that require
@@ -408,6 +413,39 @@ sudo ./mz0380-live.sh unload
 The expected final log contains one successful `final pipeline stop` boundary.
 The explicit unload also records the spawn tally and removes root-owned build
 products that could obstruct a later non-root build.
+
+### Audio capture
+
+To capture audio, load the module with `enable_audio=1`, start a video capture
+(open `/dev/video0` or run an ffmpeg/v4l2 stream), then capture the audio:
+
+```bash
+sudo insmod ./mz0380.ko enable_audio=1
+ffmpeg -f v4l2 -input_format h264 -t 30 -i /dev/video0 -c copy -y video.mkv &
+sleep 5
+make capture-audio
+```
+
+Or use `arecord` directly:
+
+```bash
+arecord -v -D hw:mz0380,0 -f S16_LE -r 48000 -c 2 -d 10 /tmp/audio.wav
+ls -l /tmp/audio.wav
+```
+
+Monitor audio delivery stats in `/proc/mz0380-events`:
+
+```bash
+sudo grep audio /proc/mz0380-events
+```
+
+The output shows event count, slots delivered, dropped slots, and ordering
+skips. To verify audio content with a test tone, use the audio-verify script
+from the hd-pro60 repository:
+
+```bash
+scripts/audio-verify.sh /tmp/audio.wav
+```
 
 ## Encoder spawn budget
 

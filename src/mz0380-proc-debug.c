@@ -500,6 +500,15 @@ static void mz0380_dump_events(struct seq_file *m, struct mz0380_dev *dev)
 		seq_puts(m, "\n");
 	}
 
+	seq_printf(m,
+		   "  audio: events=%d delivered=%llu dropped=%llu order_skips=%llu running=%d registered=%d\n",
+		   atomic_read(&dev->irq_audio_count),
+		   dev->audio_slots_delivered,
+		   dev->audio_slots_dropped,
+		   dev->audio_order_skips,
+		   READ_ONCE(dev->audio_running),
+		   dev->audio_bufs_registered);
+
 	snap = kmalloc_array(MZ0380_EVENT_RING_SIZE, sizeof(*snap), GFP_KERNEL);
 	if (!snap) {
 		seq_puts(m, "  (out of memory)\n");

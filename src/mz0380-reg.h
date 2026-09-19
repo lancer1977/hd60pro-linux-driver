@@ -103,6 +103,15 @@
 #define MZ0380_MB_EVT_PAYLOAD1         0x44
 #define MZ0380_MB_EVT_PAYLOAD2         0x48
 #define MZ0380_MB_EVT_PAYLOAD3         0x4c    /* payload for EVENT[23:16] events  */
+#define MZ0380_CMD_SET_BUF_AUDIO        MZ0380_CMD_SET_BUF_3   /* hd-pro60 #56 */
+#define MZ0380_AUDIO_EVENT_SHIFT        16
+#define MZ0380_AUDIO_EVENT_MASK         (0xfu << MZ0380_AUDIO_EVENT_SHIFT)  /* bit 16+n = slot n done */
+#define MZ0380_AUDIO_NR_BUFS            4
+#define MZ0380_AUDIO_BUF_SIZE           0x10000   /* host backing per slot (8-ch mode writes 64 KB from slot 0) */
+#define MZ0380_AUDIO_SLOT_BYTES         0x1000    /* payload per completion in 2-ch mode: 1024 frames x 2 x 2 */
+#define MZ0380_AUDIO_SIZE_WORD          0x2000    /* SET_BUF size word, as proven with op 0x03 */
+#define MZ0380_AUDIO_POISON_BYTE        0x5a
+#define MZ0380_AIC_DWORD0_STEREO        0x00100200u /* channel_num=0, mono=2, 16-bit */
 #define MZ0380_MB_FIRE                 0x800   /* doorbell value to fire a command */
 #define MZ0380_MB_INT_ACK              0x400   /* doorbell value acking an event   */
 #define MZ0380_MB_RESET                MZ0380_MB_INT_ACK /* old name, same value   */
@@ -535,64 +544,8 @@
 #define MZ0380_CMD_RESET                0xFF  /* CHECKME */
 
 /* ====================================================================
- *  Interrupt status/mask (CHECKME)
- *
- *  ep.ko references "pciep_isr_clrint" and "msi_enable" but the host-
- *  visible interrupt register layout is not yet known. Hypothesised
- *  block lives in BAR0 above the HDMI status window.
+ *  Disproven BAR5 ring model, removed in #57
  * ====================================================================
  */
-
-#define MZ0380_REG_IRQ_STATUS           0x0100  /* CHECKME (BAR0) */
-#define MZ0380_REG_IRQ_MASK             0x0104  /* CHECKME (BAR0) */
-#define MZ0380_REG_IRQ_ACK              0x0108  /* CHECKME (BAR0) */
-
-#define MZ0380_IRQ_CMD_COMPLETE         BIT(0)
-#define MZ0380_IRQ_VIDEO_RING_READY     BIT(1)
-#define MZ0380_IRQ_AUDIO_RING_READY     BIT(2)
-#define MZ0380_IRQ_SIGNAL_CHANGE        BIT(3)
-#define MZ0380_IRQ_FW_READY             BIT(4)
-#define MZ0380_IRQ_ERROR                BIT(5)
-
-/* ====================================================================
- *  Ring base/size/head/tail (legacy mailbox - kept for now)
- *
- *  Two conflicting models:
- *    Model A (mailbox):  ring base programmed via BAR5 0x0200..0x0234.
- *                        Card pushes 4 KiB-aligned descriptors of the
- *                        custom flags+len+pts format below.
- *    Model B (XDMA):     an sc0710-style Xilinx XDMA descriptor table.
- *                        DISPROVEN and its definitions deleted - this card
- *                        has no host-visible XDMA controller.
- *
- *  Model A is what the bring-up scaffolding in mz0380-dma.c uses. The real
- *  streaming path is neither: it is the mailbox plus the outbound windows.
- * ====================================================================
- */
-
-#define MZ0380_REG_VIDEO_RING_BASE_LO   0x0200  /* CHECKME (BAR5) */
-#define MZ0380_REG_VIDEO_RING_BASE_HI   0x0204
-#define MZ0380_REG_VIDEO_RING_SIZE      0x0208
-#define MZ0380_REG_VIDEO_RING_ENTRIES   0x020c
-#define MZ0380_REG_VIDEO_RING_HEAD      0x0210
-#define MZ0380_REG_VIDEO_RING_TAIL      0x0214
-
-#define MZ0380_REG_AUDIO_RING_BASE_LO   0x0220  /* CHECKME (BAR5) */
-#define MZ0380_REG_AUDIO_RING_BASE_HI   0x0224
-#define MZ0380_REG_AUDIO_RING_SIZE      0x0228
-#define MZ0380_REG_AUDIO_RING_ENTRIES   0x022c
-#define MZ0380_REG_AUDIO_RING_HEAD      0x0230
-#define MZ0380_REG_AUDIO_RING_TAIL      0x0234
-
-/* Per-entry descriptor in our Model A ring (CHECKME) */
-#define MZ0380_DESC_FLAGS_OFFSET        0x00
-#define MZ0380_DESC_BYTECOUNT_OFFSET    0x04
-#define MZ0380_DESC_PTS_LO_OFFSET       0x08
-#define MZ0380_DESC_PTS_HI_OFFSET       0x0c
-#define MZ0380_DESC_PAYLOAD_OFFSET      0x14
-
-#define MZ0380_DESC_FLAG_KEY_FRAME      BIT(0)
-#define MZ0380_DESC_FLAG_END_OF_STREAM  BIT(1)
-#define MZ0380_DESC_FLAG_ERROR          BIT(2)
 
 #endif /* _MZ0380_REG_H_ */

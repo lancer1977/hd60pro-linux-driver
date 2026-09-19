@@ -28,6 +28,8 @@ struct mz0380_pcm {
 	unsigned int period_bytes;
 	unsigned int buffer_bytes;
 	unsigned int hw_ptr_bytes;
+	spinlock_t lock;
+	bool running;
 };
 
 #define MZ0380_AUDIO_RATE_MIN  32000
@@ -60,8 +62,12 @@ static int mz0380_pcm_open(struct snd_pcm_substream *ss)
 	struct mz0380_pcm *pcm = dev->snd_pcm;
 
 	ss->runtime->hw = mz0380_pcm_hw;
+	snd_pcm_hw_constraint_step(ss->runtime, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES,
+				   MZ0380_AUDIO_SLOT_BYTES);
+	spin_lock_irq(&pcm->lock);
 	pcm->substream = ss;
 	pcm->hw_ptr_bytes = 0;
+	spin_unlock_irq(&pcm->lock);
 	return 0;
 }
 
@@ -70,7 +76,10 @@ static int mz0380_pcm_close(struct snd_pcm_substream *ss)
 	struct mz0380_dev *dev = snd_pcm_substream_chip(ss);
 	struct mz0380_pcm *pcm = dev->snd_pcm;
 
+	spin_lock_irq(&pcm->lock);
 	pcm->substream = NULL;
+	pcm->running = false;
+	spin_unlock_irq(&pcm->lock);
 	return 0;
 }
 
@@ -101,12 +110,36 @@ static int mz0380_pcm_prepare(struct snd_pcm_substream *ss)
 
 static int mz0380_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 {
+	struct mz0380_dev *dev = snd_pcm_substream_chip(ss);
+	struct mz0380_pcm *pcm = dev->snd_pcm;
+	unsigned long flags;
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
+		if (!READ_ONCE(dev->pipeline_running) || !dev->audio_bufs_registered) {
+			pr_info_once("%s: audio capture requires the video pipeline to be started (open /dev/video0 first)\n",
+				     dev->name);
+			return -EAGAIN;
+		}
+		/*
+		 * Trigger runs under ALSA's stream lock with IRQs already off:
+		 * irqsave, never spin_unlock_irq(), or we would re-enable them
+		 * inside the stream lock.
+		 */
+		spin_lock_irqsave(&pcm->lock, flags);
+		pcm->hw_ptr_bytes = 0;
+		pcm->running = true;
+		spin_unlock_irqrestore(&pcm->lock, flags);
+		WRITE_ONCE(dev->audio_running, true);
 		return 0;
+
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		spin_lock_irqsave(&pcm->lock, flags);
+		pcm->running = false;
+		spin_unlock_irqrestore(&pcm->lock, flags);
+		WRITE_ONCE(dev->audio_running, false);
 		return 0;
 	}
 	return -EINVAL;
@@ -130,56 +163,72 @@ static const struct snd_pcm_ops mz0380_pcm_ops = {
 	.pointer   = mz0380_pcm_pointer,
 };
 
-void mz0380_audio_period_elapsed(struct mz0380_dev *dev)
+void mz0380_audio_deliver_slot(struct mz0380_dev *dev, unsigned int slot)
 {
 	struct mz0380_pcm *pcm = dev->snd_pcm;
-	struct snd_pcm_substream *ss;
-	struct mz0380_ring *r = &dev->audio_ring;
-	u32 tail;
-	size_t produced;
-	void *dst;
+	struct snd_pcm_substream *ss = NULL;
+	void *src;
+	size_t nbytes = MZ0380_AUDIO_SLOT_BYTES;
+	unsigned long flags;
 
-	if (!pcm || !pcm->substream)
+	if (!pcm || slot >= MZ0380_AUDIO_NR_BUFS)
 		return;
-	ss = pcm->substream;
 
-	tail = mz_cfg_read(dev, r->tail_reg);
+	src = dev->audio_bufs[slot].vaddr;
+	if (!src)
+		return;
 
-	while (r->head != tail) {
-		void *src = (u8 *)r->buf + (size_t)r->head * r->entry_size;
-		u32 nbytes = *(u32 *)(src + MZ0380_DESC_BYTECOUNT_OFFSET);
-
-		if (nbytes == 0 || nbytes > r->entry_size)
-			goto advance;
-
-		produced = nbytes;
-
-		if (pcm->hw_ptr_bytes + produced <= pcm->buffer_bytes) {
-			dst = ss->runtime->dma_area + pcm->hw_ptr_bytes;
-			memcpy(dst, (u8 *)src + MZ0380_DESC_PAYLOAD_OFFSET,
-			       produced);
-			pcm->hw_ptr_bytes += produced;
-		} else {
-			size_t first = pcm->buffer_bytes - pcm->hw_ptr_bytes;
-			size_t rest  = produced - first;
-			dst = ss->runtime->dma_area + pcm->hw_ptr_bytes;
-			memcpy(dst,
-			       (u8 *)src + MZ0380_DESC_PAYLOAD_OFFSET,
-			       first);
-			memcpy(ss->runtime->dma_area,
-			       (u8 *)src + MZ0380_DESC_PAYLOAD_OFFSET + first,
-			       rest);
-			pcm->hw_ptr_bytes = rest;
-		}
-
-advance:
-		r->head = (r->head + 1) % r->nr_entries;
-		mz_cfg_write(dev, r->head_reg, r->head);
+	spin_lock_irqsave(&pcm->lock, flags);
+	if (!pcm->running || !pcm->substream) {
+		dev->audio_slots_dropped++;
+		spin_unlock_irqrestore(&pcm->lock, flags);
+		return;
 	}
 
-	snd_pcm_period_elapsed(ss);
+	/*
+	 * Copy slot data into the ring buffer with wraparound. The existing
+	 * wraparound logic from the old ring model ensures hw_ptr_bytes is
+	 * always mod buffer_bytes after the copy.
+	 */
+	if (pcm->hw_ptr_bytes + nbytes <= pcm->buffer_bytes) {
+		memcpy(pcm->substream->runtime->dma_area + pcm->hw_ptr_bytes,
+		       src, nbytes);
+		pcm->hw_ptr_bytes += nbytes;
+	} else {
+		size_t first = pcm->buffer_bytes - pcm->hw_ptr_bytes;
+		size_t rest = nbytes - first;
+		memcpy(pcm->substream->runtime->dma_area + pcm->hw_ptr_bytes,
+		       src, first);
+		memcpy(pcm->substream->runtime->dma_area, (u8 *)src + first, rest);
+		pcm->hw_ptr_bytes = rest;
+	}
+
+	dev->audio_slots_delivered++;
+	ss = pcm->substream;
+	spin_unlock_irqrestore(&pcm->lock, flags);
+
+	/* Re-poison the slot buffer outside the lock (card won't reuse it for 3 more periods) */
+	memset(src, MZ0380_AUDIO_POISON_BYTE, MZ0380_AUDIO_SLOT_BYTES);
+
+	/*
+	 * Kernel 6.14: ALSA's stream lock protects close() from running concurrently
+	 * with period_elapsed(), and our spinlock protects substream pointer mutation.
+	 * Trigger cannot run while a close() is in progress (it's gated by stream state).
+	 * So after unlocking our own lock, we re-check ss under the lock to ensure it
+	 * wasn't cleared by a concurrent close().
+	 */
+	if (ss) {
+		spin_lock_irqsave(&pcm->lock, flags);
+		if (pcm->substream)
+			ss = pcm->substream;
+		else
+			ss = NULL;
+		spin_unlock_irqrestore(&pcm->lock, flags);
+		if (ss)
+			snd_pcm_period_elapsed(ss);
+	}
 }
-EXPORT_SYMBOL_GPL(mz0380_audio_period_elapsed);
+EXPORT_SYMBOL_GPL(mz0380_audio_deliver_slot);
 
 int mz0380_audio_register(struct mz0380_dev *dev)
 {
@@ -199,6 +248,7 @@ int mz0380_audio_register(struct mz0380_dev *dev)
 	pcm = card->private_data;
 	pcm->card = card;
 	pcm->dev = dev;
+	spin_lock_init(&pcm->lock);
 	dev->snd_card = card;
 	dev->snd_pcm  = pcm;
 

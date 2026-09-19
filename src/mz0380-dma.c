@@ -22,41 +22,6 @@
 /* SET_VIC below configures video channel zero; channel_done sets its EVENT bit. */
 #define MZ0380_VIDEO_EVENT_BIT BIT(MZ0380_STREAM_VIDEO_CHANNEL)
 
-int mz0380_dma_ring_alloc(struct mz0380_dev *dev, struct mz0380_ring *r,
-			  u32 nr_entries, u32 entry_size)
-{
-	size_t total;
-
-	if (!nr_entries || !entry_size)
-		return -EINVAL;
-
-	total = (size_t)nr_entries * entry_size;
-	r->buf = dma_alloc_coherent(&dev->pci->dev, total, &r->dma,
-				    GFP_KERNEL);
-	if (!r->buf)
-		return -ENOMEM;
-
-	r->total_size = total;
-	r->entry_size = entry_size;
-	r->nr_entries = nr_entries;
-	r->head = 0;
-	r->tail_seen = 0;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(mz0380_dma_ring_alloc);
-
-void mz0380_dma_ring_free(struct mz0380_dev *dev, struct mz0380_ring *r)
-{
-	if (r->buf) {
-		dma_free_coherent(&dev->pci->dev, r->total_size,
-				  r->buf, r->dma);
-		r->buf = NULL;
-	}
-	r->total_size = 0;
-	r->nr_entries = 0;
-}
-EXPORT_SYMBOL_GPL(mz0380_dma_ring_free);
-
 /* --- streaming buffer set (video channel 0) ------------------------------ */
 
 void mz0380_stream_bufs_free(struct mz0380_dev *dev)
@@ -368,6 +333,124 @@ static int mz0380_audio_probe_bufs_alloc_iova(struct mz0380_dev *dev)
 
 err:
 	mz0380_audio_probe_bufs_free(dev);
+	return ret;
+}
+
+/* --- audio capture buffers (enabled via mz0380_enable_audio) -------------------------------- */
+
+void mz0380_audio_bufs_free(struct mz0380_dev *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(&dev->pci->dev);
+	unsigned int i;
+
+	for (i = 0; i < MZ0380_AUDIO_NR_BUFS; i++) {
+		struct mz0380_audio_buf *b = &dev->audio_bufs[i];
+
+		if (!b->vaddr)
+			continue;
+		if (b->pages) {
+			if (b->iova && domain)
+				iommu_unmap(domain, b->iova, MZ0380_AUDIO_BUF_SIZE);
+			__free_pages(b->pages, b->order);
+			b->pages = NULL;
+		} else {
+			dma_free_coherent(&dev->pci->dev, MZ0380_AUDIO_BUF_SIZE,
+					  b->vaddr, b->iova);
+		}
+		b->vaddr = NULL;
+		b->iova = 0;
+	}
+}
+
+int mz0380_audio_bufs_alloc_iova(struct mz0380_dev *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(&dev->pci->dev);
+	unsigned int order = get_order(MZ0380_AUDIO_BUF_SIZE);
+	unsigned int i;
+	int ret;
+
+	if (!mz0380_dma_iova_remap || !domain)
+		return -ENODEV;
+
+	for (i = 0; i < MZ0380_AUDIO_NR_BUFS; i++) {
+		struct mz0380_audio_buf *b = &dev->audio_bufs[i];
+		dma_addr_t iova = mz0380_dma_iova_base +
+			((u64)(2 * MZ0380_STREAM_NR_BUFS + MZ0380_RAW_PROBE_NR_BUFS + i) << 32);
+		phys_addr_t phys;
+
+		b->pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
+		if (!b->pages) {
+			ret = -ENOMEM;
+			goto err;
+		}
+		b->vaddr = page_address(b->pages);
+		b->order = order;
+		phys = page_to_phys(b->pages);
+
+		if (iommu_iova_to_phys(domain, iova)) {
+			pr_err("%s: audio buf IOVA 0x%llx is already mapped\n",
+			       dev->name, (unsigned long long)iova);
+			ret = -EBUSY;
+			goto err;
+		}
+		ret = iommu_map(domain, iova, phys, MZ0380_AUDIO_BUF_SIZE,
+				IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+		if (ret) {
+			pr_err("%s: audio buf iommu_map(0x%llx -> %pa, %u) failed (%d)\n",
+			       dev->name, (unsigned long long)iova, &phys,
+			       MZ0380_AUDIO_BUF_SIZE, ret);
+			goto err;
+		}
+		b->iova = iova;
+		memset(b->vaddr, MZ0380_AUDIO_POISON_BYTE, MZ0380_AUDIO_BUF_SIZE);
+		pr_info("%s: audio buf[%u] phys=%pa mapped at IOVA 0x%llx (%u bytes, poison=0x%02x)\n",
+			dev->name, i, &phys, (unsigned long long)iova,
+			MZ0380_AUDIO_BUF_SIZE, MZ0380_AUDIO_POISON_BYTE);
+	}
+	wmb();
+	return 0;
+
+err:
+	mz0380_audio_bufs_free(dev);
+	return ret;
+}
+
+int mz0380_audio_program_bufs(struct mz0380_dev *dev)
+{
+	u32 params[2 + 2 * MZ0380_AUDIO_NR_BUFS] = { 0 };
+	unsigned int i;
+	int ret;
+
+	if (!mz0380_enable_audio)
+		return 0;
+
+	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
+	params[1] = MZ0380_AUDIO_SIZE_WORD;
+	for (i = 0; i < MZ0380_AUDIO_NR_BUFS; i++) {
+		struct mz0380_audio_buf *b = &dev->audio_bufs[i];
+		u64 target = b->iova;
+
+		if (!b->vaddr || !target) {
+			pr_warn("%s: audio buffers not allocated - skipping registration\n",
+				dev->name);
+			return -ENODEV;
+		}
+		memset(b->vaddr, MZ0380_AUDIO_POISON_BYTE, MZ0380_AUDIO_SLOT_BYTES);
+		params[2 + 2 * i] = upper_32_bits(target);
+		params[2 + 2 * i + 1] = lower_32_bits(target);
+	}
+	wmb();
+
+	ret = mz0380_send_command(dev, MZ0380_CMD_SET_BUF_AUDIO, params,
+				  ARRAY_SIZE(params), NULL, 2000);
+	pr_info("%s: audio SET_BUF(op 0x03) 4 x 0x%x bytes params=%08x %08x %08x %08x %08x %08x %08x %08x %08x %08x ret=%d\n",
+		dev->name, MZ0380_AUDIO_SLOT_BYTES,
+		params[0], params[1], params[2], params[3], params[4],
+		params[5], params[6], params[7], params[8], params[9], ret);
+	dev->audio_bufs_registered = (ret == 0);
+	dev->audio_next_slot = 0;
+	if (ret)
+		pr_warn("%s: audio SET_BUF failed, audio disabled\n", dev->name);
 	return ret;
 }
 
@@ -1041,6 +1124,12 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 		}
 	}
 
+	if (mz0380_enable_audio && mz0380_audio_probe_op) {
+		pr_warn("%s: both enable_audio and audio_probe_op are set, they share IOVA window - forcing audio_probe_op=0\n",
+			dev->name);
+		mz0380_audio_probe_op = 0;
+	}
+
 	if (mz0380_audio_probe_op) {
 		ret = mz0380_audio_probe_bufs_alloc_iova(dev);
 		if (ret) {
@@ -1052,6 +1141,18 @@ int mz0380_dma_setup(struct mz0380_dev *dev)
 				MZ0380_STREAM_NR_BUFS,
 				mz0380_audio_probe_slot_bytes,
 				mz0380_audio_probe_size_word);
+		}
+	}
+
+	if (mz0380_enable_audio) {
+		ret = mz0380_audio_bufs_alloc_iova(dev);
+		if (ret) {
+			pr_err("%s: audio buffer alloc failed (%d); continuing without audio\n",
+			       dev->name, ret);
+		} else {
+			pr_info("%s: audio capture enabled: %u buffers x %u KiB\n",
+				dev->name, MZ0380_AUDIO_NR_BUFS,
+				MZ0380_AUDIO_BUF_SIZE >> 10);
 		}
 	}
 
@@ -1093,6 +1194,51 @@ void mz0380_enc_stat_ack(struct mz0380_dev *dev)
 
 	mz_mmio_write(dev, MZ0380_MB_ENC_STATUS, MZ0380_MB_ENC_STAT_FREE);
 	wmb();
+}
+
+/*
+ * hd-pro60 #56/#57: audio completion. EVENT bit 16+n means ring slot n
+ * (0..3) holds one 1024-frame period; BAR0+0x4c carries the same index.
+ * Queue it into the same FIFO as video so the drain worker copies it into
+ * the ALSA ring in process context. Not gated on frame_events_accepting:
+ * the audio app on the card outlives a VB2 detach (persistent pipeline).
+ */
+static void mz0380_audio_event_snapshot(struct mz0380_dev *dev, u32 event)
+{
+	struct mz0380_frame_event snapshot;
+	unsigned long flags;
+	u16 next;
+
+	atomic_inc(&dev->irq_audio_count);
+
+	if (!READ_ONCE(dev->audio_running)) {
+		dev->audio_slots_dropped++;
+		return;
+	}
+
+	snapshot.kind = MZ0380_EVT_AUDIO;
+	snapshot.timestamp_ns = ktime_get_ns();
+	snapshot.event = event;
+	snapshot.token = 0;
+	snapshot.payload[0] = 0;
+	snapshot.payload[1] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2);
+	snapshot.payload[2] = mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3);
+	snapshot.enc_status = 0;
+	dma_rmb();
+
+	spin_lock_irqsave(&dev->frame_event_lock, flags);
+	next = (dev->frame_event_head + 1) % MZ0380_FRAME_EVENT_FIFO_SIZE;
+	if (next == dev->frame_event_tail) {
+		dev->frame_event_drops++;
+	} else {
+		dev->frame_events[dev->frame_event_head] = snapshot;
+		dev->frame_event_head = next;
+		if (!dev->frame_event_drain_scheduled) {
+			dev->frame_event_drain_scheduled = true;
+			schedule_work(&dev->drain_work);
+		}
+	}
+	spin_unlock_irqrestore(&dev->frame_event_lock, flags);
 }
 
 /*
@@ -1150,10 +1296,14 @@ void mz0380_handle_event_snapshot(struct mz0380_dev *dev, u32 event)
 			mz_mmio_read(dev, MZ0380_MB_ENC_STATUS));
 	}
 
+	if (event & MZ0380_AUDIO_EVENT_MASK)
+		mz0380_audio_event_snapshot(dev, event);
+
 	if (!(event & MZ0380_VIDEO_EVENT_BIT) ||
 	    !READ_ONCE(dev->frame_events_accepting))
 		return;
 
+	snapshot.kind = MZ0380_EVT_VIDEO;
 	snapshot.timestamp_ns = ktime_get_ns();
 	snapshot.event = event;
 	snapshot.token = mz_mmio_read(dev, MZ0380_MB_FRAME_TOKEN);
@@ -1289,12 +1439,15 @@ void mz0380_dma_flush_events(struct mz0380_dev *dev)
 
 	spin_lock_irqsave(&dev->frame_event_lock, flags);
 	while (dev->frame_event_tail != dev->frame_event_head) {
-		u32 token = dev->frame_events[dev->frame_event_tail].token & 7;
+		struct mz0380_frame_event *ev = &dev->frame_events[dev->frame_event_tail];
+		u32 token = ev->token & 7;
 
-		if (token < (mz0380_raw_bank_probe ?
-			     MZ0380_RAW_PROBE_NR_BUFS :
-			     MZ0380_STREAM_NR_BUFS))
-			dev->frame_event_drop_tokens |= BIT(token);
+		if (ev->kind != MZ0380_EVT_AUDIO) {
+			if (token < (mz0380_raw_bank_probe ?
+				     MZ0380_RAW_PROBE_NR_BUFS :
+				     MZ0380_STREAM_NR_BUFS))
+				dev->frame_event_drop_tokens |= BIT(token);
+		}
 		dev->frame_event_tail = (dev->frame_event_tail + 1) %
 					MZ0380_FRAME_EVENT_FIFO_SIZE;
 		pending++;

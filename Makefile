@@ -284,9 +284,11 @@ capture: all
 
 capture-h264: capture
 
+AUDIO_WAV ?= /tmp/hd60-audio.wav
+AUDIO_SECS ?= 10
 capture-audio:
-	@echo "ALSA PCM DMA is not implemented; enable_audio must remain disabled."
-	@false
+	arecord -v -D hw:mz0380,0 -f S16_LE -r 48000 -c 2 -d $(AUDIO_SECS) $(AUDIO_WAV)
+	@ls -l $(AUDIO_WAV)
 
 #
 # Installation.
