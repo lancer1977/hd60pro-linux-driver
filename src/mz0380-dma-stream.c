@@ -154,6 +154,22 @@ static int mz0380_stream_post_proc(struct mz0380_dev *dev, u32 fps)
 }
 
 /*
+ * Build the 4-word AIC payload for SET_AIC_PARAMS command.
+ * Used by both the initial SET_AIC and the pre-START resend.
+ */
+static void mz0380_aic_payload(u32 aic[4])
+{
+	aic[0] = (mz0380_aic_channels & 0xff) |
+		 ((u32)(mz0380_aic_channels == 1 ? 1 : 0) << 8) |
+		 ((u32)(mz0380_aic_bits & 0xffff) << 16);
+	aic[1] = mz0380_aic_freq;
+	aic[2] = (mz0380_aic_period_frames & 0xffff) |
+		 ((u32)(mz0380_aic_periods & 0xffff) << 16);
+	aic[3] = 1u |
+		 ((u32)(mz0380_aic_int_mode & 0xff) << 8);
+}
+
+/*
  * Start streaming: program the buffer physaddrs into the card, then arm the
  * encoder with SET_VIC_PARAMS (the same op 0x29 path input-select uses). Per
  * M17 the card's own userspace flips its internal enables in response, so no
@@ -584,18 +600,9 @@ vic_done:
 	 */
 	if (mz0380_aic_on && (mz0380_aic_every_frame || !dev->aic_armed)) {
 		bool was_armed = dev->aic_armed;
-		u32 aic[4] = {
-			/* cmd+4 channel_num | cmd+5 mono<<8 | cmd+6 bits<<16 */
-			(mz0380_aic_channels & 0xff) |
-			((u32)(mz0380_aic_channels == 1 ? 1 : 0) << 8) |
-			((u32)(mz0380_aic_bits & 0xffff) << 16),
-			mz0380_aic_freq,			/* cmd+8  freq  */
-			(mz0380_aic_period_frames & 0xffff) |	/* cmd+12       */
-			((u32)(mz0380_aic_periods & 0xffff) << 16), /* cmd+14   */
-			1u |					/* cmd+16 on=1  */
-			((u32)(mz0380_aic_int_mode & 0xff) << 8),/* cmd+17     */
-		};
+		u32 aic[4];
 
+		mz0380_aic_payload(aic);
 		ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS, aic,
 					  ARRAY_SIZE(aic), NULL, 2000);
 		pr_info("%s: stream start: SET_AIC(on=1, %u ch, %u bit, %u Hz, %u frames x %u periods) ret=%d\n",
@@ -712,6 +719,19 @@ vic_done:
 			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD1),
 			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD2),
 			mz_mmio_read(dev, MZ0380_MB_EVT_PAYLOAD3));
+	}
+
+	if (mz0380_aic_resend_before_start && mz0380_aic_on) {
+		u32 aic2[4];
+		int aic2_ret;
+
+		mz0380_aic_payload(aic2);
+		aic2_ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS, aic2,
+					       ARRAY_SIZE(aic2), NULL, 2000);
+		pr_info("%s: stream start: hd-pro60 #56 SET_AIC(on=1) re-sent before op 0x06, ret=%d, settle %u ms\n",
+			dev->name, aic2_ret, mz0380_aic_pre_start_settle_ms);
+		if (mz0380_aic_pre_start_settle_ms)
+			msleep(mz0380_aic_pre_start_settle_ms);
 	}
 
 	/*

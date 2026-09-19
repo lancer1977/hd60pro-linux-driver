@@ -893,6 +893,8 @@ extern unsigned int mz0380_raw_clear_chroma;
 extern bool mz0380_raw_full_range;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;
+extern bool mz0380_aic_resend_before_start;
+extern unsigned int mz0380_aic_pre_start_settle_ms;
 extern bool mz0380_signal_confirm;
 extern unsigned int mz0380_vic_fw;
 extern unsigned int mz0380_vic_out_format;

@@ -733,6 +733,16 @@ module_param_named(aic_every_frame, mz0380_aic_every_frame, bool, 0644);
 MODULE_PARM_DESC(aic_every_frame,
 		 "M60: re-send SET_AIC(on=1) on every encoder spawn instead of once per session (def:0)");
 
+bool mz0380_aic_resend_before_start;
+module_param_named(aic_resend_before_start, mz0380_aic_resend_before_start, bool, 0644);
+MODULE_PARM_DESC(aic_resend_before_start,
+		 "hd-pro60 #56: re-send SET_AIC(on=1) immediately before START_STREAMING so audio_capture_mgr sees it last (def:0)");
+
+unsigned int mz0380_aic_pre_start_settle_ms;
+module_param_named(aic_pre_start_settle_ms, mz0380_aic_pre_start_settle_ms, uint, 0644);
+MODULE_PARM_DESC(aic_pre_start_settle_ms,
+		 "hd-pro60 #56: msleep after the pre-START SET_AIC resend, before op 0x06 (def:0)");
+
 unsigned int mz0380_aic_channels = 2;
 module_param_named(aic_channels, mz0380_aic_channels, uint, 0644);
 MODULE_PARM_DESC(aic_channels, "M33: SET_AIC channel_num (def:2)");
