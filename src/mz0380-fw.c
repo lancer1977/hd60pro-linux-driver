@@ -76,6 +76,37 @@ MODULE_PARM_DESC(fw_upload_path,
 	"the original path was removed. Never set outside a deliberate "
 	"console-instrument run with a verified /mnt/flash/yuan_demo_sdi_bak.");
 
+/*
+ * #56 runs C1-C5 (2026-09-19): five images, including one with stock content
+ * and only the version file changed, all came back not installed after a
+ * mains-off cold boot, while every card-side gate that depends on image
+ * content was cleared statically. The open question is whether the pushed
+ * bytes reach the card's buffer at all. Two things make that answerable
+ * without a cold boot:
+ *
+ *  - ep.ko's fw_store programs the inbound window as START = BAR0+0x60,
+ *    LIMIT = START+size-1, TARGET = card phys, at offsets 0x40/0x48/0x10 of
+ *    its translation block - and that block is what this driver maps as
+ *    BAR5: on a fresh boot BAR5[0x40] reads 0, after BEGIN_FW_DL it reads
+ *    BAR0_base+0x60 (seen in the probe-time property-201 read-back).
+ *  - the window is a plain address-match region into card DRAM, so a host
+ *    read of BAR0+0x60+i should return what was written there.
+ *
+ * fw_upload_commit=0 stops after the read-back: no COMMIT_FW, no card
+ * reboot, the card's daemons keep running. The card keeps one MemMgr buffer
+ * of `size` bytes until its next boot, which is the price of not killing
+ * the pipeline.
+ */
+static bool fw_upload_commit = true;
+module_param(fw_upload_commit, bool, 0444);
+MODULE_PARM_DESC(fw_upload_commit,
+	"#56: with fw_upload_path, send COMMIT_FW after the push (def:1). "
+	"0 = BEGIN_FW_DL + push + read-back only; the card is left running.");
+
+#define MZ0380_FW_WIN_START   0x40  /* BAR5: inbound window start (host address) */
+#define MZ0380_FW_WIN_LIMIT   0x48  /* BAR5: inbound window limit, inclusive */
+#define MZ0380_FW_WIN_TARGET  0x10  /* BAR5: inbound window target (card phys) */
+
 /* Pre-removal upload protocol constants (RE-confirmed from e60MZ0380.X64.SYS,
  * see RE_FINDINGS.md and commit 6b1d434's log). Scoped to this file only -
  * not restored to mz0380-reg.h - so the opt-in nature of fw_upload_path is
@@ -114,6 +145,59 @@ static void mz0380_fw_upload_write_buffer(struct mz0380_dev *dev,
 	wmb();
 }
 
+static void mz0380_fw_upload_log_window(struct mz0380_dev *dev,
+					const char *when)
+{
+	pr_info("%s: fw_upload_path: window %s: BAR5[0x40]=%08x BAR5[0x48]=%08x BAR5[0x10]=%08x BAR5[0x30]=%08x BAR5[0x38]=%08x\n",
+		dev->name, when,
+		mz_cfg_read(dev, MZ0380_FW_WIN_START),
+		mz_cfg_read(dev, MZ0380_FW_WIN_LIMIT),
+		mz_cfg_read(dev, MZ0380_FW_WIN_TARGET),
+		mz_cfg_read(dev, 0x30), mz_cfg_read(dev, 0x38));
+}
+
+/*
+ * Read the whole blob back through the window and compare word by word.
+ * Reports the first mismatch, the mismatch count and how many words came
+ * back as all-ones (the PCIe "unsupported request" signature), plus the
+ * first and last word so a shifted/offset landing is recognisable.
+ */
+static void mz0380_fw_upload_verify(struct mz0380_dev *dev,
+				    const u8 *data, size_t len)
+{
+	size_t words = len / 4, i;
+	size_t bad = 0, ones = 0, first_bad = 0;
+	u32 first_exp = 0, first_got = 0;
+	u32 w0, wlast;
+
+	rmb();
+	w0 = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER);
+	for (i = 0; i < words; i++) {
+		u32 exp = get_unaligned_le32(data + i * 4);
+		u32 got = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER + i * 4);
+
+		if (got == U32_MAX)
+			ones++;
+		if (got != exp) {
+			if (!bad) {
+				first_bad = i * 4;
+				first_exp = exp;
+				first_got = got;
+			}
+			bad++;
+		}
+	}
+	wlast = words ? mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER +
+				     (words - 1) * 4) : 0;
+
+	pr_info("%s: fw_upload_path: read-back %zu words: %zu mismatched, %zu all-ones; word0 got=%08x exp=%08x; last got=%08x exp=%08x\n",
+		dev->name, words, bad, ones, w0, get_unaligned_le32(data),
+		wlast, words ? get_unaligned_le32(data + (words - 1) * 4) : 0);
+	if (bad)
+		pr_info("%s: fw_upload_path: first mismatch at +0x%zx: got=%08x exp=%08x\n",
+			dev->name, first_bad, first_got, first_exp);
+}
+
 /*
  * BEGIN_FW_DL -> push blob -> COMMIT_FW -> wait for the card to reboot into
  * it. Copied from the pre-removal mz0380_fw_upload_blob(), same opcode
@@ -132,6 +216,8 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 	pr_warn("%s: fw_upload_path set - UPLOADING %zu bytes and forcing a card reboot (~21s). #56 console-instrument opt-in path, NOT standing driver behaviour.\n",
 		dev->name, size);
 
+	mz0380_fw_upload_log_window(dev, "before BEGIN");
+
 	params[0] = (u32)size;
 	ret = mz0380_send_command(dev, MZ0380_FW_UPLOAD_CMD_BEGIN,
 				  params, 1, &status, 2000);
@@ -141,7 +227,18 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 		return ret;
 	}
 
+	mz0380_fw_upload_log_window(dev, "after BEGIN ack");
+
 	mz0380_fw_upload_write_buffer(dev, data, size);
+
+	mz0380_fw_upload_log_window(dev, "after push");
+	mz0380_fw_upload_verify(dev, data, size);
+
+	if (!fw_upload_commit) {
+		pr_info("%s: fw_upload_path: fw_upload_commit=0, NOT sending COMMIT_FW - card left running its own image\n",
+			dev->name);
+		return 0;
+	}
 
 	ret = mz0380_send_command(dev, MZ0380_FW_UPLOAD_CMD_COMMIT,
 				  NULL, 0, &status, 0);
