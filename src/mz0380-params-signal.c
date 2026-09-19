@@ -743,6 +743,26 @@ module_param_named(aic_pre_start_settle_ms, mz0380_aic_pre_start_settle_ms, uint
 MODULE_PARM_DESC(aic_pre_start_settle_ms,
 		 "hd-pro60 #56: msleep after the pre-START SET_AIC resend, before op 0x06 (def:0)");
 
+bool mz0380_aic_raw_dword0_set;
+module_param_named(aic_raw_dword0_set, mz0380_aic_raw_dword0_set, bool, 0644);
+MODULE_PARM_DESC(aic_raw_dword0_set,
+		 "hd-pro60 #56: when 1, SET_AIC payload word 0 (cmd+4..7) is taken verbatim from aic_raw_dword0 (def:0)");
+
+unsigned int mz0380_aic_raw_dword0;
+module_param_named(aic_raw_dword0, mz0380_aic_raw_dword0, uint, 0644);
+MODULE_PARM_DESC(aic_raw_dword0,
+		 "hd-pro60 #56: raw SET_AIC word 0 used when aic_raw_dword0_set=1 (Windows call1 shape: byte0=input idx, byte1=chs, bytes2-3=bits)");
+
+bool mz0380_aic_resend_raw_dword0_set;
+module_param_named(aic_resend_raw_dword0_set, mz0380_aic_resend_raw_dword0_set, bool, 0644);
+MODULE_PARM_DESC(aic_resend_raw_dword0_set,
+		 "hd-pro60 #56: when 1, the pre-START SET_AIC resend uses aic_resend_raw_dword0 as word 0 instead of the normal payload (def:0)");
+
+unsigned int mz0380_aic_resend_raw_dword0;
+module_param_named(aic_resend_raw_dword0, mz0380_aic_resend_raw_dword0, uint, 0644);
+MODULE_PARM_DESC(aic_resend_raw_dword0,
+		 "hd-pro60 #56: raw word 0 for the pre-START resend when aic_resend_raw_dword0_set=1 (Windows call2 shape 0x00100104)");
+
 unsigned int mz0380_aic_channels = 2;
 module_param_named(aic_channels, mz0380_aic_channels, uint, 0644);
 MODULE_PARM_DESC(aic_channels, "M33: SET_AIC channel_num (def:2)");

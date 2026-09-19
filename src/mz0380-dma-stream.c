@@ -162,6 +162,8 @@ static void mz0380_aic_payload(u32 aic[4])
 	aic[0] = (mz0380_aic_channels & 0xff) |
 		 ((u32)(mz0380_aic_channels == 1 ? 1 : 0) << 8) |
 		 ((u32)(mz0380_aic_bits & 0xffff) << 16);
+	if (mz0380_aic_raw_dword0_set)
+		aic[0] = mz0380_aic_raw_dword0;
 	aic[1] = mz0380_aic_freq;
 	aic[2] = (mz0380_aic_period_frames & 0xffff) |
 		 ((u32)(mz0380_aic_periods & 0xffff) << 16);
@@ -605,10 +607,10 @@ vic_done:
 		mz0380_aic_payload(aic);
 		ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS, aic,
 					  ARRAY_SIZE(aic), NULL, 2000);
-		pr_info("%s: stream start: SET_AIC(on=1, %u ch, %u bit, %u Hz, %u frames x %u periods) ret=%d\n",
+		pr_info("%s: stream start: SET_AIC(on=1, %u ch, %u bit, %u Hz, %u frames x %u periods) ret=%d, words=%08x %08x %08x %08x\n",
 			dev->name, mz0380_aic_channels, mz0380_aic_bits,
 			mz0380_aic_freq, mz0380_aic_period_frames,
-			mz0380_aic_periods, ret);
+			mz0380_aic_periods, ret, aic[0], aic[1], aic[2], aic[3]);
 		if (!ret) {
 			dev->aic_armed = true;
 			aic_newly_armed = !was_armed;
@@ -726,10 +728,12 @@ vic_done:
 		int aic2_ret;
 
 		mz0380_aic_payload(aic2);
+		if (mz0380_aic_resend_raw_dword0_set)
+			aic2[0] = mz0380_aic_resend_raw_dword0;
 		aic2_ret = mz0380_send_command(dev, MZ0380_CMD_SET_AIC_PARAMS, aic2,
 					       ARRAY_SIZE(aic2), NULL, 2000);
-		pr_info("%s: stream start: hd-pro60 #56 SET_AIC(on=1) re-sent before op 0x06, ret=%d, settle %u ms\n",
-			dev->name, aic2_ret, mz0380_aic_pre_start_settle_ms);
+		pr_info("%s: stream start: hd-pro60 #56 SET_AIC(on=1) re-sent before op 0x06, ret=%d, settle %u ms, words=%08x %08x %08x %08x\n",
+			dev->name, aic2_ret, mz0380_aic_pre_start_settle_ms, aic2[0], aic2[1], aic2[2], aic2[3]);
 		if (mz0380_aic_pre_start_settle_ms)
 			msleep(mz0380_aic_pre_start_settle_ms);
 	}
