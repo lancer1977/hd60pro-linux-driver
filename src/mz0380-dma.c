@@ -284,7 +284,8 @@ err:
  * hd-pro60 #56: audio DMA-target probe. Copies mz0380_h264_bufs_alloc_iova()
  * exactly, at a 4 GiB-aligned IOVA above every other slot set (H.264 occupies
  * MZ0380_STREAM_NR_BUFS..2*MZ0380_STREAM_NR_BUFS-1, raw banks occupy
- * 2*MZ0380_STREAM_NR_BUFS..2*MZ0380_STREAM_NR_BUFS+MZ0380_RAW_PROBE_NR_BUFS-1),
+ * 2*MZ0380_STREAM_NR_BUFS..2*MZ0380_STREAM_NR_BUFS+MZ0380_RAW_PROBE_NR_BUFS-1,
+ * audio probe occupies 2*MZ0380_STREAM_NR_BUFS+MZ0380_RAW_PROBE_NR_BUFS..)
  * so this never aliases a live producer. Diagnostic only - never wired to any
  * ALSA delivery path.
  */
@@ -329,7 +330,7 @@ static int mz0380_audio_probe_bufs_alloc_iova(struct mz0380_dev *dev)
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
 		struct mz0380_stream_buf *b = &dev->audio_probe_bufs[i];
 		dma_addr_t iova = mz0380_dma_iova_base +
-			((u64)(MZ0380_STREAM_NR_BUFS + 4 + i) << 32);
+			((u64)(2 * MZ0380_STREAM_NR_BUFS + MZ0380_RAW_PROBE_NR_BUFS + i) << 32);
 		phys_addr_t phys;
 
 		b->pages = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
