@@ -50,7 +50,10 @@ Not implemented or not yet proved:
 
 - Audio capture limitations: audio-only start unsupported (trigger returns
   `-EIO` with a one-time dmesg hint); only 2-channel 48 kHz S16_LE; no
-  A/V sync; 8-channel mode not wired.
+  A/V sync; 8-channel mode not wired. As with any ALSA driver, a running
+  sound server (PipeWire/WirePlumber, PulseAudio) opens the new card's control
+  node and holds a module reference, so `rmmod` reports "in use" until it
+  releases the card.
 - Resolutions other than 1920x1080.
 - Native webcam-style compatibility with every camera application. The live
   V4L2 node currently advertises compressed H.264; applications that require
