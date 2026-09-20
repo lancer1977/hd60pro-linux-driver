@@ -207,6 +207,13 @@ void mz0380_audio_deliver_slot(struct mz0380_dev *dev, unsigned int slot)
 		memcpy(pcm->substream->runtime->dma_area, (u8 *)src + first, rest);
 		pcm->hw_ptr_bytes = rest;
 	}
+	/*
+	 * C15 on mugen: "invalid position: pos = 24000, buffer size = 24000"
+	 * - a slot that ends exactly on the buffer end must report 0, not
+	 * buffer_size, or ALSA rejects the pointer.
+	 */
+	if (pcm->hw_ptr_bytes >= pcm->buffer_bytes)
+		pcm->hw_ptr_bytes -= pcm->buffer_bytes;
 
 	dev->audio_slots_delivered++;
 	ss = pcm->substream;
