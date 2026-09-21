@@ -501,11 +501,12 @@ static void mz0380_dump_events(struct seq_file *m, struct mz0380_dev *dev)
 	}
 
 	seq_printf(m,
-		   "  audio: events=%d delivered=%llu dropped=%llu order_skips=%llu running=%d registered=%d\n",
+		   "  audio: events=%d delivered=%llu dropped=%llu order_skips=%llu silence=%llu running=%d registered=%d\n",
 		   atomic_read(&dev->irq_audio_count),
 		   dev->audio_slots_delivered,
 		   dev->audio_slots_dropped,
 		   dev->audio_order_skips,
+		   dev->audio_silence_slots,
 		   READ_ONCE(dev->audio_running),
 		   dev->audio_bufs_registered);
 

@@ -300,22 +300,21 @@ MODULE_PARM_DESC(enable_audio,
 
 /*
  * #57: the card only DMAs audio while its own video pipeline is streaming, and
- * that pipeline is started by the V4L2 node, not by the PCM. A client that
- * opens both at once (OBS does: its v4l2_input and pulse_input_capture sources
- * start within the same tick) loses that race and records a silent track for
- * the whole session. Rather than fail the PCM, prepare() waits here for the
- * pipeline; 0 restores the old fail-immediately behaviour.
+ * that pipeline is started by the V4L2 node, not by the PCM. Failing the stream
+ * in that window is what made OBS record a silent track for a whole session
+ * (it starts its v4l2_input and pulse_input_capture sources within the same
+ * tick) and what kept the card out of PipeWire's source list entirely, since
+ * WirePlumber probes the PCM before anything has opened video.
  *
- * 10 s, not 5: a cold STREAMON on the Bazzite host (C38) took 2.9 s of card
- * work on its own - 1.9 s of pre-STOP settle, then SET_VIC's spawn - and a
- * 5 s budget timed out 147 ms before the pipeline came up. A client whose
- * audio open leads its video open by a couple of seconds needs the headroom.
+ * With this set the PCM instead runs and hands back silence until the first
+ * real slot arrives - what a capture device with no signal yet should do.
+ * Clear it to get the old behaviour back: -EIO from the trigger.
  */
-unsigned int mz0380_audio_gate_timeout_ms = 10000;
-module_param_named(audio_gate_timeout_ms, mz0380_audio_gate_timeout_ms,
-		   uint, 0644);
-MODULE_PARM_DESC(audio_gate_timeout_ms,
-		 "how long a PCM prepare() waits for the video pipeline before giving up, ms (0 = do not wait; def:10000)");
+bool mz0380_audio_prestart_silence = true;
+module_param_named(audio_prestart_silence, mz0380_audio_prestart_silence,
+		   bool, 0644);
+MODULE_PARM_DESC(audio_prestart_silence,
+		 "feed silence until the video pipeline starts instead of failing the PCM with -EIO (def:1)");
 
 unsigned int mz0380_video_ring_entries = 16;
 module_param_named(video_ring_entries, mz0380_video_ring_entries,

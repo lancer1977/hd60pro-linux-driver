@@ -77,7 +77,6 @@ static int mz0380_dev_setup(struct mz0380_dev *dev)
 	mutex_init(&dev->h264_delivery_lock);
 	init_waitqueue_head(&dev->fw_wait);
 	init_waitqueue_head(&dev->cmd_wait);
-	init_waitqueue_head(&dev->audio_gate_wait);
 	spin_lock_init(&dev->buf_lock);
 	spin_lock_init(&dev->event_lock);
 	spin_lock_init(&dev->frame_event_lock);

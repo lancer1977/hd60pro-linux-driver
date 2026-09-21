@@ -383,14 +383,7 @@ struct mz0380_dev {
 	u64 audio_slots_delivered;     /* copied into the ALSA ring */
 	u64 audio_slots_dropped;       /* event arrived, no running substream */
 	u64 audio_order_skips;         /* slot arrived out of the expected order */
-	/*
-	 * #57: the card only DMAs audio while its video pipeline is up, and the
-	 * pipeline is started by the V4L2 node, never by the PCM. Woken when
-	 * mz0380_dma_start() has both started the pipeline and had SET_BUF
-	 * op 0x03 acked, so a PCM prepare() can wait for the gate to open
-	 * instead of failing the race against a concurrent video open.
-	 */
-	wait_queue_head_t audio_gate_wait;
+	u64 audio_silence_slots;       /* pre-start silence fed while the pipeline was down */
 	/* Opt-in Windows-parity window-0 banks: op 0x02 then independent op 0x08. */
 	struct mz0380_raw_probe_buf {
 		void *va;
@@ -990,7 +983,7 @@ extern bool mz0380_mst_win_output;
 extern unsigned int mz0380_mst_ad;
 extern bool mz0380_dma_handshake;
 extern bool mz0380_enable_audio;
-extern unsigned int mz0380_audio_gate_timeout_ms;
+extern bool mz0380_audio_prestart_silence;
 extern unsigned int mz0380_video_ring_entries;
 extern unsigned int mz0380_video_ring_entry_size;
 
