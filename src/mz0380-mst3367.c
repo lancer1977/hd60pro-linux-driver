@@ -496,19 +496,70 @@ static int mz0380_mst3367_read_edid_chunk(struct mz0380_dev *dev,
 				  ARRAY_SIZE(params), NULL, 500);
 	if (ret)
 		return ret;
-	/* the reply payload lands back in the PARAM slots */
+	/*
+	 * #60: the payload lands in PARAM2..PARAM9, NOT PARAM1. mz0380_send_command()
+	 * writes params[i] to MZ0380_MB_PARAM(i + 1) (mz0380-mailbox.c), so params[0]
+	 * - the descriptor - occupies PARAM1 and the 32 data bytes occupy PARAM2..9,
+	 * exactly as the write_s packet above documents.
+	 *
+	 * This read used to start at PARAM(1 + i), so byte 0 of every "EDID" chunk was
+	 * the descriptor read straight back: off=0 produced a0 00 20 00, which is
+	 * le32(0xa0 | (0 << 8) | (32 << 16)) - the params[0] we had just written. The
+	 * verify could therefore never match, and "nothing is holding the EDID at
+	 * 0xa0" was emitted on every load regardless of what the store actually held.
+	 */
 	for (i = 0; i < MZ0380_EDID_CHUNK / sizeof(u32); i++) {
-		u32 v = mz_mmio_read(dev, MZ0380_MB_PARAM(1 + i));
+		u32 v = mz_mmio_read(dev, MZ0380_MB_PARAM(2 + i));
 
 		memcpy(buf + i * sizeof(u32), &v, sizeof(v));
 	}
 	return 0;
 }
 
+/*
+ * #60: verify the whole 256-byte store against what we pushed, not just the
+ * first 32 bytes. Offset 128 is the CEA extension - the half that carries the
+ * HDMI VSDB - so a store holding only block 0 makes a source negotiate DVI with
+ * no audio island, which is indistinguishable from "no EDID" unless it is
+ * checked separately. Returns the number of chunks that matched.
+ */
+static unsigned int mz0380_mst3367_verify_edid(struct mz0380_dev *dev)
+{
+	unsigned int off, good = 0;
+
+	for (off = 0; off < MZ0380_EDID_SIZE; off += MZ0380_EDID_CHUNK) {
+		u8 got[MZ0380_EDID_CHUNK];
+		int ret;
+
+		memset(got, 0, sizeof(got));
+		ret = mz0380_mst3367_read_edid_chunk(dev, off, got);
+		if (ret) {
+			pr_warn("%s: EDID verify @%3u: read failed (%d)\n",
+				dev->name, off, ret);
+			continue;
+		}
+		if (!memcmp(got, &mz0380_edid_default[off], MZ0380_EDID_CHUNK)) {
+			good++;
+			continue;
+		}
+		/*
+		 * All-poison means the firmware NAKed and left our bytes alone -
+		 * a genuinely absent store, as opposed to a wrong-content one.
+		 */
+		pr_warn("%s: EDID verify @%3u: MISMATCH%s (got %02x %02x %02x %02x, want %02x %02x %02x %02x)\n",
+			dev->name, off,
+			got[0] == 0xa5 && got[1] == 0xa5 && got[2] == 0xa5 &&
+			got[3] == 0xa5 ? " [poison - NAK, nothing answered]" : "",
+			got[0], got[1], got[2], got[3],
+			mz0380_edid_default[off + 0], mz0380_edid_default[off + 1],
+			mz0380_edid_default[off + 2], mz0380_edid_default[off + 3]);
+	}
+	return good;
+}
+
 static int mz0380_mst3367_load_edid(struct mz0380_dev *dev)
 {
-	u8 verify[MZ0380_EDID_CHUNK];
-	unsigned int off;
+	unsigned int off, good;
 	int ret;
 
 	/*
@@ -555,20 +606,20 @@ static int mz0380_mst3367_load_edid(struct mz0380_dev *dev)
 	}
 
 	/*
-	 * M69: verify with the clean NAK detector while the mux still points
-	 * at the local store. Header bytes 1..6 of a valid EDID are 0xff - a
-	 * value the poison (0xa5) cannot fake.
+	 * M69/#60: verify the whole store while the mux still points at it. The
+	 * poison (0xa5) cannot fake a match, so a chunk that compares equal to
+	 * what we pushed is proof the store answered with our own bytes.
 	 */
-	memset(verify, 0, sizeof(verify));
-	ret = mz0380_mst3367_read_edid_chunk(dev, 0, verify);
-	if (!ret && verify[1] == 0xff && verify[2] == 0xff && verify[6] == 0xff)
-		pr_info("%s: EDID READ-BACK OK (%02x %02x %02x %02x %02x %02x %02x %02x) - a real store holds our EDID\n",
-			dev->name, verify[0], verify[1], verify[2], verify[3],
-			verify[4], verify[5], verify[6], verify[7]);
+	good = mz0380_mst3367_verify_edid(dev);
+	if (good == MZ0380_EDID_SIZE / MZ0380_EDID_CHUNK)
+		pr_info("%s: EDID READ-BACK OK - all %u bytes verified, CEA extension at 128 included; a real store holds our EDID\n",
+			dev->name, MZ0380_EDID_SIZE);
+	else if (good)
+		pr_warn("%s: EDID read-back PARTIAL - %u/%u chunks match. A store holding block 0 but not the CEA extension makes a source negotiate DVI with no audio\n",
+			dev->name, good, MZ0380_EDID_SIZE / MZ0380_EDID_CHUNK);
 	else
-		pr_warn("%s: EDID read-back failed (ret=%d, first bytes %02x %02x %02x %02x) - nothing is holding the EDID at 0xa0\n",
-			dev->name, ret, verify[0], verify[1], verify[2],
-			verify[3]);
+		pr_warn("%s: EDID read-back failed - no chunk matched; nothing is holding the EDID at 0x%02x\n",
+			dev->name, MZ0380_EDID_I2C_DEV);
 
 	/* hand the store back to the connector side, as Windows does */
 	mz0380_gpio_set(dev, MZ0380_GPIO_EDID_MUX, 0);
