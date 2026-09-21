@@ -366,12 +366,29 @@ void mz0380_mst3367_output_diag(struct mz0380_dev *dev, const char *tag)
 		mst3367_status_locked(r55) ? "LOCKED" : "no-lock",
 		ab, ad, ae, b0, b1, b2, b3, b4, b5, b7, r51,
 		b2_01, b2_02, b2_07);
+	/*
+	 * #60: hdcapm's RxTmdsGetType bit map does NOT hold on this part - do not
+	 * assert a link type from it. Measured on .178 2026-09-21, the same
+	 * b1_01=0x80 (bit2 clear, which hdcapm calls DVI) was read on BOTH a dead
+	 * link (R55=03 no-lock, 0 frames) AND a link that was simultaneously
+	 * carrying 2054 H.264 frames and real HDMI audio - a DVI link carries no
+	 * audio at all, so the "DVI" reading was simply wrong. The same line also
+	 * reported "HDCP absent" (bit0) next to "ACTIVE (encrypted)" (0x34 bit7),
+	 * which cannot both be true.
+	 *
+	 * The label used to editorialise ("source fell back - EDID?") and that sent
+	 * a real debugging session down a blind alley. R55 lock, printed above, is
+	 * the discriminator that actually tracked the two cases. Print the raw
+	 * registers and the hdcapm reading, flag the contradiction, claim nothing.
+	 */
 	if (link_read)
-		pr_info("%s: link [%s]: B1 01=%02x 34=%02x -> %s, HDCP %s%s | B2 0b=%02x 0c=%02x 0e=%02x 48=%02x, input colorspace %s\n",
+		pr_info("%s: link [%s]: B1 01=%02x 34=%02x -> hdcapm-decode says %s/HDCP-%s%s%s | B2 0b=%02x 0c=%02x 0e=%02x 48=%02x, input colorspace %s\n",
 			dev->name, tag, b1_01, b1_34,
-			(b1_01 & 0x04) ? "HDMI" : "DVI (source fell back - EDID?)",
+			(b1_01 & 0x04) ? "HDMI" : "DVI",
 			(b1_01 & 0x01) ? "present" : "absent",
 			(b1_34 & 0x80) ? ", ACTIVE (encrypted)" : "",
+			(!(b1_01 & 0x01) && (b1_34 & 0x80)) ?
+				" [CONTRADICTORY - do not trust this decode, see R55 lock above]" : "",
 			b2_0b, b2_0c, b2_0e, b2_48,
 			/* hdcapm MST3367_HdmiGetPacketColor: B2 0x48 bits 6:5 */
 			(b2_48 & 0x60) == 0x00 ? "RGB" :
