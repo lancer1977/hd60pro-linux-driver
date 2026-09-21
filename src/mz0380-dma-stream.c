@@ -793,6 +793,12 @@ vic_done:
 	dev->pipeline_source_interlaced = interlaced;
 	WRITE_ONCE(dev->pipeline_start_failed, false);
 	dev->pipeline_attach_count++;
+	/*
+	 * #57: release any ALSA prepare() parked on the audio gate. Audio SET_BUF
+	 * (op 0x03) was already acked above, so both halves of the gate condition
+	 * are true by the time a waiter re-evaluates it.
+	 */
+	wake_up_all(&dev->audio_gate_wait);
 	return 0;
 
 err_events:

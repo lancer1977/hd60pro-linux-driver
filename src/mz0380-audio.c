@@ -2,13 +2,17 @@
 /*
  *  Driver for MZ0380 based capture cards.
  *
- *  Experimental ALSA HDMI audio scaffold.
+ *  ALSA HDMI audio capture (hd-pro60 #57).
  *
- *  The card can extract PCM from HDMI, but the host address, ownership and
- *  completion protocol for that PCM is not yet proven.  dev->audio_ring is
- *  therefore never allocated or programmed and enable_audio remains off by
- *  default.  SET_AIC in the video path is separate: it releases tinyvenc's
- *  audio_ready gate and is required even when no ALSA device is registered.
+ *  The card DMAs 2-ch S16_LE PCM into the four MZ0380_AUDIO_SLOT_BYTES slots
+ *  registered by SET_BUF op 0x03 and signals each completion through the
+ *  BAR0+0x30 EVENT bits; mz0380_audio_deliver_slot() copies a completed slot
+ *  into the substream ring.  enable_audio is still off by default.
+ *
+ *  Audio only flows while the card's video pipeline is streaming, and that
+ *  pipeline is started by the V4L2 node - see the audio gate below.  SET_AIC
+ *  in the video path is separate: it releases tinyvenc's audio_ready gate and
+ *  is required even when no ALSA device is registered.
  */
 
 #include "mz0380.h"
@@ -99,12 +103,70 @@ static int mz0380_pcm_hw_free(struct snd_pcm_substream *ss)
 	return 0;
 }
 
+/*
+ * The audio gate: the card only DMAs PCM while its video pipeline is up, and
+ * SET_BUF op 0x03 must have been acked for that stream so the slots the EVENT
+ * bits refer to actually point at our buffers.  Both halves are set by
+ * mz0380_dma_start(), which is driven by the V4L2 node, never by the PCM.
+ */
+static bool mz0380_audio_gate_open(struct mz0380_dev *dev)
+{
+	return READ_ONCE(dev->pipeline_running) &&
+	       READ_ONCE(dev->audio_bufs_registered);
+}
+
+static void mz0380_audio_gate_complain(struct mz0380_dev *dev)
+{
+	/*
+	 * Name this card's own node.  The old message hard-coded /dev/video0,
+	 * which on a host that also has a v4l2loopback (OBS's virtual camera
+	 * claims video0) sends the user to the wrong device and keeps them
+	 * broken - observed on the Bazzite host, hd-pro60 #57.
+	 */
+	pr_warn_ratelimited("%s: audio capture needs the video pipeline running - start capture on /dev/%s first (pipeline_running=%d audio_bufs_registered=%d)\n",
+			    dev->name, video_device_node_name(&dev->vdev),
+			    READ_ONCE(dev->pipeline_running),
+			    READ_ONCE(dev->audio_bufs_registered));
+}
+
 static int mz0380_pcm_prepare(struct snd_pcm_substream *ss)
 {
 	struct mz0380_dev *dev = snd_pcm_substream_chip(ss);
 	struct mz0380_pcm *pcm = dev->snd_pcm;
+	unsigned long timeout;
+	long left;
 
 	pcm->hw_ptr_bytes = 0;
+
+	if (mz0380_audio_gate_open(dev))
+		return 0;
+
+	if (!mz0380_audio_gate_timeout_ms) {
+		mz0380_audio_gate_complain(dev);
+		return -EIO;
+	}
+
+	/*
+	 * Wait for the gate instead of failing.  A client that opens video and
+	 * audio at the same moment (OBS starts its v4l2_input and
+	 * pulse_input_capture sources within the same tick) would otherwise lose
+	 * the race and record a silent track for the whole session, with no way
+	 * to recover short of restarting it.  prepare() runs in process context
+	 * before trigger(), so it is the one PCM callback allowed to sleep.
+	 */
+	timeout = msecs_to_jiffies(mz0380_audio_gate_timeout_ms);
+	left = wait_event_interruptible_timeout(dev->audio_gate_wait,
+						mz0380_audio_gate_open(dev),
+						timeout);
+	if (left < 0)
+		return -ERESTARTSYS;
+	if (!left) {
+		mz0380_audio_gate_complain(dev);
+		return -EIO;
+	}
+
+	pr_info("%s: audio capture: video pipeline came up after %u ms, PCM prepared\n",
+		dev->name, jiffies_to_msecs(timeout - left));
 	return 0;
 }
 
@@ -118,13 +180,16 @@ static int mz0380_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 		/*
+		 * prepare() already waited for the gate, so reaching this with
+		 * it shut means the pipeline went down in between - a backstop,
+		 * not the normal path.
+		 *
 		 * -EIO, not -EAGAIN: arecord treats EAGAIN from a start as
 		 * "wait 100 ms and retry" and spins forever (seen on mugen,
 		 * C14); EIO makes it print "read error" and exit.
 		 */
-		if (!READ_ONCE(dev->pipeline_running) || !dev->audio_bufs_registered) {
-			pr_info_once("%s: audio capture requires the video pipeline to be started (open /dev/video0 first)\n",
-				     dev->name);
+		if (!mz0380_audio_gate_open(dev)) {
+			mz0380_audio_gate_complain(dev);
 			return -EIO;
 		}
 		/*

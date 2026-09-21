@@ -298,6 +298,20 @@ module_param_named(enable_audio, mz0380_enable_audio, bool, 0444);
 MODULE_PARM_DESC(enable_audio,
 		 "register the ALSA capture device (2-ch S16_LE 48 kHz; needs the video pipeline running; def:0)");
 
+/*
+ * #57: the card only DMAs audio while its own video pipeline is streaming, and
+ * that pipeline is started by the V4L2 node, not by the PCM. A client that
+ * opens both at once (OBS does: its v4l2_input and pulse_input_capture sources
+ * start within the same tick) loses that race and records a silent track for
+ * the whole session. Rather than fail the PCM, prepare() waits here for the
+ * pipeline; 0 restores the old fail-immediately behaviour.
+ */
+unsigned int mz0380_audio_gate_timeout_ms = 5000;
+module_param_named(audio_gate_timeout_ms, mz0380_audio_gate_timeout_ms,
+		   uint, 0644);
+MODULE_PARM_DESC(audio_gate_timeout_ms,
+		 "how long a PCM prepare() waits for the video pipeline before giving up, ms (0 = do not wait; def:5000)");
+
 unsigned int mz0380_video_ring_entries = 16;
 module_param_named(video_ring_entries, mz0380_video_ring_entries,
 		   uint, 0444);
