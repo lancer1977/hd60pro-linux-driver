@@ -305,12 +305,17 @@ MODULE_PARM_DESC(enable_audio,
  * start within the same tick) loses that race and records a silent track for
  * the whole session. Rather than fail the PCM, prepare() waits here for the
  * pipeline; 0 restores the old fail-immediately behaviour.
+ *
+ * 10 s, not 5: a cold STREAMON on the Bazzite host (C38) took 2.9 s of card
+ * work on its own - 1.9 s of pre-STOP settle, then SET_VIC's spawn - and a
+ * 5 s budget timed out 147 ms before the pipeline came up. A client whose
+ * audio open leads its video open by a couple of seconds needs the headroom.
  */
-unsigned int mz0380_audio_gate_timeout_ms = 5000;
+unsigned int mz0380_audio_gate_timeout_ms = 10000;
 module_param_named(audio_gate_timeout_ms, mz0380_audio_gate_timeout_ms,
 		   uint, 0644);
 MODULE_PARM_DESC(audio_gate_timeout_ms,
-		 "how long a PCM prepare() waits for the video pipeline before giving up, ms (0 = do not wait; def:5000)");
+		 "how long a PCM prepare() waits for the video pipeline before giving up, ms (0 = do not wait; def:10000)");
 
 unsigned int mz0380_video_ring_entries = 16;
 module_param_named(video_ring_entries, mz0380_video_ring_entries,
