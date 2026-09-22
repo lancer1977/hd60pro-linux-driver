@@ -206,10 +206,7 @@ static int mz0380_raw_probe_bufs_alloc_iova(struct mz0380_dev *dev)
 			ret = -ENOMEM;
 			goto err;
 		}
-		memset(b->va,
-		       i < MZ0380_STREAM_NR_BUFS ?
-			MZ0380_RAW_PROBE_BANK0_POISON :
-			MZ0380_RAW_PROBE_BANK1_POISON,
+		memset(b->va, mz0380_raw_poison_byte(i),
 		       MZ0380_RAW_PROBE_BUF_SIZE);
 		pr_info("%s: raw-bank probe bank%u buf[%u] mapped at IOVA 0x%llx (%u pages)\n",
 			dev->name, i / MZ0380_STREAM_NR_BUFS,
@@ -436,8 +433,8 @@ static int mz0380_raw_probe_program_bufs(struct mz0380_dev *dev)
 	params[0] = MZ0380_STREAM_VIDEO_CHANNEL;
 	params[1] = MZ0380_RAW_PROBE_BUF_SIZE;
 	for (bank = 0; bank < MZ0380_RAW_PROBE_BANKS; bank++) {
-		u8 poison = bank ? MZ0380_RAW_PROBE_BANK1_POISON :
-				   MZ0380_RAW_PROBE_BANK0_POISON;
+		u8 poison = mz0380_raw_poison_byte(bank *
+						   MZ0380_STREAM_NR_BUFS);
 		int ret;
 
 		for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
@@ -1078,6 +1075,8 @@ void mz0380_frame_events_start(struct mz0380_dev *dev)
 	dev->raw_ladder_samples = 0;
 	dev->raw_ladder_prefix = 0;
 	dev->raw_ladder_nonprefix = 0;
+	dev->raw_ladder_nonprefix_touched = 0;
+	dev->raw_ladder_nonprefix_filled = 0;
 	dev->raw_ladder_empty = 0;
 	dev->raw_ladder_full = 0;
 	dev->raw_ladder_worst_touched = 0;

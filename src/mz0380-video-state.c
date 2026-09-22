@@ -180,7 +180,9 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 					   mz0380_raw_frame_bytes(dev) /
 						   MZ0380_RAW_LADDER_RUNGS);
 				if (dev->raw_ladder_worst_valid)
-					seq_printf(m, "               first non-prefix: touched=%08x filled=%08x - a high rung written with a lower one clear; the ascending-write assumption does NOT hold\n",
+					seq_printf(m, "               %llu clear-pass (vs poison 0xa5 - STRONG), %llu fill-pass (vs clear byte; chroma 0x80 aliases neutral colour - WEAK)\n               first non-prefix: touched=%08x filled=%08x\n",
+						   (unsigned long long)dev->raw_ladder_nonprefix_touched,
+						   (unsigned long long)dev->raw_ladder_nonprefix_filled,
 						   dev->raw_ladder_worst_touched,
 						   dev->raw_ladder_worst_filled);
 				else if (partial)

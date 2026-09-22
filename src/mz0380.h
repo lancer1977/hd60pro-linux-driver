@@ -453,9 +453,21 @@ struct mz0380_dev {
 	 * counted separately because a run that is all-full has sampled only
 	 * finished frames and has therefore tested nothing.
 	 */
+	/*
+	 * The two masks are NOT equally strong evidence, so they are counted
+	 * apart. `touched` compares against the poison dword 0xa5a5a5a5, and
+	 * eight consecutive bytes of 0xa5 in real video is not a thing that
+	 * happens - a hole there is the card's write order. `filled` compares
+	 * against the plane's clear byte, and for chroma that is 0x80, which is
+	 * also exactly neutral chroma: eight bytes of 0x80 is an ordinary grey
+	 * region. A fill-pass hole is therefore a lead, not a proof, and saying
+	 * so is the difference between this measurement and a guess.
+	 */
 	u64 raw_ladder_samples;
 	u64 raw_ladder_prefix;
 	u64 raw_ladder_nonprefix;
+	u64 raw_ladder_nonprefix_touched;
+	u64 raw_ladder_nonprefix_filled;
 	u64 raw_ladder_empty;
 	u64 raw_ladder_full;
 	u32 raw_ladder_worst_touched;
@@ -894,6 +906,7 @@ extern unsigned int mz0380_poison_byte;
 extern unsigned int mz0380_raw_clear_byte;
 extern unsigned int mz0380_raw_clear_chroma;
 extern bool mz0380_raw_ladder_diag;
+extern unsigned int mz0380_raw_probe_poison;
 bool mz0380_raw_ladder_selftest(void);
 extern bool mz0380_raw_full_range;
 extern bool mz0380_aic_on;

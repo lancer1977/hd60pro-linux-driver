@@ -584,9 +584,32 @@ report:
  * first sentinel sits at the LAST dword of the frame, so it can only read as
  * written once the transfer has reached the end. That holds if the card writes
  * the frame in ascending address order, which is what a linear DMA does and
- * what the extent measurements in M209/M215 are consistent with, but it has not
- * been proven directly. If torn frames ever show up, this is the assumption to
- * doubt first.
+ * what the extent measurements in M209/M215 are consistent with.
+ *
+ * #61 measured it rather than leaving it inferred, and it holds - with a stated
+ * resolution. A 32-rung ladder across the frame (mz0380_raw_ladder_sample)
+ * records which rungs the card has written as a bitmask; an ascending write can
+ * only ever produce a prefix, so a hole is a high rung written with a lower one
+ * still clear, which ascending order cannot do. Over ~28,000 samples on .178 at
+ * 1920x1080p60, ~5,000 of which caught a slot mid-write, NO reproducible hole
+ * was found: every candidate moved when the poison byte was changed
+ * (raw_probe_poison), which is M37's signature of picture data that happens to
+ * equal the poison rather than a real write hole. One early run showed 694
+ * holes all at a single rung; they vanished when the screen content changed.
+ *
+ * What that does and does not license:
+ *
+ *   - Within a plane, the write frontier advanced monotonically at every
+ *     observation. The last-dword sentinel is a sound completion test.
+ *   - The resolution is 97,200 bytes at 1080p - about 50 luma rows. A
+ *     reordering finer than one rung spacing is invisible to this test and is
+ *     NOT excluded.
+ *   - ACROSS planes the assumption is still false, and independently so: M238
+ *     found luma complete with chroma untouched. That is why
+ *     mz0380_raw_probe_chroma_filled() exists and must stay.
+ *
+ * So if torn frames ever show up, doubt the sub-rung granularity or the
+ * cross-plane ordering - not the frontier being monotonic.
  */
 /*
  * M222: hand one raw I420 frame to V4L2.

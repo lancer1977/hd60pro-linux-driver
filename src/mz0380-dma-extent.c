@@ -69,6 +69,25 @@ void mz0380_frame_buffers_poison_start(struct mz0380_dev *dev)
 		dev->name, dev->frame_poison_byte);
 }
 
+/*
+ * #61: one place decides the raw-bank poison byte, so the override applies
+ * everywhere the poison is written or compared. A param that changed the fill
+ * but not the test - or either one but not the other - would not be a
+ * discriminator, it would be a new bug.
+ */
+u8 mz0380_raw_poison_byte(u32 idx)
+{
+	if (mz0380_raw_probe_poison)
+		return mz0380_raw_probe_poison & 0xff;
+	return idx < MZ0380_STREAM_NR_BUFS ? MZ0380_RAW_PROBE_BANK0_POISON :
+					     MZ0380_RAW_PROBE_BANK1_POISON;
+}
+
+static u32 mz0380_raw_poison_dword(u32 idx)
+{
+	return 0x01010101u * mz0380_raw_poison_byte(idx);
+}
+
 int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
 				  size_t *length)
 {
@@ -84,10 +103,7 @@ int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
 	if (!b->va)
 		return -EINVAL;
 
-	poison = 0x01010101u *
-		(idx < MZ0380_STREAM_NR_BUFS ?
-		 MZ0380_RAW_PROBE_BANK0_POISON :
-		 MZ0380_RAW_PROBE_BANK1_POISON);
+	poison = mz0380_raw_poison_dword(idx);
 	dwords = b->va;
 	dma_rmb();
 	for (i = MZ0380_RAW_PROBE_BUF_SIZE / sizeof(*dwords); i; i--) {
@@ -137,13 +153,6 @@ int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
  * landed and nothing is delivered at all. One of the fixed offsets was even
  * negative below 1048576 bytes.
  */
-static u32 mz0380_raw_poison_dword(u32 idx)
-{
-	return 0x01010101u * (idx < MZ0380_STREAM_NR_BUFS ?
-			      MZ0380_RAW_PROBE_BANK0_POISON :
-			      MZ0380_RAW_PROBE_BANK1_POISON);
-}
-
 size_t mz0380_raw_frame_bytes(struct mz0380_dev *dev)
 {
 	u32 w = dev->capture.width;
@@ -158,12 +167,24 @@ size_t mz0380_raw_frame_bytes(struct mz0380_dev *dev)
  * Sentinels, as offsets into the frame rather than fixed byte positions.
  *
  * [0] is the last dword and is what actually proves completion, because an
- * ascending DMA writes it last. The rest are spread back through the frame and
- * exist only because that ascending-order assumption is inferred rather than
- * proven: if the card ever writes planes or blocks out of order, requiring the
- * others too still rejects a partial frame. They cost a false negative only
- * when real pixel data happens to equal the poison dword at one of these
- * offsets, which costs one frame and cannot persist.
+ * ascending DMA writes it last. The rest are spread back through the frame as
+ * defence in depth: if the card ever writes planes or blocks out of order,
+ * requiring the others too still rejects a partial frame. They cost a false
+ * negative only when real pixel data happens to equal the poison dword at one
+ * of these offsets, which costs one frame and cannot persist.
+ *
+ * #61 measured the ordering these depend on instead of inferring it. The write
+ * frontier was monotonic at every one of ~5,000 mid-write observations on .178,
+ * so [0] alone is a sound completion test at rung resolution (97,200 bytes at
+ * 1080p); a reordering finer than that is not excluded, and across planes the
+ * assumption is still false (M238). Keep all four.
+ *
+ * Note for anyone retuning these offsets: they are even 64ths of the frame, and
+ * mz0380_raw_ladder_offsets() relies on that to place its rungs on ODD 64ths so
+ * a rung can never land on a sentinel. The ladder's first version did collide,
+ * and spent 43 of its first 80 "findings" reporting this function's own poison
+ * back as evidence of out-of-order DMA. Move these to odd 64ths and the ladder
+ * has to move too.
  */
 static void mz0380_raw_sentinel_offsets(size_t frame, size_t out[4])
 {
@@ -401,14 +422,34 @@ static void mz0380_raw_ladder_offsets(size_t frame,
 
 	/*
 	 * Ascending, unlike mz0380_raw_sentinel_offsets(), so that "prefix"
-	 * means what it says. Rung 0 sits at the start of the frame, and the
-	 * top rung is pinned to the final dword pair - the one the whole
-	 * completion test rests on - rather than left wherever the division
-	 * happens to land.
+	 * means what it says.
+	 *
+	 * ODD 64ths, and that is the whole point of the arithmetic. The first
+	 * version of this put rung k at frame/32*k and pinned the top rung to
+	 * the final dword pair, and it produced a beautifully repeatable
+	 * result that was entirely an artifact: 43 of the first 80 non-prefix
+	 * masks were exactly 0x3efeffff, holes at rungs 16, 24, 30 and 31. Those
+	 * are frame/2, frame-frame/4, frame-frame/16 and frame-4 - precisely
+	 * mz0380_raw_sentinel_offsets(), which M239 re-poisons before every
+	 * copy to arm the tear check. The ladder was reading the driver's own
+	 * poison and reporting it as the card writing out of order.
+	 *
+	 * It was not bad luck. The sentinels sit at 32, 48 and 60 sixty-fourths
+	 * of the frame plus its last dword, all of which are multiples of
+	 * frame/32, so an evenly-divided 32-rung ladder cannot avoid them. Odd
+	 * 64ths - 1, 3, 5 ... 63 - are disjoint from every even 64th by
+	 * construction, so no rung can ever land on a sentinel no matter how
+	 * the sentinel offsets are later retuned, as long as they stay even
+	 * 64ths.
+	 *
+	 * The cost is that the top rung sits at 63/64 of the frame rather than
+	 * its final dword, so the ladder does not observe the last 1/64. That
+	 * is the right trade: the final dword belongs to the completion test,
+	 * and this measures the SHAPE of the write frontier, not completion.
 	 */
 	for (k = 0; k < MZ0380_RAW_LADDER_RUNGS; k++)
-		out[k] = round_down(frame / MZ0380_RAW_LADDER_RUNGS * k, 4);
-	out[MZ0380_RAW_LADDER_RUNGS - 1] = round_down(frame - 8, 4);
+		out[k] = round_down(frame / (2 * MZ0380_RAW_LADDER_RUNGS) *
+				    (2 * k + 1), 4);
 }
 
 /*
@@ -509,6 +550,10 @@ void mz0380_raw_ladder_sample(struct mz0380_dev *dev, u32 idx)
 	 * something that happened later in the same run.
 	 */
 	dev->raw_ladder_nonprefix++;
+	if (!tprefix)
+		dev->raw_ladder_nonprefix_touched++;
+	if (!fprefix)
+		dev->raw_ladder_nonprefix_filled++;
 	if (!dev->raw_ladder_worst_valid) {
 		dev->raw_ladder_worst_touched = touched;
 		dev->raw_ladder_worst_filled = filled;
@@ -832,9 +877,7 @@ void mz0380_raw_probe_buffer_repoison(struct mz0380_dev *dev, u32 idx)
 	b = &dev->raw_probe_bufs[idx];
 	if (!b->va)
 		return;
-	poison = idx < MZ0380_STREAM_NR_BUFS ?
-		 MZ0380_RAW_PROBE_BANK0_POISON :
-		 MZ0380_RAW_PROBE_BANK1_POISON;
+	poison = mz0380_raw_poison_byte(idx);
 	memset(b->va, poison, MZ0380_RAW_PROBE_BUF_SIZE);
 	dma_wmb();
 }
@@ -1049,9 +1092,7 @@ void mz0380_raw_probe_bufs_dump(struct mz0380_dev *dev, const char *tag)
 	dma_rmb();
 	for (i = 0; i < MZ0380_RAW_PROBE_NR_BUFS; i++) {
 		const struct mz0380_raw_probe_buf *b = &dev->raw_probe_bufs[i];
-		const u8 poison = i < MZ0380_STREAM_NR_BUFS ?
-			MZ0380_RAW_PROBE_BANK0_POISON :
-			MZ0380_RAW_PROBE_BANK1_POISON;
+		const u8 poison = mz0380_raw_poison_byte(i);
 		const u8 *p = b->va;
 		size_t extent = 0, touched = 0, off;
 

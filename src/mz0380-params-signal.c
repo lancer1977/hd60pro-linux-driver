@@ -297,6 +297,30 @@ MODULE_PARM_DESC(raw_clear_byte,
  * answers a question about the hardware rather than doing anything for the
  * capture, so it has no business running when nobody is asking.
  */
+/*
+ * #61: M37's lesson, applied to the raw banks.
+ *
+ * The first ladder run reported 694 strong-mask holes, every one of them at
+ * rung 17 and nowhere else. A genuinely out-of-order DMA scatters holes; a
+ * single fixed rung across thousands of frames is either something structural
+ * about that offset or - far more likely with a static picture on screen -
+ * eight bytes of real luma that happen to equal the poison dword, aliasing
+ * identically on every frame.
+ *
+ * M37 already names the way to tell those apart for the stream buffers: "re-run
+ * with e.g. 0x55 to tell a real write hole from a data-equals-poison
+ * collision". The raw banks had no such knob - their poison was a compile-time
+ * constant - so this adds one. Aliasing depends on the poison value and moves
+ * or vanishes when it changes; a real write-order hole does not care what byte
+ * we filled the buffer with and stays exactly where it was.
+ *
+ * 0 means "use the per-bank defaults", 0xa5 and 0x5a.
+ */
+unsigned int mz0380_raw_probe_poison;
+module_param_named(raw_probe_poison, mz0380_raw_probe_poison, uint, 0644);
+MODULE_PARM_DESC(raw_probe_poison,
+	"#61: override the raw-bank poison byte for both banks (def:0 = per-bank 0xa5/0x5a). Re-run a raw_ladder_diag measurement with a different value to tell a real out-of-order write from picture data that happens to equal the poison");
+
 bool mz0380_raw_ladder_diag;
 module_param_named(raw_ladder_diag, mz0380_raw_ladder_diag, bool, 0644);
 MODULE_PARM_DESC(raw_ladder_diag,
