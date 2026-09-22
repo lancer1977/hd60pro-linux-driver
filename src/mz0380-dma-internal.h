@@ -45,6 +45,12 @@ int mz0380_infer_frame_length(struct mz0380_dev *dev, u32 idx,
 bool mz0380_raw_probe_frame_landed(struct mz0380_dev *dev, u32 idx);
 bool mz0380_raw_probe_frame_filled(struct mz0380_dev *dev, u32 idx);
 bool mz0380_raw_probe_chroma_filled(struct mz0380_dev *dev, u32 idx);
+/* #61: write-order ladder. Diagnostic only - delivers nothing, changes nothing. */
+void mz0380_raw_ladder_sample(struct mz0380_dev *dev, u32 idx);
+void mz0380_raw_ladder_scan(const void *va, size_t frame, u32 poison,
+			    u32 clear_luma, u32 clear_chroma,
+			    u32 *touched_out, u32 *filled_out);
+bool mz0380_raw_ladder_is_prefix(u32 mask);
 void mz0380_raw_probe_sentinel_repoison(struct mz0380_dev *dev, u32 idx);
 void mz0380_raw_probe_sentinel_save(struct mz0380_dev *dev, u32 idx, u32 out[4]);
 void mz0380_raw_probe_sentinel_restore(struct mz0380_dev *dev, void *dst,

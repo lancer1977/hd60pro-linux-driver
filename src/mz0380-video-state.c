@@ -153,6 +153,41 @@ void mz0380_video_state_dump(struct seq_file *m, struct mz0380_dev *dev)
 				   (unsigned long long)dev->raw_dup_content,
 				   (unsigned long long)dev->raw_frames_torn,
 				   (unsigned long long)dev->raw_multi_landed);
+			/*
+			 * #61. Printed only when armed, so its absence is not
+			 * read as a clean result - "no ladder line" and "the
+			 * ladder found nothing" must not look the same.
+			 *
+			 * partial is the number that decides whether the run
+			 * means anything: samples that caught a slot mid-write.
+			 * A run whose samples are all empty or all full has
+			 * observed no frontier and has therefore tested
+			 * nothing, however many samples it took.
+			 */
+			if (mz0380_raw_ladder_diag) {
+				u64 partial = dev->raw_ladder_samples -
+					      dev->raw_ladder_empty -
+					      dev->raw_ladder_full;
+
+				seq_printf(m, "  raw ladder : %llu samples, %llu prefix, %llu NON-PREFIX, %llu partial (%llu empty, %llu full) - %u rungs, %zu bytes apart (#61)\n",
+					   (unsigned long long)dev->raw_ladder_samples,
+					   (unsigned long long)dev->raw_ladder_prefix,
+					   (unsigned long long)dev->raw_ladder_nonprefix,
+					   (unsigned long long)partial,
+					   (unsigned long long)dev->raw_ladder_empty,
+					   (unsigned long long)dev->raw_ladder_full,
+					   MZ0380_RAW_LADDER_RUNGS,
+					   mz0380_raw_frame_bytes(dev) /
+						   MZ0380_RAW_LADDER_RUNGS);
+				if (dev->raw_ladder_worst_valid)
+					seq_printf(m, "               first non-prefix: touched=%08x filled=%08x - a high rung written with a lower one clear; the ascending-write assumption does NOT hold\n",
+						   dev->raw_ladder_worst_touched,
+						   dev->raw_ladder_worst_filled);
+				else if (partial)
+					seq_puts(m, "               no non-prefix mask seen; every observed frontier was contiguous from the start of the frame\n");
+				else
+					seq_puts(m, "               INCONCLUSIVE - no sample caught a slot mid-write, so nothing was tested\n");
+			}
 		}
 		/*
 		 * Labelled for what it is. "no signal : inactive" was read by

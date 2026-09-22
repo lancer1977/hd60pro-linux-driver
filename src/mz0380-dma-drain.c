@@ -794,8 +794,20 @@ mz0380_drain_raw_deliver(struct mz0380_dev *dev,
 	 * under M223, which is that fact seen from the other side. It is gone.
 	 */
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
-		if (!dev->raw_probe_bufs[i].va ||
-		    !mz0380_raw_probe_frame_landed(dev, i))
+		if (!dev->raw_probe_bufs[i].va)
+			continue;
+		/*
+		 * #61: sample the write-order ladder BEFORE the landed test,
+		 * and on every slot rather than only the ready ones. The whole
+		 * value of the measurement is in the slots that are still being
+		 * written - a slot that has landed is by definition finished,
+		 * and a finished frame's mask is all-ones no matter what order
+		 * the card wrote it in. Sampling only ready slots would produce
+		 * a run of perfect prefixes that proves nothing at all.
+		 */
+		if (mz0380_raw_ladder_diag)
+			mz0380_raw_ladder_sample(dev, i);
+		if (!mz0380_raw_probe_frame_landed(dev, i))
 			continue;
 		if (!mz0380_raw_probe_frame_filled(dev, i)) {
 			/* Cleared, not yet filled. Leave it to finish. */
@@ -830,6 +842,26 @@ mz0380_drain_raw_deliver(struct mz0380_dev *dev,
 		if (mz0380_raw_deliver_slot(dev, snapshot, slot)) {
 			dev->raw_next_slot = (slot + 1) %
 					     MZ0380_STREAM_NR_BUFS;
+			/*
+			 * #61: restore a known baseline for the next frame.
+			 *
+			 * Normal delivery re-poisons only the four sentinels,
+			 * which is right for the completeness test and useless
+			 * for the ladder: every other rung still holds the
+			 * frame just delivered, so it reads as written before
+			 * the card has touched it, and the mask is all-ones
+			 * from the first sample onwards. Without this the
+			 * ladder measures nothing but its own stale data.
+			 *
+			 * It costs a 4.6 MB memset per delivered frame, which
+			 * is exactly the cost M217 refused for the capture
+			 * path - hence the module param. Frame rate may drop
+			 * during a measurement run; that is not a problem here
+			 * and arguably helps, since a slower consumer catches
+			 * more slots mid-write, which is where the evidence is.
+			 */
+			if (mz0380_raw_ladder_diag)
+				mz0380_raw_probe_buffer_repoison(dev, slot);
 			pr_info_ratelimited("%s: raw scan landed=0x%x took slot %u (multi=%llu torn=%llu unfilled=%llu)\n",
 					    dev->name, landed, slot,
 					    (unsigned long long)dev->raw_multi_landed,

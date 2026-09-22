@@ -1074,6 +1074,15 @@ void mz0380_frame_events_start(struct mz0380_dev *dev)
 	 */
 	dev->raw_incomplete_tail = 0;
 	dev->raw_incomplete_chroma = 0;
+	/* #61: same reasoning - a ladder verdict must describe one session. */
+	dev->raw_ladder_samples = 0;
+	dev->raw_ladder_prefix = 0;
+	dev->raw_ladder_nonprefix = 0;
+	dev->raw_ladder_empty = 0;
+	dev->raw_ladder_full = 0;
+	dev->raw_ladder_worst_touched = 0;
+	dev->raw_ladder_worst_filled = 0;
+	dev->raw_ladder_worst_valid = false;
 	for (i = 0; i < MZ0380_RAW_PROBE_NR_BUFS; i++) {
 		dev->raw_probe_bufs[i].last_extent = 0;
 		dev->raw_probe_bufs[i].completions = 0;

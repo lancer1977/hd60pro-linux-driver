@@ -445,6 +445,22 @@ struct mz0380_dev {
 	u64 raw_incomplete_tail;
 	/* M238: slots whose luma was complete but whose CHROMA was not. */
 	u64 raw_incomplete_chroma;
+	/*
+	 * #61: write-order ladder. samples is every observation taken; prefix
+	 * and nonprefix partition it. A non-zero nonprefix is the whole point -
+	 * it means a high rung was written with a lower one still clear, which
+	 * an ascending DMA cannot do. empty and full are the degenerate ends,
+	 * counted separately because a run that is all-full has sampled only
+	 * finished frames and has therefore tested nothing.
+	 */
+	u64 raw_ladder_samples;
+	u64 raw_ladder_prefix;
+	u64 raw_ladder_nonprefix;
+	u64 raw_ladder_empty;
+	u64 raw_ladder_full;
+	u32 raw_ladder_worst_touched;
+	u32 raw_ladder_worst_filled;
+	bool raw_ladder_worst_valid;
 	/* M233: AUTO_POSITION re-arms issued, i.e. real acquisition losses. */
 	u64 mst_rearms;
 	/* M237: last CSC byte written to BANK0 0x92, and whether one ever was. */
@@ -877,6 +893,8 @@ extern unsigned int procfs_verbosity;
 extern unsigned int mz0380_poison_byte;
 extern unsigned int mz0380_raw_clear_byte;
 extern unsigned int mz0380_raw_clear_chroma;
+extern bool mz0380_raw_ladder_diag;
+bool mz0380_raw_ladder_selftest(void);
 extern bool mz0380_raw_full_range;
 extern bool mz0380_aic_on;
 extern bool mz0380_aic_every_frame;

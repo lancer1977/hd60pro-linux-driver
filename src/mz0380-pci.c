@@ -351,6 +351,19 @@ static int __init mz0380_init(void)
 	       (MZ0380_VERSION_CODE >> 8) & 0xff,
 	       MZ0380_VERSION_CODE & 0xff);
 
+	/*
+	 * #61: validate the write-order ladder before it is ever allowed to
+	 * report a result. It runs here rather than lazily on first use because
+	 * the sample path is a completion path - it cannot allocate - and
+	 * because a detector's own self-test belongs in the log next to the
+	 * results it vouches for. If it fails, the diagnostic disarms itself:
+	 * a broken detector reporting "clean" is worse than no detector, which
+	 * is the lesson of the EDID read-back that warned falsely for the life
+	 * of the project.
+	 */
+	if (!mz0380_raw_ladder_selftest())
+		mz0380_raw_ladder_diag = false;
+
 	ret = mz0380_proc_create();
 	if (ret < 0)
 		return ret;

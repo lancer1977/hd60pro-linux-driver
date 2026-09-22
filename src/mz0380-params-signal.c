@@ -292,6 +292,16 @@ module_param_named(raw_clear_byte, mz0380_raw_clear_byte, uint, 0644);
 MODULE_PARM_DESC(raw_clear_byte,
 	"M229: byte the card writes when clearing a raw slot before filling it (def:1). A slot whose last luma rows are entirely this value has not finished filling and is not delivered");
 
+/*
+ * #61. Off by default: it costs up to 64 reads per slot per completion, and it
+ * answers a question about the hardware rather than doing anything for the
+ * capture, so it has no business running when nobody is asking.
+ */
+bool mz0380_raw_ladder_diag;
+module_param_named(raw_ladder_diag, mz0380_raw_ladder_diag, bool, 0644);
+MODULE_PARM_DESC(raw_ladder_diag,
+	"#61: sample a 32-rung write-order ladder across each raw slot on every completion (def:0). An ascending DMA can only ever produce a prefix mask; a non-prefix one proves the card writes out of order, which would mean the last-dword sentinel does not guarantee a whole frame. Results in /proc/mz0380-state; self-tests at arm time");
+
 unsigned int mz0380_poison_byte = 0xaa;
 module_param_named(poison_byte, mz0380_poison_byte, uint, 0644);
 MODULE_PARM_DESC(poison_byte,
