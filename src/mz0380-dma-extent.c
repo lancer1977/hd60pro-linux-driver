@@ -69,6 +69,25 @@ void mz0380_frame_buffers_poison_start(struct mz0380_dev *dev)
 		dev->name, dev->frame_poison_byte);
 }
 
+/*
+ * #61: one place decides the raw-bank poison byte, so the override applies
+ * everywhere the poison is written or compared. A param that changed the fill
+ * but not the test - or either one but not the other - would not be a
+ * discriminator, it would be a new bug.
+ */
+u8 mz0380_raw_poison_byte(u32 idx)
+{
+	if (mz0380_raw_probe_poison)
+		return mz0380_raw_probe_poison & 0xff;
+	return idx < MZ0380_STREAM_NR_BUFS ? MZ0380_RAW_PROBE_BANK0_POISON :
+					     MZ0380_RAW_PROBE_BANK1_POISON;
+}
+
+static u32 mz0380_raw_poison_dword(u32 idx)
+{
+	return 0x01010101u * mz0380_raw_poison_byte(idx);
+}
+
 int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
 				  size_t *length)
 {
@@ -84,10 +103,7 @@ int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
 	if (!b->va)
 		return -EINVAL;
 
-	poison = 0x01010101u *
-		(idx < MZ0380_STREAM_NR_BUFS ?
-		 MZ0380_RAW_PROBE_BANK0_POISON :
-		 MZ0380_RAW_PROBE_BANK1_POISON);
+	poison = mz0380_raw_poison_dword(idx);
 	dwords = b->va;
 	dma_rmb();
 	for (i = MZ0380_RAW_PROBE_BUF_SIZE / sizeof(*dwords); i; i--) {
@@ -137,13 +153,6 @@ int mz0380_raw_probe_infer_length(struct mz0380_dev *dev, u32 idx,
  * landed and nothing is delivered at all. One of the fixed offsets was even
  * negative below 1048576 bytes.
  */
-static u32 mz0380_raw_poison_dword(u32 idx)
-{
-	return 0x01010101u * (idx < MZ0380_STREAM_NR_BUFS ?
-			      MZ0380_RAW_PROBE_BANK0_POISON :
-			      MZ0380_RAW_PROBE_BANK1_POISON);
-}
-
 size_t mz0380_raw_frame_bytes(struct mz0380_dev *dev)
 {
 	u32 w = dev->capture.width;
@@ -158,12 +167,23 @@ size_t mz0380_raw_frame_bytes(struct mz0380_dev *dev)
  * Sentinels, as offsets into the frame rather than fixed byte positions.
  *
  * [0] is the last dword and is what actually proves completion, because an
- * ascending DMA writes it last. The rest are spread back through the frame and
- * exist only because that ascending-order assumption is inferred rather than
- * proven: if the card ever writes planes or blocks out of order, requiring the
- * others too still rejects a partial frame. They cost a false negative only
- * when real pixel data happens to equal the poison dword at one of these
- * offsets, which costs one frame and cannot persist.
+ * ascending DMA writes it last. The rest are spread back through the frame as
+ * defence in depth: if the card ever writes planes or blocks out of order,
+ * requiring the others too still rejects a partial frame. They cost a false
+ * negative only when real pixel data happens to equal the poison dword at one
+ * of these offsets, which costs one frame and cannot persist.
+ *
+ * #61 adds a diagnostic to measure this ordering assumption. Until the
+ * stock-firmware hardware run is complete, no ordering claim follows from the
+ * diagnostic existing or from a prefix-only synthetic result. Keep all four
+ * sentinels regardless; the ladder cannot exclude reordering within one rung.
+ *
+ * Note for anyone retuning these offsets: they are even 64ths of the frame, and
+ * mz0380_raw_ladder_offsets() relies on that to place its rungs on ODD 64ths so
+ * a rung can never land on a sentinel. The ladder's first version did collide,
+ * and spent 43 of its first 80 "findings" reporting this function's own poison
+ * back as evidence of out-of-order DMA. Move these to odd 64ths and the ladder
+ * has to move too.
  */
 static void mz0380_raw_sentinel_offsets(size_t frame, size_t out[4])
 {
@@ -344,6 +364,333 @@ bool mz0380_raw_probe_chroma_filled(struct mz0380_dev *dev, u32 idx)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * #61: measure the write ORDER instead of assuming it.
+ *
+ * Everything above rests on one unproven sentence, stated in
+ * mz0380-dma-drain.c and again at mz0380_raw_sentinel_offsets(): the card
+ * writes a frame in ascending address order, so a written last dword means the
+ * whole transfer arrived. It has never been measured. M238 already showed it
+ * false ACROSS planes - luma can finish with chroma untouched - and the driver
+ * answered that with a second per-plane check rather than asking the question
+ * underneath. What is still unknown is whether the write is ascending WITHIN a
+ * plane. If it is not, a torn frame passes every test above, because the last
+ * dword gets written while the middle of the plane has not been.
+ *
+ * The test is a generalisation of the four sentinels, not a new mechanism. Lay
+ * rungs at ascending offsets across the whole frame and record which have been
+ * written as a BITMASK rather than as a boolean AND. An ascending write can
+ * only ever produce a PREFIX - some number of low rungs set, the rest clear.
+ * Any other mask contains a hole: a high rung written while a lower one was
+ * not, which ascending order cannot produce. That is the proof, and the hole
+ * positions give its granularity.
+ *
+ * Two masks, because the card writes each slot twice. M226 established the
+ * clear-then-fill sequence, so the poison is long gone before the picture
+ * arrives and one mask cannot see both passes:
+ *
+ *   touched - rung differs from the poison dword.       The CLEAR frontier.
+ *   filled  - rung differs from poison AND from the     The FILL frontier.
+ *             clear byte of the plane it falls in.
+ *
+ * Both must be prefixes independently, which is two tests from one sample. The
+ * clear byte is plane-dependent (luma 0x01, chroma 0x80), so each rung is
+ * classified by which plane its offset lands in.
+ *
+ * FALSE POSITIVES are the thing to be careful about here, and are why each rung
+ * reads two ADJACENT dwords and requires both to match. Real pixel data
+ * equalling the poison or clear dword at one rung is entirely plausible in flat
+ * content - a black frame is a field of 0x01 - and a single aliased rung in the
+ * middle of a prefix reads as a hole, which would be a false proof of exactly
+ * the thing being tested for. Requiring eight consecutive bytes makes that
+ * coincidence far rarer, and the raw mask is recorded rather than only a
+ * verdict, so a shallow one-rung hole can be told apart from a real
+ * out-of-order pattern by eye. A non-prefix observation is a lead, not a
+ * conclusion; the mask is the evidence.
+ *
+ * Diagnostic only - it changes nothing about what is delivered - and off by
+ * default, because it costs up to 2 * MZ0380_RAW_LADDER_RUNGS reads per slot
+ * per completion.
+ */
+static void mz0380_raw_ladder_offsets(size_t frame,
+				      size_t out[MZ0380_RAW_LADDER_RUNGS])
+{
+	unsigned int k;
+
+	/*
+	 * Ascending, unlike mz0380_raw_sentinel_offsets(), so that "prefix"
+	 * means what it says.
+	 *
+	 * ODD 64ths, and that is the whole point of the arithmetic. The first
+	 * version of this put rung k at frame/32*k and pinned the top rung to
+	 * the final dword pair, and it produced a beautifully repeatable
+	 * result that was entirely an artifact: 43 of the first 80 non-prefix
+	 * masks were exactly 0x3efeffff, holes at rungs 16, 24, 30 and 31. Those
+	 * are frame/2, frame-frame/4, frame-frame/16 and frame-4 - precisely
+	 * mz0380_raw_sentinel_offsets(), which M239 re-poisons before every
+	 * copy to arm the tear check. The ladder was reading the driver's own
+	 * poison and reporting it as the card writing out of order.
+	 *
+	 * It was not bad luck. The sentinels sit at 32, 48 and 60 sixty-fourths
+	 * of the frame plus its last dword, all of which are multiples of
+	 * frame/32, so an evenly-divided 32-rung ladder cannot avoid them. Odd
+	 * 64ths - 1, 3, 5 ... 63 - are disjoint from every even 64th by
+	 * construction, so no rung can ever land on a sentinel no matter how
+	 * the sentinel offsets are later retuned, as long as they stay even
+	 * 64ths.
+	 *
+	 * The cost is that the top rung sits at 63/64 of the frame rather than
+	 * its final dword, so the ladder does not observe the last 1/64. That
+	 * is the right trade: the final dword belongs to the completion test,
+	 * and this measures the SHAPE of the write frontier, not completion.
+	 */
+	for (k = 0; k < MZ0380_RAW_LADDER_RUNGS; k++)
+		out[k] = round_down(frame / (2 * MZ0380_RAW_LADDER_RUNGS) *
+				    (2 * k + 1), 4);
+}
+
+/*
+ * A rung counts as written only if BOTH dwords differ from the reference. One
+ * dword of coincidence is common in flat content; eight consecutive bytes of it
+ * is not.
+ */
+static bool mz0380_raw_ladder_rung_differs(const void *va, size_t off, u32 ref)
+{
+	const u32 *p = va + off;
+
+	return READ_ONCE(p[0]) != ref && READ_ONCE(p[1]) != ref;
+}
+
+/*
+ * An ascending write can produce 0b0000, 0b0001, 0b0011, 0b0111 ... and nothing
+ * else. Those are exactly the values for which mask + 1 clears every set bit.
+ */
+bool mz0380_raw_ladder_is_prefix(u32 mask)
+{
+	return ((mask + 1) & mask) == 0;
+}
+
+/*
+ * The mask builder, kept free of any dependence on the device so the self-test
+ * below can drive it against a synthetic buffer. A detector that has only ever
+ * been run on real captures and has only ever said "clean" has not been shown
+ * to work at all - that is finding #10 of the 2026-09-21 claims audit, and this
+ * split is what lets the claim be checked rather than assumed.
+ */
+void mz0380_raw_ladder_scan(const void *va, size_t frame, u32 poison,
+			    u32 clear_luma, u32 clear_chroma,
+			    u32 *touched_out, u32 *filled_out)
+{
+	size_t luma, off[MZ0380_RAW_LADDER_RUNGS];
+	u32 touched = 0, filled = 0;
+	unsigned int k;
+
+	mz0380_raw_ladder_offsets(frame, off);
+	/* I420: the luma plane is the first two thirds. */
+	luma = frame / 3 * 2;
+
+	for (k = 0; k < MZ0380_RAW_LADDER_RUNGS; k++) {
+		u32 clear = off[k] < luma ? clear_luma : clear_chroma;
+
+		if (!mz0380_raw_ladder_rung_differs(va, off[k], poison))
+			continue;
+		touched |= BIT(k);
+		if (mz0380_raw_ladder_rung_differs(va, off[k], clear))
+			filled |= BIT(k);
+	}
+
+	*touched_out = touched;
+	*filled_out = filled;
+}
+
+void mz0380_raw_ladder_sample(struct mz0380_dev *dev, u32 idx)
+{
+	const struct mz0380_raw_probe_buf *b;
+	size_t frame;
+	u32 touched, filled;
+	bool tprefix, fprefix;
+
+	if (idx >= MZ0380_RAW_PROBE_NR_BUFS)
+		return;
+	b = &dev->raw_probe_bufs[idx];
+	if (!b->va)
+		return;
+
+	frame = mz0380_raw_frame_bytes(dev);
+	if (frame < MZ0380_RAW_LADDER_MIN_FRAME ||
+	    frame > MZ0380_RAW_PROBE_BUF_SIZE)
+		return;
+
+	dma_rmb();
+	mz0380_raw_ladder_scan(b->va, frame, mz0380_raw_poison_dword(idx),
+			       0x01010101u * (mz0380_raw_clear_byte & 0xff),
+			       0x01010101u * (mz0380_raw_clear_chroma & 0xff),
+			       &touched, &filled);
+
+	dev->raw_ladder_samples++;
+	if (!touched)
+		dev->raw_ladder_empty++;
+	else if (touched == GENMASK(MZ0380_RAW_LADDER_RUNGS - 1, 0))
+		dev->raw_ladder_full++;
+
+	tprefix = mz0380_raw_ladder_is_prefix(touched);
+	fprefix = mz0380_raw_ladder_is_prefix(filled);
+	if (tprefix && fprefix) {
+		dev->raw_ladder_prefix++;
+		return;
+	}
+
+	/*
+	 * The interesting case. Keep the FIRST one seen rather than the last: a
+	 * counter that overwrites itself makes the run un-reconstructable, and
+	 * the earliest hole is the one least likely to be explained away by
+	 * something that happened later in the same run.
+	 */
+	dev->raw_ladder_nonprefix++;
+	if (!tprefix)
+		dev->raw_ladder_nonprefix_touched++;
+	if (!fprefix)
+		dev->raw_ladder_nonprefix_filled++;
+	if (!dev->raw_ladder_worst_valid) {
+		dev->raw_ladder_worst_touched = touched;
+		dev->raw_ladder_worst_filled = filled;
+		dev->raw_ladder_worst_valid = true;
+	}
+	pr_warn_ratelimited("%s: RAW LADDER non-prefix on slot %u: touched=%0*x filled=%0*x (%s) - a high rung is written with a lower one clear, which ascending order cannot produce. See #61.\n",
+			    dev->name, idx,
+			    MZ0380_RAW_LADDER_RUNGS / 4, touched,
+			    MZ0380_RAW_LADDER_RUNGS / 4, filled,
+			    !tprefix && !fprefix ? "both passes" :
+			    !tprefix ? "clear pass" : "fill pass");
+}
+
+/*
+ * #61: prove the detector detects.
+ *
+ * The failure this whole exercise exists to avoid is a diagnostic that reports
+ * "clean" because it cannot see, which is exactly how the EDID read-back
+ * warning survived the entire project (audit finding #1) and how the NO-SIGNAL
+ * placeholder passed for live capture (finding #10). A ladder that has only
+ * ever returned prefix masks on real hardware is indistinguishable from a
+ * ladder wired to a constant - unless it is shown rejecting a pattern it is
+ * supposed to reject.
+ *
+ * So before the ladder is allowed to make any claim, it is run against
+ * synthetic buffers with known answers: one genuine ascending prefix, one with
+ * a deliberate hole, one where the clear pass has completed but the fill has
+ * not, and the degenerate empty and full cases. If any verdict is wrong the
+ * diagnostic disarms itself rather than reporting results nobody should
+ * believe.
+ *
+ * MZ0380_RAW_LADDER_MIN_FRAME is used rather than a real 1080p frame so this
+ * costs one small allocation and no hardware.
+ */
+static void mz0380_raw_ladder_paint(void *va, size_t frame, u32 fill, u32 mask,
+				    u32 value)
+{
+	size_t off[MZ0380_RAW_LADDER_RUNGS];
+	unsigned int k;
+	size_t i;
+
+	for (i = 0; i < frame / 4; i++)
+		((u32 *)va)[i] = fill;
+
+	mz0380_raw_ladder_offsets(frame, off);
+	for (k = 0; k < MZ0380_RAW_LADDER_RUNGS; k++) {
+		u32 *p;
+
+		if (!(mask & BIT(k)))
+			continue;
+		p = va + off[k];
+		/* Both dwords, because one is not enough to count as written. */
+		p[0] = value;
+		p[1] = value;
+	}
+}
+
+bool mz0380_raw_ladder_selftest(void)
+{
+	static const struct {
+		const char *name;
+		u32 paint;		/* rungs to overwrite */
+		u32 want_touched;
+		u32 want_filled;
+		bool want_nonprefix;
+	} cases[] = {
+		{ "empty",	0x00000000, 0x00000000, 0x00000000, false },
+		{ "prefix",	0x00000007, 0x00000007, 0x00000007, false },
+		{ "full",	0xffffffff, 0xffffffff, 0xffffffff, false },
+		/* The one that matters: a high rung written over a clear one. */
+		{ "hole",	0x00100007, 0x00100007, 0x00100007, true  },
+		/* Adversarial: only the top rung - what a tear looks like. */
+		{ "top only",	0x80000000, 0x80000000, 0x80000000, true  },
+	};
+	const size_t frame = MZ0380_RAW_LADDER_MIN_FRAME;
+	const u32 poison = 0x01010101u * MZ0380_RAW_PROBE_BANK0_POISON;
+	const u32 clear_luma = 0x01010101u * 0x01;
+	const u32 clear_chroma = 0x01010101u * 0x80;
+	const u32 data = 0xdeadbeefu;
+	bool ok = true;
+	unsigned int c;
+	void *va;
+
+	BUILD_BUG_ON(MZ0380_RAW_LADDER_RUNGS != 32);
+
+	va = vzalloc(frame);
+	if (!va) {
+		pr_warn("mz0380: raw ladder self-test skipped - no memory\n");
+		return false;
+	}
+
+	for (c = 0; c < ARRAY_SIZE(cases); c++) {
+		u32 touched, filled;
+
+		mz0380_raw_ladder_paint(va, frame, poison, cases[c].paint, data);
+		mz0380_raw_ladder_scan(va, frame, poison, clear_luma,
+				       clear_chroma, &touched, &filled);
+
+		if (touched != cases[c].want_touched ||
+		    filled != cases[c].want_filled ||
+		    mz0380_raw_ladder_is_prefix(touched) ==
+			    cases[c].want_nonprefix) {
+			pr_warn("mz0380: raw ladder self-test FAILED on '%s': touched=%08x (want %08x) filled=%08x (want %08x)\n",
+				cases[c].name, touched, cases[c].want_touched,
+				filled, cases[c].want_filled);
+			ok = false;
+		}
+	}
+
+	/*
+	 * The two-pass case, which the masks above cannot express: every rung
+	 * holds the luma clear byte, so the card has cleared the slot but
+	 * written no picture. touched must be full and filled must be empty.
+	 * Getting this wrong is how M229's original bug delivered black frames.
+	 */
+	mz0380_raw_ladder_paint(va, frame, clear_luma, 0, 0);
+	{
+		u32 touched, filled;
+
+		mz0380_raw_ladder_scan(va, frame, poison, clear_luma,
+				       clear_chroma, &touched, &filled);
+		/*
+		 * Rungs in the chroma third compare against 0x80 and so read as
+		 * filled; only the luma rungs must read clear-but-not-filled.
+		 */
+		if (touched != GENMASK(MZ0380_RAW_LADDER_RUNGS - 1, 0) ||
+		    (filled & 0x000000ffu)) {
+			pr_warn("mz0380: raw ladder self-test FAILED on 'cleared not filled': touched=%08x (want ffffffff) filled=%08x (low byte must be 0)\n",
+				touched, filled);
+			ok = false;
+		}
+	}
+
+	vfree(va);
+	if (ok)
+		pr_info("mz0380: raw ladder self-test OK - %u synthetic cases, holes and top-only tears both detected\n",
+			(unsigned int)ARRAY_SIZE(cases) + 1);
+	return ok;
 }
 
 /*
@@ -529,9 +876,7 @@ void mz0380_raw_probe_buffer_repoison(struct mz0380_dev *dev, u32 idx)
 	b = &dev->raw_probe_bufs[idx];
 	if (!b->va)
 		return;
-	poison = idx < MZ0380_STREAM_NR_BUFS ?
-		 MZ0380_RAW_PROBE_BANK0_POISON :
-		 MZ0380_RAW_PROBE_BANK1_POISON;
+	poison = mz0380_raw_poison_byte(idx);
 	memset(b->va, poison, MZ0380_RAW_PROBE_BUF_SIZE);
 	dma_wmb();
 }
@@ -746,9 +1091,7 @@ void mz0380_raw_probe_bufs_dump(struct mz0380_dev *dev, const char *tag)
 	dma_rmb();
 	for (i = 0; i < MZ0380_RAW_PROBE_NR_BUFS; i++) {
 		const struct mz0380_raw_probe_buf *b = &dev->raw_probe_bufs[i];
-		const u8 poison = i < MZ0380_STREAM_NR_BUFS ?
-			MZ0380_RAW_PROBE_BANK0_POISON :
-			MZ0380_RAW_PROBE_BANK1_POISON;
+		const u8 poison = mz0380_raw_poison_byte(i);
 		const u8 *p = b->va;
 		size_t extent = 0, touched = 0, off;
 

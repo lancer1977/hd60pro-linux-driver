@@ -500,6 +500,20 @@
 #define MZ0380_RAW_PROBE_BANK1_POISON   0x5a
 
 /*
+ * #61: write-order ladder. 32 rungs so a whole observation is one u32 mask and
+ * the prefix test is a single (m + 1) & m - anything wider needs a bitmap and
+ * loses that. At 1080p the rungs land ~145 KB apart, which is the resolution
+ * any "the write is ascending" conclusion is limited to; a reordering finer
+ * than that is invisible to this test and has to be stated as such.
+ *
+ * The floor exists because rung spacing must stay above the 8 bytes a rung
+ * reads: below it the rungs start to overlap and the mask stops meaning
+ * anything. 4096 / 32 = 128 bytes per rung, comfortably clear.
+ */
+#define MZ0380_RAW_LADDER_RUNGS         32
+#define MZ0380_RAW_LADDER_MIN_FRAME     4096
+
+/*
  * M36/M37 (proven on hw): the fake-frame path lands ONE fully contiguous raw
  * burst of exactly 1920 x 1107 x 1.5 bytes (0x30a5c0) in buf0 within 450 ms
  * of START, then the card's encoder loop parks (M39: a fresh spawn yields

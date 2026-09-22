@@ -269,6 +269,10 @@ tarball:
 	tar zcf ../mz0380-dev-$(shell date +%Y%m%d-%H%M%S).tgz $(TARFILES)
 
 #
+.PHONY: test-ladder
+test-ladder:
+	python3 tests/test-raw-ladder-classifier.py
+
 # Smoke tests (require an actual capture + HDMI source).
 #
 list:

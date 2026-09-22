@@ -584,9 +584,32 @@ report:
  * first sentinel sits at the LAST dword of the frame, so it can only read as
  * written once the transfer has reached the end. That holds if the card writes
  * the frame in ascending address order, which is what a linear DMA does and
- * what the extent measurements in M209/M215 are consistent with, but it has not
- * been proven directly. If torn frames ever show up, this is the assumption to
- * doubt first.
+ * what the extent measurements in M209/M215 are consistent with.
+ *
+ * #61 measured it rather than leaving it inferred, and it holds - with a stated
+ * resolution. A 32-rung ladder across the frame (mz0380_raw_ladder_sample)
+ * records which rungs the card has written as a bitmask; an ascending write can
+ * only ever produce a prefix, so a hole is a high rung written with a lower one
+ * still clear, which ascending order cannot do. Over ~28,000 samples on .178 at
+ * 1920x1080p60, ~5,000 of which caught a slot mid-write, NO reproducible hole
+ * was found: every candidate moved when the poison byte was changed
+ * (raw_probe_poison), which is M37's signature of picture data that happens to
+ * equal the poison rather than a real write hole. One early run showed 694
+ * holes all at a single rung; they vanished when the screen content changed.
+ *
+ * What that does and does not license:
+ *
+ *   - Within a plane, the write frontier advanced monotonically at every
+ *     observation. The last-dword sentinel is a sound completion test.
+ *   - The resolution is 97,200 bytes at 1080p - about 50 luma rows. A
+ *     reordering finer than one rung spacing is invisible to this test and is
+ *     NOT excluded.
+ *   - ACROSS planes the assumption is still false, and independently so: M238
+ *     found luma complete with chroma untouched. That is why
+ *     mz0380_raw_probe_chroma_filled() exists and must stay.
+ *
+ * So if torn frames ever show up, doubt the sub-rung granularity or the
+ * cross-plane ordering - not the frontier being monotonic.
  */
 /*
  * M222: hand one raw I420 frame to V4L2.
@@ -794,8 +817,20 @@ mz0380_drain_raw_deliver(struct mz0380_dev *dev,
 	 * under M223, which is that fact seen from the other side. It is gone.
 	 */
 	for (i = 0; i < MZ0380_STREAM_NR_BUFS; i++) {
-		if (!dev->raw_probe_bufs[i].va ||
-		    !mz0380_raw_probe_frame_landed(dev, i))
+		if (!dev->raw_probe_bufs[i].va)
+			continue;
+		/*
+		 * #61: sample the write-order ladder BEFORE the landed test,
+		 * and on every slot rather than only the ready ones. The whole
+		 * value of the measurement is in the slots that are still being
+		 * written - a slot that has landed is by definition finished,
+		 * and a finished frame's mask is all-ones no matter what order
+		 * the card wrote it in. Sampling only ready slots would produce
+		 * a run of perfect prefixes that proves nothing at all.
+		 */
+		if (mz0380_raw_ladder_diag)
+			mz0380_raw_ladder_sample(dev, i);
+		if (!mz0380_raw_probe_frame_landed(dev, i))
 			continue;
 		if (!mz0380_raw_probe_frame_filled(dev, i)) {
 			/* Cleared, not yet filled. Leave it to finish. */
@@ -830,6 +865,26 @@ mz0380_drain_raw_deliver(struct mz0380_dev *dev,
 		if (mz0380_raw_deliver_slot(dev, snapshot, slot)) {
 			dev->raw_next_slot = (slot + 1) %
 					     MZ0380_STREAM_NR_BUFS;
+			/*
+			 * #61: restore a known baseline for the next frame.
+			 *
+			 * Normal delivery re-poisons only the four sentinels,
+			 * which is right for the completeness test and useless
+			 * for the ladder: every other rung still holds the
+			 * frame just delivered, so it reads as written before
+			 * the card has touched it, and the mask is all-ones
+			 * from the first sample onwards. Without this the
+			 * ladder measures nothing but its own stale data.
+			 *
+			 * It costs a 4.6 MB memset per delivered frame, which
+			 * is exactly the cost M217 refused for the capture
+			 * path - hence the module param. Frame rate may drop
+			 * during a measurement run; that is not a problem here
+			 * and arguably helps, since a slower consumer catches
+			 * more slots mid-write, which is where the evidence is.
+			 */
+			if (mz0380_raw_ladder_diag)
+				mz0380_raw_probe_buffer_repoison(dev, slot);
 			pr_info_ratelimited("%s: raw scan landed=0x%x took slot %u (multi=%llu torn=%llu unfilled=%llu)\n",
 					    dev->name, landed, slot,
 					    (unsigned long long)dev->raw_multi_landed,
