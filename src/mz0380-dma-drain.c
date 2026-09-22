@@ -1283,6 +1283,10 @@ void mz0380_dma_drain_video(struct mz0380_dev *dev)
 		 * endpoint early and overwrite an older queued token before its copy.
 		 */
 		while (mz0380_frame_event_pop(dev, &snapshot)) {
+			if (snapshot.kind == MZ0380_EVT_AUDIO) {
+				mz0380_dma_drain_audio_snapshot(dev, &snapshot);
+				continue;	/* audio never sets `handled` — no enc_stat ack for it */
+			}
 			handled = true;
 			mz0380_drain_frame_snapshot(dev, &snapshot);
 		}
@@ -1333,11 +1337,48 @@ void mz0380_dma_drain_video(struct mz0380_dev *dev)
 }
 EXPORT_SYMBOL_GPL(mz0380_dma_drain_video);
 
-void mz0380_dma_drain_audio(struct mz0380_dev *dev)
+void mz0380_dma_drain_audio_snapshot(struct mz0380_dev *dev,
+				      const struct mz0380_frame_event *ev)
 {
-	/* audio DMA path is milestone-C follow-up; no-op for now */
+	unsigned int bits, n, initial_slot;
+	int last = -1;
+
+	/* Extract the slot indices from the audio event bits */
+	bits = (ev->event & MZ0380_AUDIO_EVENT_MASK) >> MZ0380_AUDIO_EVENT_SHIFT;
+
+	/* Save the initial slot to walk the completion mask in ring order. */
+	initial_slot = dev->audio_next_slot;
+
+	/* Walk slots in order: initial, initial+1, initial+2, initial+3 (mod 4) */
+	for (n = 0; n < 4; n++) {
+		unsigned int slot = (initial_slot + n) & 3;
+
+		if (!(bits & BIT(slot)))
+			continue;
+
+		/* Check for out-of-order delivery */
+		if (slot != dev->audio_next_slot)
+			dev->audio_order_skips++;
+
+		mz0380_audio_deliver_slot(dev, slot);
+		dev->audio_next_slot = (slot + 1) & 3;
+		last = slot;
+	}
+
+	/*
+	 * Cross-check: the precursor evidence measured BAR0+0x4c =
+	 * a5a5a5a0..a3 in
+	 * lock-step with EVENT bit 16+n, i.e. its low nibble is the slot that
+	 * just completed. With one bit per event it must equal the slot we
+	 * delivered last; log and count a disagreement, never act on it.
+	 */
+	if (last >= 0 && (ev->payload[2] & 0xf) != (unsigned int)last) {
+		pr_info_ratelimited("%s: audio slot cross-check: EVENT bits 0x%x delivered slot %d but BAR0+0x4c=%08x\n",
+				    dev->name, bits, last, ev->payload[2]);
+		dev->audio_order_skips++;
+	}
 }
-EXPORT_SYMBOL_GPL(mz0380_dma_drain_audio);
+EXPORT_SYMBOL_GPL(mz0380_dma_drain_audio_snapshot);
 
 void mz0380_drain_work_fn(struct work_struct *w)
 {

@@ -36,6 +36,7 @@
 #include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
+#include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-dv-timings.h>
 #include <media/videobuf2-v4l2.h>
@@ -147,30 +148,6 @@ enum mz0380_fw_state {
 };
 
 /*
- * Per-ring DMA bookkeeping. Video and audio each get one of these.
- *
- * The card writes encoded H.264 NALs (video) or PCM samples (audio)
- * into the page-aligned `buf` allocation, structured as `nr_entries`
- * fixed-size slots of `entry_size` bytes each. Card advances its tail;
- * host advances head as it consumes.
- */
-struct mz0380_ring {
-	void *buf;              /* kernel virt addr                       */
-	dma_addr_t dma;         /* DMA / bus addr                         */
-	size_t total_size;
-	u32 entry_size;
-	u32 nr_entries;
-	u32 head;               /* host consumer index                    */
-	u32 tail_seen;          /* last tail value drained from card      */
-	u32 base_reg_lo;        /* BAR5 offset for ring-base-low          */
-	u32 base_reg_hi;
-	u32 size_reg;
-	u32 entries_reg;
-	u32 head_reg;
-	u32 tail_reg;
-};
-
-/*
  * vb2 buffer wrapper. The encoded payload from one or more ring slots
  * is copied / scatter-gathered into the vb2_buffer-backed memory and
  * handed to userspace via DQBUF.
@@ -271,13 +248,24 @@ struct mz0380_event_rec {
  * endpoint overwrite TOKEN/PAYLOAD immediately.  Keep the complete pre-ACK
  * image in a bounded IRQ-safe FIFO and let process context consume it.
  */
+struct mz0380_audio_buf {
+	void *vaddr;
+	dma_addr_t iova;
+	struct page *pages;
+	unsigned int order;
+};
+
 struct mz0380_frame_event {
+	u8 kind;            /* MZ0380_EVT_VIDEO or MZ0380_EVT_AUDIO */
 	u64 timestamp_ns;
 	u32 event;
 	u32 token;
 	u32 payload[3];
 	u32 enc_status;
 };
+
+#define MZ0380_EVT_VIDEO 0
+#define MZ0380_EVT_AUDIO 1
 
 #define MZ0380_FRAME_EVENT_FIFO_SIZE 64
 #define MZ0380_H264_PARAMETER_SETS_MAX 4096
@@ -336,9 +324,7 @@ struct mz0380_dev {
 	u32 cmd_last_param[MZ0380_REG_PARAM_MAX];
 	bool cmd_complete;
 
-	/* DMA rings */
-	struct mz0380_ring video_ring;
-	struct mz0380_ring audio_ring;
+	/* DMA state */
 	bool dma_armed;
 
 	// pattern-check: skip preloaded DMA buffer array, plain state, no abstraction
@@ -377,6 +363,14 @@ struct mz0380_dev {
 	 * These must not alias: the two producers rotate independently.
 	 */
 	struct mz0380_stream_buf h264_bufs[MZ0380_STREAM_NR_BUFS];
+	struct mz0380_audio_buf audio_bufs[MZ0380_AUDIO_NR_BUFS];
+	bool audio_bufs_registered;    /* SET_BUF op 0x03 acked this stream */
+	bool audio_running;            /* ALSA trigger START..STOP; read with READ_ONCE in IRQ path */
+	u32 audio_next_slot;           /* expected next slot index 0..3 */
+	u64 audio_slots_delivered;     /* copied into the ALSA ring */
+	u64 audio_slots_dropped;       /* event arrived, no running substream */
+	u64 audio_order_skips;         /* slot arrived out of the expected order */
+	u64 audio_silence_slots;       /* pre-start silence fed while the pipeline was down */
 	/* Opt-in Windows-parity window-0 banks: op 0x02 then independent op 0x08. */
 	struct mz0380_raw_probe_buf {
 		void *va;
@@ -760,11 +754,11 @@ void mz0380_dma_flush_events(struct mz0380_dev *dev);
 int mz0380_nosg_capture_start(struct mz0380_dev *dev);
 void mz0380_nosg_capture_stop(struct mz0380_dev *dev);
 void mz0380_extent_repoison(struct mz0380_dev *dev);	/* M38 */
-int mz0380_dma_ring_alloc(struct mz0380_dev *dev, struct mz0380_ring *r,
-			  u32 nr_entries, u32 entry_size);
-void mz0380_dma_ring_free(struct mz0380_dev *dev, struct mz0380_ring *r);
 void mz0380_dma_drain_video(struct mz0380_dev *dev);
-void mz0380_dma_drain_audio(struct mz0380_dev *dev);
+int mz0380_audio_bufs_alloc_iova(struct mz0380_dev *dev);
+void mz0380_audio_bufs_free(struct mz0380_dev *dev);
+int mz0380_audio_program_bufs(struct mz0380_dev *dev);
+void mz0380_dma_drain_audio_snapshot(struct mz0380_dev *dev, const struct mz0380_frame_event *ev);
 
 /* HDMI signal detect and DV timings (mz0380-signal.c) */
 extern const struct v4l2_dv_timings mz0380_no_signal;
@@ -819,11 +813,11 @@ int mz0380_i2cbb_edid_burn(struct mz0380_dev *dev, u8 sda, u8 scl, u8 addr7);
 #if IS_ENABLED(CONFIG_SND)
 int mz0380_audio_register(struct mz0380_dev *dev);
 void mz0380_audio_unregister(struct mz0380_dev *dev);
-void mz0380_audio_period_elapsed(struct mz0380_dev *dev);
+void mz0380_audio_deliver_slot(struct mz0380_dev *dev, unsigned int slot);
 #else
 static inline int mz0380_audio_register(struct mz0380_dev *dev) { return 0; }
 static inline void mz0380_audio_unregister(struct mz0380_dev *dev) {}
-static inline void mz0380_audio_period_elapsed(struct mz0380_dev *dev) {}
+static inline void mz0380_audio_deliver_slot(struct mz0380_dev *dev, unsigned int slot) {}
 #endif
 
 /*
@@ -967,10 +961,9 @@ extern bool mz0380_mst_win_output;
 extern unsigned int mz0380_mst_ad;
 extern bool mz0380_dma_handshake;
 extern bool mz0380_enable_audio;
+extern bool mz0380_audio_prestart_silence;
 extern unsigned int mz0380_video_ring_entries;
 extern unsigned int mz0380_video_ring_entry_size;
-extern unsigned int mz0380_audio_ring_entries;
-extern unsigned int mz0380_audio_ring_entry_size;
 
 /*
  * M172: the reported field follows the negotiated timings.
