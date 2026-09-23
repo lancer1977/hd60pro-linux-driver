@@ -97,10 +97,10 @@ MODULE_PARM_DESC(fw_upload_path,
  * of `size` bytes until its next boot, which is the price of not killing
  * the pipeline.
  */
-static bool fw_upload_commit = true;
+static bool fw_upload_commit;
 module_param(fw_upload_commit, bool, 0444);
 MODULE_PARM_DESC(fw_upload_commit,
-	"#56: with fw_upload_path, send COMMIT_FW after the push (def:1). "
+	"#56: with fw_upload_path, send COMMIT_FW after the push (def:0). "
 	"0 = BEGIN_FW_DL + push + read-back only; the card is left running.");
 
 #define MZ0380_FW_WIN_START   0x40  /* BAR5: inbound window start (host address) */
@@ -157,11 +157,19 @@ static void mz0380_fw_upload_log_window(struct mz0380_dev *dev,
 }
 
 /*
- * Read the whole blob back through the window and compare word by word.
- * Reports the first mismatch, the mismatch count and how many words came
- * back as all-ones (the PCIe "unsupported request" signature), plus the
- * first and last word so a shifted/offset landing is recognisable.
+ * A previous whole-image read-back did not return during an eight-hour
+ * observation. Per-read latency and forward progress were not measured.
+ * Verify a fixed ladder that
+ * always includes the first and last padded words plus evenly spaced interior
+ * words.  Any mismatch (including the all-ones PCIe failure signature) aborts
+ * before COMMIT_FW.  The source file's exact hash and size remain operator
+ * preconditions; this bounded ladder checks that BEGIN exposed the expected
+ * window at sampled positions only; it does not prove whole-image integrity.
+ * A software deadline cannot interrupt a readl() that never returns.
  */
+#define MZ0380_FW_VERIFY_SAMPLES 17
+#define MZ0380_FW_VERIFY_TIMEOUT_MS 2000
+
 static u32 mz0380_fw_upload_expected_word(const u8 *data, size_t len,
 					  size_t offset)
 {
@@ -175,40 +183,49 @@ static u32 mz0380_fw_upload_expected_word(const u8 *data, size_t len,
 static int mz0380_fw_upload_verify(struct mz0380_dev *dev,
 				   const u8 *data, size_t len)
 {
-	size_t words = DIV_ROUND_UP(len, 4), i;
-	size_t bad = 0, ones = 0, first_bad = 0;
-	u32 first_exp = 0, first_got = 0;
-	u32 w0, wlast;
+	size_t words = DIV_ROUND_UP(len, 4);
+	size_t samples = min_t(size_t, words, MZ0380_FW_VERIFY_SAMPLES);
+	size_t i;
+	unsigned long started = jiffies;
+	unsigned long deadline = started +
+		msecs_to_jiffies(MZ0380_FW_VERIFY_TIMEOUT_MS);
+
+	if (!len)
+		return -EINVAL;
 
 	rmb();
-	w0 = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER);
-	for (i = 0; i < words; i++) {
-		u32 exp = mz0380_fw_upload_expected_word(data, len, i * 4);
-		u32 got = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER + i * 4);
+	for (i = 0; i < samples; i++) {
+		size_t word = samples == 1 ? 0 :
+			(i * (words - 1)) / (samples - 1);
+		size_t offset = word * 4;
+		u32 exp = mz0380_fw_upload_expected_word(data, len, offset);
+		u32 got;
 
-		if (got == U32_MAX)
-			ones++;
-		if (got != exp) {
-			if (!bad) {
-				first_bad = i * 4;
-				first_exp = exp;
-				first_got = got;
-			}
-			bad++;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		pr_info("%s: fw_upload_path: sample %zu/%zu BEGIN offset=0x%zx\n",
+			dev->name, i + 1, samples, offset);
+		got = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER + offset);
+		pr_info("%s: fw_upload_path: sample %zu/%zu RETURN\n",
+			dev->name, i + 1, samples);
+		if (time_after_eq(jiffies, deadline)) {
+			pr_err("%s: firmware verification deadline exceeded; refusing COMMIT_FW\n",
+			       dev->name);
+			return -ETIMEDOUT;
+		}
+
+		if (got == U32_MAX || got != exp) {
+			pr_err("%s: fw_upload_path: bounded read-back sample %zu/%zu at +0x%zx got=%08x exp=%08x%s; refusing COMMIT_FW\n",
+			       dev->name, i + 1, samples, offset, got, exp,
+			       got == U32_MAX ? " (all-ones PCIe failure)" : "");
+			return -EIO;
 		}
 	}
-	wlast = words ? mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER +
-				     (words - 1) * 4) : 0;
 
-	pr_info("%s: fw_upload_path: read-back %zu words: %zu mismatched, %zu all-ones; word0 got=%08x exp=%08x; last got=%08x exp=%08x\n",
-		dev->name, words, bad, ones, w0,
-		mz0380_fw_upload_expected_word(data, len, 0), wlast,
-		mz0380_fw_upload_expected_word(data, len, (words - 1) * 4));
-	if (bad)
-		pr_err("%s: fw_upload_path: first mismatch at +0x%zx: got=%08x exp=%08x; refusing COMMIT_FW\n",
-			dev->name, first_bad, first_got, first_exp);
-
-	return bad ? -EIO : 0;
+	pr_info("%s: fw_upload_path: %zu samples matched across %zu words in %u ms; unsampled bytes unverified\n",
+		dev->name, samples, words,
+		jiffies_to_msecs(jiffies - started));
+	return 0;
 }
 
 /*
@@ -230,7 +247,7 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 
 	if (!size || size > U32_MAX ||
 	    aperture < MZ0380_FW_UPLOAD_MB_FW_BUFFER ||
-	    size > aperture - MZ0380_FW_UPLOAD_MB_FW_BUFFER) {
+	    ALIGN(size, 4) > aperture - MZ0380_FW_UPLOAD_MB_FW_BUFFER) {
 		pr_err("%s: fw_upload_path: invalid image size %zu for BAR0 aperture 0x%llx; refusing BEGIN_FW_DL\n",
 		       dev->name, size, (unsigned long long)aperture);
 		return -EFBIG;
