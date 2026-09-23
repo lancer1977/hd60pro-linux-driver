@@ -162,10 +162,20 @@ static void mz0380_fw_upload_log_window(struct mz0380_dev *dev,
  * back as all-ones (the PCIe "unsupported request" signature), plus the
  * first and last word so a shifted/offset landing is recognisable.
  */
-static void mz0380_fw_upload_verify(struct mz0380_dev *dev,
-				    const u8 *data, size_t len)
+static u32 mz0380_fw_upload_expected_word(const u8 *data, size_t len,
+					  size_t offset)
 {
-	size_t words = len / 4, i;
+	u8 tail[4] = { 0 };
+	size_t remaining = len - offset;
+
+	memcpy(tail, data + offset, min_t(size_t, remaining, sizeof(tail)));
+	return get_unaligned_le32(tail);
+}
+
+static int mz0380_fw_upload_verify(struct mz0380_dev *dev,
+				   const u8 *data, size_t len)
+{
+	size_t words = DIV_ROUND_UP(len, 4), i;
 	size_t bad = 0, ones = 0, first_bad = 0;
 	u32 first_exp = 0, first_got = 0;
 	u32 w0, wlast;
@@ -173,7 +183,7 @@ static void mz0380_fw_upload_verify(struct mz0380_dev *dev,
 	rmb();
 	w0 = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER);
 	for (i = 0; i < words; i++) {
-		u32 exp = get_unaligned_le32(data + i * 4);
+		u32 exp = mz0380_fw_upload_expected_word(data, len, i * 4);
 		u32 got = mz_mmio_read(dev, MZ0380_FW_UPLOAD_MB_FW_BUFFER + i * 4);
 
 		if (got == U32_MAX)
@@ -191,11 +201,14 @@ static void mz0380_fw_upload_verify(struct mz0380_dev *dev,
 				     (words - 1) * 4) : 0;
 
 	pr_info("%s: fw_upload_path: read-back %zu words: %zu mismatched, %zu all-ones; word0 got=%08x exp=%08x; last got=%08x exp=%08x\n",
-		dev->name, words, bad, ones, w0, get_unaligned_le32(data),
-		wlast, words ? get_unaligned_le32(data + (words - 1) * 4) : 0);
+		dev->name, words, bad, ones, w0,
+		mz0380_fw_upload_expected_word(data, len, 0), wlast,
+		mz0380_fw_upload_expected_word(data, len, (words - 1) * 4));
 	if (bad)
-		pr_info("%s: fw_upload_path: first mismatch at +0x%zx: got=%08x exp=%08x\n",
+		pr_err("%s: fw_upload_path: first mismatch at +0x%zx: got=%08x exp=%08x; refusing COMMIT_FW\n",
 			dev->name, first_bad, first_got, first_exp);
+
+	return bad ? -EIO : 0;
 }
 
 /*
@@ -211,7 +224,17 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 	u32 status;
 	u32 result;
 	int ret;
+	bool saw_boot_busy;
 	unsigned long deadline;
+	resource_size_t aperture = dev->bar_len[MZ0380_MAP_BAR_MMIO];
+
+	if (!size || size > U32_MAX ||
+	    aperture < MZ0380_FW_UPLOAD_MB_FW_BUFFER ||
+	    size > aperture - MZ0380_FW_UPLOAD_MB_FW_BUFFER) {
+		pr_err("%s: fw_upload_path: invalid image size %zu for BAR0 aperture 0x%llx; refusing BEGIN_FW_DL\n",
+		       dev->name, size, (unsigned long long)aperture);
+		return -EFBIG;
+	}
 
 	pr_warn("%s: fw_upload_path set - UPLOADING %zu bytes and forcing a card reboot (~21s). #56 console-instrument opt-in path, NOT standing driver behaviour.\n",
 		dev->name, size);
@@ -232,7 +255,9 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 	mz0380_fw_upload_write_buffer(dev, data, size);
 
 	mz0380_fw_upload_log_window(dev, "after push");
-	mz0380_fw_upload_verify(dev, data, size);
+	ret = mz0380_fw_upload_verify(dev, data, size);
+	if (ret)
+		return ret;
 
 	if (!fw_upload_commit) {
 		pr_info("%s: fw_upload_path: fw_upload_commit=0, NOT sending COMMIT_FW - card left running its own image\n",
@@ -250,6 +275,7 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 
 	msleep(100);
 	result = mz_mmio_read(dev, MZ0380_MB_RESULT);
+	saw_boot_busy = result != 0;
 	deadline = jiffies + msecs_to_jiffies(MZ0380_FW_UPLOAD_BOOT_TIMEOUT_MS);
 	while (time_before(jiffies, deadline)) {
 		u32 event = mz_mmio_read(dev, MZ0380_MB_EVENT);
@@ -259,14 +285,16 @@ static int mz0380_fw_upload_blob(struct mz0380_dev *dev,
 			pr_info("%s: fw_upload_path: EVENT=0x%08x during boot wait, acked\n",
 				dev->name, event);
 		result = mz_mmio_read(dev, MZ0380_MB_RESULT);
-		if (result == 0)
+		if (result != 0)
+			saw_boot_busy = true;
+		if (saw_boot_busy && result == 0)
 			break;
 		msleep(1);
 	}
 
-	if (result != 0) {
-		pr_err("%s: fw_upload_path: boot timed out (result=0x%08x)\n",
-		       dev->name, result);
+	if (!saw_boot_busy || result != 0) {
+		pr_err("%s: fw_upload_path: boot transition timed out (saw_busy=%u result=0x%08x)\n",
+		       dev->name, saw_boot_busy, result);
 		return -ETIMEDOUT;
 	}
 
