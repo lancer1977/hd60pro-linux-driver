@@ -530,6 +530,14 @@ vic_done:
 				dev->name, mz0380_set_buf_opcode);
 	}
 
+	/* Register audio capture buffers if enabled. */
+	ret = mz0380_audio_program_bufs(dev);
+	if (ret) {
+		pr_warn("%s: audio SET_BUF(op 0x03) failed (%d) - continuing without audio\n",
+			dev->name, ret);
+		ret = 0;
+	}
+
 	/*
 	 * Real H.264 needs an owned poison suffix for bounded length inference.
 	 * NOSG keeps the older live extent diagnostic; its fixed raw size does not
@@ -799,6 +807,7 @@ void __mz0380_dma_stop(struct mz0380_dev *dev, bool verbose)
 	if (dev->dma_armed && READ_ONCE(dev->pipeline_running)) {
 		if (mz0380_stop_on_streamoff || verbose) {
 			stop_ret = mz0380_stream_stop_all(dev, 2000);
+			dev->audio_bufs_registered = false;
 			pr_info("%s: final pipeline stop: STOP_STREAMING(all channels) ret=%d after %u userspace attachment(s) and %u SET_VIC spawn(s)\n",
 				dev->name, stop_ret, dev->pipeline_attach_count,
 				dev->encoder_spawns);
